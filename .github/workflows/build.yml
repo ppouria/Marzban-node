@@ -38,7 +38,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            rebeccapanel/marzban-node:latest
-            rebeccapanel/marzban-node:${{github.ref_name}}
-            ghcr.io/ppouria/marzban-node:latest
-            ghcr.io/ppouria/marzban-node:${{github.ref_name}}
+            rebeccapanel/rebecca-node:latest
+            rebeccapanel/rebecca-node:${{github.ref_name}}
+            ghcr.io/ppouria/rebecca-node:latest
+            ghcr.io/ppouria/rebecca-node:${{github.ref_name}}
