@@ -50,6 +50,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+.vscode
 
 # Translations
 *.mo
@@ -159,7 +160,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-*-dev.*
+#*-dev.*
 
 # ssl
 ssl_cert.pem
