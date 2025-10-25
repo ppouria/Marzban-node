@@ -1,21 +1,21 @@
-# Marzban-node
+# Rebecca-node
 
 ## Quick install
-Install Marzban-node on your server using this command
+Install Rebecca-node on your server using this command
 ```bash
-sudo bash -c "$(curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh)" @ install
+sudo bash -c "$(curl -sL https://github.com/rebeccapanel/Rebecca-node/raw/master/rebecca-node.sh)" @ install
 ```
-Install Marzban-node on your server using this command with custom name:
+Install Rebecca-node on your server using this command with custom name:
 ```bash
-sudo bash -c "$(curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh)" @ install --name marzban-node2
+sudo bash -c "$(curl -sL https://github.com/rebeccapanel/Rebecca-node/raw/master/rebecca-node.sh)" @ install --name rebecca-node2
 ```
-Or you can only install this script (marzban-node command) on your server by using this command
+Or you can only install this script (Rebecca-node command) on your server by using this command
 ```bash
-sudo bash -c "$(curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban-node.sh)" @ install-script
+sudo bash -c "$(curl -sL https://github.com/rebeccapanel/Rebecca-node/raw/master/rebecca-node.sh)" @ install-script
 ```
 
 Use `help` to view all commands:
-```marzban-node help```
+```Rebecca-node help```
 
 
 ## Manual install
