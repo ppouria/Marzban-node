@@ -39,4 +39,4 @@ jobs:
           push: true
           tags: |
             rebeccapanel/rebecca-node:dev
-            ghcr.io/ppouria/rebecca-node:dev
+            ghcr.io/rebeccapanel/rebecca-node:dev

@@ -40,5 +40,5 @@ jobs:
           tags: |
             rebeccapanel/rebecca-node:latest
             rebeccapanel/rebecca-node:${{github.ref_name}}
-            ghcr.io/ppouria/rebecca-node:latest
-            ghcr.io/ppouria/rebecca-node:${{github.ref_name}}
+            ghcr.io/rebeccapanel/rebecca-node:latest
+            ghcr.io/rebeccapanel/rebecca-node:${{github.ref_name}}
