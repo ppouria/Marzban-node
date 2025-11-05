@@ -347,17 +347,17 @@ class Service(object):
                 content = f.read()
             
             import yaml
-            data = yaml.safe_load(content) or {"services": {"marzban-node": {"environment": {}}}}
-            env = data.get("services", {}).get("marzban-node", {}).get("environment", {})
+            data = yaml.safe_load(content) or {"services": {"rebecca-node": {"environment": {}}}}
+            env = data.get("services", {}).get("rebecca-node", {}).get("environment", {})
             
             env[key] = value
             
-            volumes = data.get("services", {}).get("marzban-node", {}).get("volumes", [])
+            volumes = data.get("services", {}).get("rebecca-node", {}).get("volumes", [])
             asset_volume = "/var/lib/reb/assets:/usr/local/share/xray"
             if asset_volume not in volumes:
                 volumes.append(asset_volume)
-            data["services"]["marzban-node"]["environment"] = env
-            data["services"]["marzban-node"]["volumes"] = volumes
+            data["services"]["rebecca-node"]["environment"] = env
+            data["services"]["rebecca-node"]["volumes"] = volumes
             
             with open(compose_file, "w") as f:
                 yaml.safe_dump(data, f, allow_unicode=True)
@@ -404,7 +404,7 @@ class Service(object):
 
         compose_file = Path("/opt/reb/docker-compose.yml")
         if compose_file.exists():
-            self._update_docker_compose(compose_file, "XRAY_EXECUTABLE_PATH", "/var/lib/marzban-node/xray-core/xray")
+            self._update_docker_compose(compose_file, "XRAY_EXECUTABLE_PATH", "/var/lib/rebecca-node/xray-core/xray")
 
         return {"detail": f"Node core ready at {exe_path}", "version": self.core_version}
 
