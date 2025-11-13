@@ -10,7 +10,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
-from config import XRAY_ASSETS_PATH, XRAY_EXECUTABLE_PATH
+from config import (
+    XRAY_ASSETS_PATH,
+    XRAY_EXECUTABLE_PATH,
+    NODE_SERVICE_HOST,
+    NODE_SERVICE_PORT,
+    NODE_SERVICE_SCHEME,
+    NODE_VERSION,
+)
 from logger import logger
 from xray import XRayConfig, XRayCore
 
@@ -43,7 +50,9 @@ class Service(object):
             assets_path=XRAY_ASSETS_PATH
         )
         self.core_version = self.core.get_version()
+        self.node_version = NODE_VERSION
         self.config = None
+        self._node_service_base = self._build_node_service_base()
 
         self.router.add_api_route("/", self.base, methods=["POST"])
         self.router.add_api_route("/ping", self.ping, methods=["POST"])
@@ -54,8 +63,47 @@ class Service(object):
         self.router.add_api_route("/restart", self.restart, methods=["POST"])
         self.router.add_api_route("/update_core", self.update_core, methods=["POST"])
         self.router.add_api_route("/update_geo", self.update_geo, methods=["POST"])
+        self.router.add_api_route("/maintenance/restart", self.restart_node_service, methods=["POST"])
+        self.router.add_api_route("/maintenance/update", self.update_node_service, methods=["POST"])
 
         self.router.add_websocket_route("/logs", self.logs)
+
+    def _build_node_service_base(self):
+        host = (NODE_SERVICE_HOST or "").strip()
+        scheme = (NODE_SERVICE_SCHEME or "").strip() or "http"
+        if not host:
+            return None
+
+        base = f"{scheme}://{host}"
+        if NODE_SERVICE_PORT:
+            base = f"{base}:{NODE_SERVICE_PORT}"
+        return base
+
+    def _call_node_service(self, path: str, timeout: int = 180):
+        if not self._node_service_base:
+            raise HTTPException(
+                status_code=503,
+                detail="Node maintenance service is not configured on this node."
+            )
+
+        url = f"{self._node_service_base}{path}"
+        try:
+            res = requests.post(url, timeout=timeout)
+        except requests.RequestException as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Unable to reach node maintenance service: {exc}"
+            )
+
+        try:
+            data = res.json()
+        except ValueError:
+            data = {"detail": res.text or "Node maintenance service returned invalid response."}
+
+        if res.status_code >= 400:
+            detail = data.get("detail") if isinstance(data, dict) else data
+            raise HTTPException(res.status_code, detail=detail)
+        return data
 
     def match_session_id(self, session_id: UUID):
         if session_id != self.session_id:
@@ -70,6 +118,7 @@ class Service(object):
             "connected": self.connected,
             "started": self.core.started,
             "core_version": self.core_version,
+            "node_version": self.node_version,
             **kwargs
         }
 
@@ -429,6 +478,14 @@ class Service(object):
             self._update_docker_compose(compose_file, "XRAY_ASSETS_PATH", "/usr/local/share/xray")
 
         return {"detail": f"Geo assets saved to {assets_dir}", "saved": saved}
+
+    def restart_node_service(self, session_id: UUID = Body(embed=True)):
+        self.match_session_id(session_id)
+        return self._call_node_service("/restart", timeout=300)
+
+    def update_node_service(self, session_id: UUID = Body(embed=True)):
+        self.match_session_id(session_id)
+        return self._call_node_service("/update", timeout=900)
 
 
 service = Service()

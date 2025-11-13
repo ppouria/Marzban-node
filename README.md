@@ -19,4 +19,4 @@ Use `help` to view all commands:
 
 
 ## Manual install
-Read the setup guide here: https://gozargah.github.io/marzban/docs/marzban-node
+Read the setup guide here: https://rebeccapanel.github.io/rebecca/docs/rebecca-node
