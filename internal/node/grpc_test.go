@@ -131,6 +131,37 @@ func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 	)
 }
 
+func TestGRPCTestOutboundRejectsMissingTag(t *testing.T) {
+	api := &grpcAPI{server: &Server{core: &xray.Core{}}}
+	response, err := api.TestOutbound(context.Background(), &nodev1.OutboundTestRequest{
+		AllOutboundsJson: `[{"tag":"direct","protocol":"freedom"}]`,
+	})
+	if err != nil {
+		t.Fatalf("test outbound failed: %v", err)
+	}
+	if response.GetSuccess() {
+		t.Fatalf("expected unsuccessful outbound test")
+	}
+	if response.GetError() != "Outbound has no tag" {
+		t.Fatalf("unexpected outbound test error: %q", response.GetError())
+	}
+}
+
+func TestPublicIPValidation(t *testing.T) {
+	if !isGlobalIP("8.8.8.8", true) {
+		t.Fatal("expected 8.8.8.8 to be a global IPv4")
+	}
+	if isGlobalIP("10.0.0.1", true) {
+		t.Fatal("expected private IPv4 to be rejected")
+	}
+	if !isGlobalIP("2001:4860:4860::8888", false) {
+		t.Fatal("expected Google DNS IPv6 to be a global IPv6")
+	}
+	if isGlobalIP("::1", false) {
+		t.Fatal("expected loopback IPv6 to be rejected")
+	}
+}
+
 func writeSelfSignedCert(t *testing.T, dir string, name string, dnsNames []string) (string, string) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
