@@ -30,7 +30,7 @@ func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 	settings := appconfig.Settings{
 		AppName:           "rebecca-node",
 		InstallMode:       "binary",
-		NodeVersion:       "0.2.0",
+		NodeVersion:       "0.2.2",
 		SSLCertFile:       serverCertFile,
 		SSLKeyFile:        serverKeyFile,
 		SSLClientCertFile: clientCertFile,
@@ -99,7 +99,7 @@ func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hello failed: %v", err)
 	}
-	if hello.GetNodeVersion() != "0.2.0" || hello.GetInstallMode() != "binary" {
+	if hello.GetNodeVersion() != "0.2.2" || hello.GetInstallMode() != "binary" {
 		t.Fatalf("unexpected hello response: %#v", hello)
 	}
 	t.Logf("hello: node_version=%s install_mode=%s started=%v", hello.GetNodeVersion(), hello.GetInstallMode(), hello.GetRuntime().GetStarted())
