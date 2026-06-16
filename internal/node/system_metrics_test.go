@@ -51,6 +51,14 @@ func TestReadMemorySnapshot(t *testing.T) {
 	}
 }
 
+func TestReadUptimeSeconds(t *testing.T) {
+	path := writeFixture(t, "uptime", "12345.67 8910.11\n")
+	got := readUptimeSeconds(path)
+	if got != 12345 {
+		t.Fatalf("uptime = %d, want 12345", got)
+	}
+}
+
 func TestReadNetworkTotals(t *testing.T) {
 	path := writeFixture(
 		t,

@@ -26,6 +26,7 @@ type systemSnapshot struct {
 	CPU       cpuSnapshot       `json:"cpu"`
 	Memory    memorySnapshot    `json:"memory"`
 	Bandwidth bandwidthSnapshot `json:"bandwidth"`
+	UptimeSec uint64            `json:"uptime_seconds"`
 }
 
 type cpuSnapshot struct {
@@ -104,7 +105,24 @@ func (s *systemSampler) Snapshot() systemSnapshot {
 		CPU:       cpu,
 		Memory:    memory,
 		Bandwidth: bandwidth,
+		UptimeSec: readUptimeSeconds("/proc/uptime"),
 	}
+}
+
+func readUptimeSeconds(path string) uint64 {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(content))
+	if len(fields) == 0 {
+		return 0
+	}
+	seconds, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil || seconds < 0 {
+		return 0
+	}
+	return uint64(seconds)
 }
 
 func readCPUTimes(path string) (cpuTimes, bool) {

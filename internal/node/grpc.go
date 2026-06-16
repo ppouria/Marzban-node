@@ -518,6 +518,7 @@ func (s *Server) grpcMetrics(message string) *nodev1.MetricsResponse {
 			MemoryUsed:         snapshot.Memory.UsedBytes,
 			MemoryTotal:        snapshot.Memory.TotalBytes,
 			MemoryUsagePercent: snapshot.Memory.UsagePct,
+			UptimeSeconds:      snapshot.UptimeSec,
 		},
 		Transfer: &nodev1.TransferMetrics{
 			UploadSpeed:   snapshot.Bandwidth.UploadBytesPerSecond,
