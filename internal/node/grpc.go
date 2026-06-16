@@ -63,29 +63,28 @@ func loadGRPCServerTLS(settings appconfig.Settings) (*tls.Config, error) {
 	if settings.SSLCertFile == "" || settings.SSLKeyFile == "" {
 		return nil, errors.New("SSL_CERT_FILE and SSL_KEY_FILE are required for gRPC")
 	}
-	if settings.SSLClientCertFile == "" || !fileExists(settings.SSLClientCertFile) {
-		return nil, errors.New("SSL_CLIENT_CERT_FILE is required for gRPC")
-	}
 
 	cert, err := tls.LoadX509KeyPair(settings.SSLCertFile, settings.SSLKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("load gRPC server certificate: %w", err)
 	}
-	clientCAPEM, err := os.ReadFile(settings.SSLClientCertFile)
-	if err != nil {
-		return nil, fmt.Errorf("read gRPC client certificate: %w", err)
-	}
-	clientCAs := x509.NewCertPool()
-	if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
-		return nil, errors.New("failed to load SSL_CLIENT_CERT_FILE for gRPC")
-	}
-
-	return &tls.Config{
+	config := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		ClientCAs:    clientCAs,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
 		MinVersion:   tls.VersionTLS12,
-	}, nil
+	}
+	if strings.TrimSpace(settings.SSLClientCertFile) != "" && fileExists(settings.SSLClientCertFile) {
+		clientCAPEM, err := os.ReadFile(settings.SSLClientCertFile)
+		if err != nil {
+			return nil, fmt.Errorf("read gRPC client certificate: %w", err)
+		}
+		clientCAs := x509.NewCertPool()
+		if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
+			return nil, errors.New("failed to load SSL_CLIENT_CERT_FILE for gRPC")
+		}
+		config.ClientCAs = clientCAs
+		config.ClientAuth = tls.VerifyClientCertIfGiven
+	}
+	return config, nil
 }
 
 func (api *grpcAPI) Hello(ctx context.Context, _ *nodev1.HelloRequest) (*nodev1.HelloResponse, error) {

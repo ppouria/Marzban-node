@@ -131,6 +131,84 @@ func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 	)
 }
 
+func TestGRPCServerAcceptsPinnedTLSWithoutClientCertificate(t *testing.T) {
+	tempDir := t.TempDir()
+	serverCertFile, serverKeyFile := writeSelfSignedCert(t, tempDir, "server", []string{"rebecca-node.test"})
+
+	settings := appconfig.Settings{
+		AppName:     "rebecca-node",
+		InstallMode: "binary",
+		NodeVersion: "0.2.2",
+		SSLCertFile: serverCertFile,
+		SSLKeyFile:  serverKeyFile,
+	}
+	tlsConfig, err := loadGRPCServerTLS(settings)
+	if err != nil {
+		t.Fatalf("failed to load gRPC TLS config: %v", err)
+	}
+	if tlsConfig.ClientAuth != tls.NoClientCert {
+		t.Fatalf("expected legacy-compatible no-client-cert mode, got %v", tlsConfig.ClientAuth)
+	}
+
+	server := &Server{
+		settings: settings,
+		core:     &xray.Core{},
+		usage:    newUsageBuffer(),
+		system:   newSystemSampler(),
+		sessions: make(map[string]time.Time),
+	}
+	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
+	server.registerGRPC(grpcServer)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		if err := grpcServer.Serve(listener); err != nil {
+			t.Logf("gRPC test server stopped: %v", err)
+		}
+	}()
+	defer grpcServer.Stop()
+
+	serverRootPEM, err := os.ReadFile(serverCertFile)
+	if err != nil {
+		t.Fatalf("failed to read server cert: %v", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(serverRootPEM) {
+		t.Fatal("failed to add server cert root")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(
+		ctx,
+		listener.Addr().String(),
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+			ServerName: "rebecca-node.test",
+			RootCAs:    roots,
+			MinVersion: tls.VersionTLS12,
+		})),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		t.Fatalf("failed to dial gRPC server without client cert: %v", err)
+	}
+	defer conn.Close()
+
+	control := nodev1.NewNodeControlServiceClient(conn)
+	hello, err := control.Hello(ctx, &nodev1.HelloRequest{MasterId: "legacy-master"})
+	if err != nil {
+		t.Fatalf("hello failed: %v", err)
+	}
+	if hello.GetNodeVersion() != "0.2.2" || hello.GetInstallMode() != "binary" {
+		t.Fatalf("unexpected hello response: %#v", hello)
+	}
+}
+
 func TestGRPCTestOutboundRejectsMissingTag(t *testing.T) {
 	api := &grpcAPI{server: &Server{core: &xray.Core{}}}
 	response, err := api.TestOutbound(context.Background(), &nodev1.OutboundTestRequest{

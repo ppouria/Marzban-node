@@ -70,32 +70,31 @@ func New(settings appconfig.Settings) (*Server, error) {
 }
 
 func (s *Server) ListenAndServeTLS() error {
-	if s.settings.SSLClientCertFile == "" || !fileExists(s.settings.SSLClientCertFile) {
-		return errors.New("SSL_CLIENT_CERT_FILE is required for the REST service")
-	}
-
 	cert, err := tls.LoadX509KeyPair(s.settings.SSLCertFile, s.settings.SSLKeyFile)
 	if err != nil {
 		return err
 	}
-	clientCAPEM, err := os.ReadFile(s.settings.SSLClientCertFile)
-	if err != nil {
-		return err
-	}
-	clientCAs := x509.NewCertPool()
-	if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
-		return errors.New("failed to load SSL_CLIENT_CERT_FILE")
-	}
 
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	if strings.TrimSpace(s.settings.SSLClientCertFile) != "" && fileExists(s.settings.SSLClientCertFile) {
+		clientCAPEM, err := os.ReadFile(s.settings.SSLClientCertFile)
+		if err != nil {
+			return err
+		}
+		clientCAs := x509.NewCertPool()
+		if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
+			return errors.New("failed to load SSL_CLIENT_CERT_FILE")
+		}
+		tlsConfig.ClientCAs = clientCAs
+		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+	}
 	server := &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", s.settings.ServiceHost, s.settings.ServicePort),
-		Handler: s.routes(),
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			ClientCAs:    clientCAs,
-			ClientAuth:   tls.RequireAndVerifyClientCert,
-			MinVersion:   tls.VersionTLS12,
-		},
+		Addr:      fmt.Sprintf("%s:%d", s.settings.ServiceHost, s.settings.ServicePort),
+		Handler:   s.routes(),
+		TLSConfig: tlsConfig,
 	}
 	return server.ListenAndServeTLS("", "")
 }
