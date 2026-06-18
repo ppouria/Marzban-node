@@ -23,3 +23,19 @@ func TestParseUserStatName(t *testing.T) {
 		t.Fatal("non-user stats should be ignored")
 	}
 }
+
+func TestParseUserEmailUID(t *testing.T) {
+	uid, ok := parseUserEmailUID("42.alice")
+	if !ok || uid != "42" {
+		t.Fatalf("unexpected parse result: uid=%q ok=%v", uid, ok)
+	}
+
+	uid, ok = parseUserEmailUID("42")
+	if !ok || uid != "42" {
+		t.Fatalf("unexpected parse result without suffix: uid=%q ok=%v", uid, ok)
+	}
+
+	if _, ok := parseUserEmailUID(""); ok {
+		t.Fatal("empty email should be ignored")
+	}
+}

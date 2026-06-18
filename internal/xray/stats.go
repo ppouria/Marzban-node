@@ -103,6 +103,39 @@ func QueryUserStats(apiHost string, apiPort int, timeout time.Duration, reset bo
 	return result, nil
 }
 
+func QueryOnlineUserUIDs(apiHost string, apiPort int, timeout time.Duration) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, err := dialAPI(ctx, apiHost, apiPort)
+	if err != nil {
+		return nil, fmt.Errorf("connect to Xray stats API: %w", err)
+	}
+	defer conn.Close()
+
+	client := statscommand.NewStatsServiceClient(conn)
+	res, err := client.GetAllOnlineUsers(ctx, &statscommand.GetAllOnlineUsersRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("query Xray online users: %w", err)
+	}
+
+	seen := map[string]struct{}{}
+	for _, email := range res.GetUsers() {
+		uid, ok := parseUserEmailUID(email)
+		if !ok {
+			continue
+		}
+		seen[uid] = struct{}{}
+	}
+
+	uids := make([]string, 0, len(seen))
+	for uid := range seen {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	return uids, nil
+}
+
 func queryStats(apiHost string, apiPort int, timeout time.Duration, pattern string, reset bool) ([]*statscommand.Stat, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -157,7 +190,11 @@ func parseUserStatName(name string) (string, bool) {
 	if len(parts) < 4 || parts[0] != "user" || parts[2] != "traffic" {
 		return "", false
 	}
-	email := strings.TrimSpace(parts[1])
+	return parseUserEmailUID(parts[1])
+}
+
+func parseUserEmailUID(email string) (string, bool) {
+	email = strings.TrimSpace(email)
 	if email == "" {
 		return "", false
 	}

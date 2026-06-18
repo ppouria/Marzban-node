@@ -431,6 +431,7 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var stats []xray.UserStat
+	var onlineUIDs []string
 	if s.core.Started() {
 		var err error
 		stats, err = xray.QueryUserStats(
@@ -443,8 +444,17 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
+		onlineUIDs, err = xray.QueryOnlineUserUIDs(
+			s.settings.XrayAPIHost,
+			s.settings.XrayAPIPort,
+			5*time.Second,
+		)
+		if err != nil {
+			log.Printf("failed to query online users: %v", err)
+		}
 	}
 	batchID, pending := s.usage.addUsersAndSnapshot(stats)
+	pending = appendOnlineUserMarkers(pending, onlineUIDs)
 	writeJSON(w, http.StatusOK, map[string]any{"batch_id": batchID, "stats": pending})
 }
 

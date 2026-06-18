@@ -37,7 +37,7 @@ func TestNewConfigForcesStatsPolicy(t *testing.T) {
 
 	levels := policy["levels"].(map[string]any)
 	level0 := levels["0"].(map[string]any)
-	if level0["statsUserUplink"] != true || level0["statsUserDownlink"] != true {
+	if level0["statsUserUplink"] != true || level0["statsUserDownlink"] != true || level0["statsUserOnline"] != true {
 		t.Fatalf("user stats were not enabled: %#v", level0)
 	}
 }

@@ -239,6 +239,7 @@ func (api *grpcAPI) UpdateService(ctx context.Context, req *nodev1.ServiceUpdate
 
 func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsageRequest) (*nodev1.UserUsageBatch, error) {
 	var stats []xray.UserStat
+	var onlineUIDs []string
 	if api.server.core.Started() {
 		var err error
 		stats, err = xray.QueryUserStats(
@@ -250,8 +251,17 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 		if err != nil {
 			return nil, status.Error(codes.Unavailable, err.Error())
 		}
+		onlineUIDs, err = xray.QueryOnlineUserUIDs(
+			api.server.settings.XrayAPIHost,
+			api.server.settings.XrayAPIPort,
+			5*time.Second,
+		)
+		if err != nil {
+			log.Printf("failed to query online users: %v", err)
+		}
 	}
 	batchID, pending := api.server.usage.addUsersAndSnapshot(stats)
+	pending = appendOnlineUserMarkers(pending, onlineUIDs)
 	res := &nodev1.UserUsageBatch{BatchId: batchID}
 	for _, stat := range pending {
 		res.Stats = append(res.Stats, &nodev1.UserUsageSample{
