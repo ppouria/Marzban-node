@@ -2,6 +2,7 @@ package xray
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,42 +27,57 @@ type OutboundTestResult struct {
 	Delay      int64  `json:"delay,omitempty"`
 	StatusCode int    `json:"statusCode,omitempty"`
 	Error      string `json:"error,omitempty"`
+	TestType   string `json:"test_type,omitempty"`
+	Address    string `json:"address,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	Output     string `json:"output,omitempty"`
 }
 
-func (c *Core) TestOutbound(outboundTag string, outboundProtocol string, allOutbounds []map[string]any, testURL string) OutboundTestResult {
+func (c *Core) TestOutbound(outboundTag string, outboundProtocol string, allOutbounds []map[string]any, testURL string, testType string) OutboundTestResult {
 	outboundTag = strings.TrimSpace(outboundTag)
 	outboundProtocol = strings.ToLower(strings.TrimSpace(outboundProtocol))
+	testType = normalizeOutboundTestType(testType)
 	testURL = strings.TrimSpace(testURL)
 	if testURL == "" {
 		testURL = DefaultOutboundTestURL
 	}
 	if outboundTag == "" {
-		return OutboundTestResult{Success: false, Error: "Outbound has no tag"}
+		return OutboundTestResult{Success: false, Error: "Outbound has no tag", TestType: testType}
 	}
 	if outboundProtocol == "blackhole" || strings.EqualFold(outboundTag, "blocked") {
-		return OutboundTestResult{Success: false, Error: "Blocked/blackhole outbound cannot be tested"}
+		return OutboundTestResult{Success: false, Error: "Blocked/blackhole outbound cannot be tested", TestType: testType}
+	}
+	if testType == "tcp" || testType == "icmp" {
+		target, ok := outboundTestTarget(outboundTag, allOutbounds)
+		if !ok {
+			return OutboundTestResult{Success: false, Error: "Outbound server address was not found", TestType: testType}
+		}
+		if testType == "tcp" {
+			return measureOutboundTCP(target)
+		}
+		return measureOutboundICMP(target)
 	}
 	if outboundProtocol == "freedom" || strings.EqualFold(outboundTag, "direct") {
 		delay, statusCode, err := measureDirectDelay(testURL)
 		if err != nil {
-			return OutboundTestResult{Success: false, Error: "Direct request failed"}
+			return OutboundTestResult{Success: false, Error: "Direct request failed", TestType: testType}
 		}
-		return OutboundTestResult{Success: true, Delay: delay, StatusCode: statusCode}
+		return OutboundTestResult{Success: true, Delay: delay, StatusCode: statusCode, TestType: testType}
 	}
 
 	port, listener, err := findAvailablePort()
 	if err != nil {
-		return OutboundTestResult{Success: false, Error: "Failed to find available test port"}
+		return OutboundTestResult{Success: false, Error: "Failed to find available test port", TestType: testType}
 	}
 	_ = listener.Close()
 
 	config, err := buildOutboundTestConfig(outboundTag, allOutbounds, port)
 	if err != nil {
-		return OutboundTestResult{Success: false, Error: "Outbound test failed"}
+		return OutboundTestResult{Success: false, Error: "Outbound test failed", TestType: testType}
 	}
 	configJSON, err := json.Marshal(config)
 	if err != nil {
-		return OutboundTestResult{Success: false, Error: "Outbound test failed"}
+		return OutboundTestResult{Success: false, Error: "Outbound test failed", TestType: testType}
 	}
 
 	c.mu.Lock()
@@ -70,18 +89,18 @@ func (c *Core) TestOutbound(outboundTag string, outboundProtocol string, allOutb
 	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+assets)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return OutboundTestResult{Success: false, Error: "Failed to create stdin pipe for test Xray process"}
+		return OutboundTestResult{Success: false, Error: "Failed to create stdin pipe for test Xray process", TestType: testType}
 	}
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 	if err := cmd.Start(); err != nil {
-		return OutboundTestResult{Success: false, Error: "Failed to start test xray instance"}
+		return OutboundTestResult{Success: false, Error: "Failed to start test xray instance", TestType: testType}
 	}
 	defer stopTestProcess(cmd)
 
 	if _, err := stdin.Write(configJSON); err != nil {
-		return OutboundTestResult{Success: false, Error: "Outbound test failed"}
+		return OutboundTestResult{Success: false, Error: "Outbound test failed", TestType: testType}
 	}
 	_ = stdin.Close()
 
@@ -89,16 +108,194 @@ func (c *Core) TestOutbound(outboundTag string, outboundProtocol string, allOutb
 	go func() { done <- cmd.Wait() }()
 	if ready, errText := waitForPort(done, port, 3*time.Second); !ready {
 		if strings.TrimSpace(output.String()) != "" && errText == "Xray test instance exited before it was ready" {
-			return OutboundTestResult{Success: false, Error: errText}
+			return OutboundTestResult{Success: false, Error: errText, TestType: testType}
 		}
-		return OutboundTestResult{Success: false, Error: errText}
+		return OutboundTestResult{Success: false, Error: errText, TestType: testType}
 	}
 
 	delay, statusCode, err := measureSocksDelay(port, testURL)
 	if err != nil {
-		return OutboundTestResult{Success: false, Error: "Request failed"}
+		return OutboundTestResult{Success: false, Error: "Request failed", TestType: testType}
 	}
-	return OutboundTestResult{Success: true, Delay: delay, StatusCode: statusCode}
+	return OutboundTestResult{Success: true, Delay: delay, StatusCode: statusCode, TestType: testType}
+}
+
+func normalizeOutboundTestType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "latency":
+		return "latency"
+	case "tcp":
+		return "tcp"
+	case "icmp", "ping":
+		return "icmp"
+	default:
+		return "latency"
+	}
+}
+
+type outboundTarget struct {
+	Address string
+	Port    int
+}
+
+func outboundTestTarget(tag string, outbounds []map[string]any) (outboundTarget, bool) {
+	tag = strings.TrimSpace(tag)
+	for _, outbound := range outbounds {
+		if strings.TrimSpace(fmt.Sprint(outbound["tag"])) != tag {
+			continue
+		}
+		return outboundTargetFromConfig(outbound)
+	}
+	return outboundTarget{}, false
+}
+
+func outboundTargetFromConfig(outbound map[string]any) (outboundTarget, bool) {
+	settings, _ := outbound["settings"].(map[string]any)
+	protocol := strings.ToLower(strings.TrimSpace(fmt.Sprint(outbound["protocol"])))
+	switch protocol {
+	case "vmess", "vless":
+		return targetFromArray(settings["vnext"], "address", "port")
+	case "trojan", "shadowsocks", "socks", "http":
+		return targetFromArray(settings["servers"], "address", "port")
+	case "wireguard":
+		if target, ok := targetFromArray(settings["peers"], "endpoint", ""); ok {
+			return target, true
+		}
+		return targetFromEndpoint(stringFromMap(settings, "endpoint"))
+	default:
+		return targetFromEndpoint(firstNonEmptyString(
+			stringFromMap(settings, "address"),
+			stringFromMap(settings, "domain"),
+			stringFromMap(outbound, "address"),
+		))
+	}
+}
+
+func targetFromArray(value any, addressKey string, portKey string) (outboundTarget, bool) {
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		return outboundTarget{}, false
+	}
+	first, ok := items[0].(map[string]any)
+	if !ok {
+		return outboundTarget{}, false
+	}
+	address := stringFromMap(first, addressKey)
+	if portKey == "" {
+		return targetFromEndpoint(address)
+	}
+	port := intFromAny(first[portKey])
+	if strings.TrimSpace(address) == "" || port <= 0 {
+		return targetFromEndpoint(address)
+	}
+	return outboundTarget{Address: strings.Trim(strings.TrimSpace(address), "[]"), Port: port}, true
+}
+
+func targetFromEndpoint(endpoint string) (outboundTarget, bool) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return outboundTarget{}, false
+	}
+	host, portText, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		if strings.Count(endpoint, ":") == 1 {
+			parts := strings.SplitN(endpoint, ":", 2)
+			host, portText = parts[0], parts[1]
+		} else {
+			return outboundTarget{Address: strings.Trim(endpoint, "[]")}, true
+		}
+	}
+	port, _ := strconv.Atoi(strings.TrimSpace(portText))
+	return outboundTarget{Address: strings.Trim(strings.TrimSpace(host), "[]"), Port: port}, strings.TrimSpace(host) != ""
+}
+
+func measureOutboundTCP(target outboundTarget) OutboundTestResult {
+	if strings.TrimSpace(target.Address) == "" || target.Port <= 0 {
+		return OutboundTestResult{Success: false, Error: "TCP test requires outbound address and port", TestType: "tcp", Address: target.Address, Port: target.Port}
+	}
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(target.Address, strconv.Itoa(target.Port)), 6*time.Second)
+	delay := time.Since(start).Milliseconds()
+	if err != nil {
+		return OutboundTestResult{Success: false, Error: err.Error(), TestType: "tcp", Address: target.Address, Port: target.Port}
+	}
+	_ = conn.Close()
+	return OutboundTestResult{Success: true, Delay: delay, TestType: "tcp", Address: target.Address, Port: target.Port}
+}
+
+func measureOutboundICMP(target outboundTarget) OutboundTestResult {
+	if strings.TrimSpace(target.Address) == "" {
+		return OutboundTestResult{Success: false, Error: "ICMP test requires outbound address", TestType: "icmp", Address: target.Address, Port: target.Port}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	args := []string{"-c", "1", "-W", "5", target.Address}
+	if runtime.GOOS == "windows" {
+		args = []string{"-n", "1", "-w", "5000", target.Address}
+	}
+	output, err := exec.CommandContext(ctx, "ping", args...).CombinedOutput()
+	cleanOutput := strings.TrimSpace(string(output))
+	delay := parsePingDelay(cleanOutput)
+	if err != nil {
+		return OutboundTestResult{Success: false, Delay: delay, Error: firstNonEmptyString(cleanOutput, err.Error()), TestType: "icmp", Address: target.Address, Port: target.Port, Output: cleanOutput}
+	}
+	return OutboundTestResult{Success: true, Delay: delay, TestType: "icmp", Address: target.Address, Port: target.Port, Output: cleanOutput}
+}
+
+var pingDelayPattern = regexp.MustCompile(`(?i)time[=<]([0-9]+(?:\.[0-9]+)?)\s*ms`)
+
+func parsePingDelay(output string) int64 {
+	match := pingDelayPattern.FindStringSubmatch(output)
+	if len(match) < 2 {
+		return 0
+	}
+	value, err := strconv.ParseFloat(match[1], 64)
+	if err != nil {
+		return 0
+	}
+	return int64(value + 0.5)
+}
+
+func stringFromMap(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	value := values[key]
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func intFromAny(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int32:
+		return int(typed)
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		n, _ := typed.Int64()
+		return int(n)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(typed))
+		return n
+	default:
+		return 0
+	}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func buildOutboundTestConfig(outboundTag string, allOutbounds []map[string]any, testPort int) (map[string]any, error) {

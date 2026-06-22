@@ -8,6 +8,7 @@ type outboundTestPayload struct {
 	OutboundProtocol string           `json:"outbound_protocol"`
 	AllOutbounds     []map[string]any `json:"all_outbounds"`
 	TestURL          string           `json:"test_url"`
+	TestType         string           `json:"test_type"`
 }
 
 func (s *Server) handleOutboundTest(w http.ResponseWriter, r *http.Request) {
@@ -23,6 +24,7 @@ func (s *Server) handleOutboundTest(w http.ResponseWriter, r *http.Request) {
 		payload.OutboundProtocol,
 		payload.AllOutbounds,
 		payload.TestURL,
+		payload.TestType,
 	)
 	writeJSON(w, http.StatusOK, result)
 }

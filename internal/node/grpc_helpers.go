@@ -37,12 +37,17 @@ func (api *grpcAPI) TestOutbound(ctx context.Context, req *nodev1.OutboundTestRe
 		req.GetOutboundProtocol(),
 		allOutbounds,
 		req.GetTestUrl(),
+		req.GetTestType(),
 	)
 	return &nodev1.OutboundTestResponse{
 		Success:    result.Success,
 		Delay:      result.Delay,
 		StatusCode: int32(result.StatusCode),
 		Error:      result.Error,
+		TestType:   result.TestType,
+		Address:    result.Address,
+		Port:       int32(result.Port),
+		Output:     result.Output,
 	}, nil
 }
 
