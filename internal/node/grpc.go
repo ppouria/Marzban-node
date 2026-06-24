@@ -417,11 +417,7 @@ func (s *Server) grpcUpdateRuntime(version string) error {
 	if err != nil {
 		return status.Error(codes.FailedPrecondition, err.Error())
 	}
-	url := fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/download/%s/%s", version, asset)
-	if err := validatePublicHTTPURL(url); err != nil {
-		return status.Error(codes.InvalidArgument, err.Error())
-	}
-	body, err := download(url, 120*time.Second)
+	body, err := downloadXrayCoreArchive(version, asset, 120*time.Second)
 	if err != nil {
 		return status.Error(codes.Unavailable, "download failed: "+err.Error())
 	}

@@ -47,6 +47,8 @@ const sessionTTL = 30 * time.Minute
 var xrayVersionPattern = regexp.MustCompile(`^v\d+\.\d+\.\d+(?:[-+._A-Za-z0-9]*)?$`)
 var releaseVersionPattern = regexp.MustCompile(`^v?\d+(?:\.\d+){1,3}(?:[-+._A-Za-z0-9]*)?$`)
 var allowedGeoFiles = map[string]struct{}{"geoip.dat": {}, "geosite.dat": {}}
+var xrayCoreDownloadBaseURLs = []string{"https://github.com/XTLS/Xray-core/releases/download"}
+var validateXrayCoreDownloadURL = validatePublicHTTPURL
 
 func New(settings appconfig.Settings) (*Server, error) {
 	core, err := xray.NewCore(settings.XrayExecutablePath, settings.XrayAssetsPath, settings.Debug)
@@ -255,12 +257,7 @@ func (s *Server) handleUpdateCore(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	url := fmt.Sprintf("https://github.com/XTLS/Xray-core/releases/download/%s/%s", payload.Version, asset)
-	if err := validatePublicHTTPURL(url); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
-		return
-	}
-	body, err := download(url, 120*time.Second)
+	body, err := downloadXrayCoreArchive(payload.Version, asset, 120*time.Second)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "Download failed: "+err.Error())
 		return
@@ -1001,15 +998,84 @@ func tailFile(path string, maxLines int) ([]string, bool, error) {
 
 func download(url string, timeout time.Duration) ([]byte, error) {
 	client := http.Client{Timeout: timeout}
-	res, err := client.Get(url)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Rebecca-node")
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 400 {
-		return nil, fmt.Errorf("http status %d", res.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 2048))
+		return nil, fmt.Errorf("http status %d: %s", res.StatusCode, summarizeDownloadBody(body))
 	}
 	return io.ReadAll(res.Body)
+}
+
+func downloadXrayCoreArchive(version string, asset string, timeout time.Duration) ([]byte, error) {
+	urls := xrayCoreDownloadURLs(version, asset)
+	failures := make([]string, 0, len(urls))
+	for _, candidate := range urls {
+		if err := validateXrayCoreDownloadURL(candidate); err != nil {
+			failures = append(failures, candidate+": "+err.Error())
+			continue
+		}
+		body, err := download(candidate, timeout)
+		if err != nil {
+			failures = append(failures, candidate+": "+err.Error())
+			continue
+		}
+		if _, err := zip.NewReader(bytes.NewReader(body), int64(len(body))); err != nil {
+			failures = append(failures, candidate+": invalid Xray archive: "+summarizeDownloadBody(body))
+			continue
+		}
+		return body, nil
+	}
+	return nil, errors.New(strings.Join(failures, "; "))
+}
+
+func xrayCoreDownloadURLs(version string, asset string) []string {
+	version = strings.TrimSpace(version)
+	asset = strings.TrimSpace(asset)
+	bases := make([]string, 0, len(xrayCoreDownloadBaseURLs)+1)
+	if custom := strings.TrimSpace(os.Getenv("XRAY_CORE_DOWNLOAD_BASE_URL")); custom != "" {
+		bases = append(bases, custom)
+	}
+	bases = append(bases, xrayCoreDownloadBaseURLs...)
+	urls := make([]string, 0, len(bases))
+	seen := map[string]struct{}{}
+	for _, base := range bases {
+		base = strings.TrimRight(strings.TrimSpace(base), "/")
+		if base == "" {
+			continue
+		}
+		candidate := base + "/" + version + "/" + asset
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		urls = append(urls, candidate)
+	}
+	return urls
+}
+
+func summarizeDownloadBody(body []byte) string {
+	text := strings.TrimSpace(string(body))
+	if text == "" {
+		return "empty response"
+	}
+	lower := strings.ToLower(text)
+	if strings.HasPrefix(lower, "<!doctype html") || strings.HasPrefix(lower, "<html") {
+		return "HTML error page from upstream"
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 240 {
+		text = text[:240] + "..."
+	}
+	return text
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
