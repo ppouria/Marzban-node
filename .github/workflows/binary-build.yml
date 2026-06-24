@@ -79,7 +79,7 @@ jobs:
           fi
 
           SHOULD_BUILD="false"
-          if [[ "${UPLOAD_RELEASE}" == "true" || "${{ github.event_name }}" == "workflow_dispatch" || "${{ matrix.asset_arch }}" == "amd64" ]]; then
+          if [[ "${UPLOAD_RELEASE}" == "true" || "${{ github.event_name }}" == "workflow_dispatch" || "${{ github.event_name }}" == "push" ]]; then
             SHOULD_BUILD="true"
           fi
 
