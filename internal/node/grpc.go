@@ -46,7 +46,11 @@ func (s *Server) ListenAndServeGRPC() error {
 		return err
 	}
 
-	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
+	grpcServer := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(tlsConfig)),
+		grpc.MaxRecvMsgSize(64<<20),
+		grpc.MaxSendMsgSize(64<<20),
+	)
 	s.registerGRPC(grpcServer)
 	return grpcServer.Serve(listener)
 }
