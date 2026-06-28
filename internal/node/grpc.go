@@ -564,12 +564,17 @@ func protoInboundUser(user *nodev1.InboundUser) (xray.InboundUser, error) {
 	if err != nil {
 		return xray.InboundUser{}, err
 	}
+	auth := strings.TrimSpace(fields["auth"])
+	if auth == "" {
+		auth = strings.TrimSpace(fields["password"])
+	}
 	return xray.InboundUser{
 		Email:      strings.TrimSpace(user.GetEmail()),
 		Protocol:   strings.TrimSpace(user.GetProtocol()),
 		Level:      level,
 		ID:         strings.TrimSpace(fields["id"]),
 		Password:   strings.TrimSpace(fields["password"]),
+		Auth:       auth,
 		Flow:       strings.TrimSpace(fields["flow"]),
 		Method:     strings.TrimSpace(fields["method"]),
 		CipherType: cipherType,

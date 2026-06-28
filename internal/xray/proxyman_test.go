@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/xtls/xray-core/common/serial"
+	hysteriaAccount "github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
 	"github.com/xtls/xray-core/proxy/trojan"
 	"github.com/xtls/xray-core/proxy/vless"
@@ -56,6 +57,15 @@ func TestBuildProtocolUserAccounts(t *testing.T) {
 			},
 			expected: &shadowsocks.Account{},
 		},
+		{
+			name: "hysteria",
+			user: InboundUser{
+				Protocol: "hysteria",
+				Email:    "1.test",
+				Auth:     "secret-auth",
+			},
+			expected: &hysteriaAccount.Account{},
+		},
 	}
 
 	for _, tt := range tests {
@@ -99,6 +109,7 @@ func TestBuildProtocolUserRejectsInvalidAccounts(t *testing.T) {
 		{Protocol: "vless", Email: "1.test"},
 		{Protocol: "trojan", Email: "1.test"},
 		{Protocol: "shadowsocks", Email: "1.test"},
+		{Protocol: "hysteria", Email: "1.test"},
 		{Protocol: "unknown", Email: "1.test"},
 		{Protocol: "vless", ID: "22222222-2222-2222-2222-222222222222"},
 	}

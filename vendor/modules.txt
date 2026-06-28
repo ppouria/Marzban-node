@@ -125,6 +125,7 @@ github.com/xtls/xray-core/features/routing/session
 github.com/xtls/xray-core/features/stats
 github.com/xtls/xray-core/main/confloader
 github.com/xtls/xray-core/proxy
+github.com/xtls/xray-core/proxy/hysteria/account
 github.com/xtls/xray-core/proxy/shadowsocks
 github.com/xtls/xray-core/proxy/trojan
 github.com/xtls/xray-core/proxy/vless

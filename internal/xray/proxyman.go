@@ -9,6 +9,7 @@ import (
 	proxyman "github.com/xtls/xray-core/app/proxyman/command"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
+	hysteriaAccount "github.com/xtls/xray-core/proxy/hysteria/account"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
 	"github.com/xtls/xray-core/proxy/trojan"
 	"github.com/xtls/xray-core/proxy/vless"
@@ -22,6 +23,7 @@ type InboundUser struct {
 	Level      uint32 `json:"level"`
 	ID         string `json:"id"`
 	Password   string `json:"password"`
+	Auth       string `json:"auth"`
 	Flow       string `json:"flow"`
 	Method     string `json:"method"`
 	CipherType int32  `json:"cipher_type"`
@@ -137,6 +139,15 @@ func buildAccountMessage(user InboundUser) (proto.Message, error) {
 			CipherType: resolveShadowsocksCipher(user),
 			IvCheck:    user.IVCheck,
 		}, nil
+	case "hysteria":
+		auth := strings.TrimSpace(user.Auth)
+		if auth == "" {
+			auth = strings.TrimSpace(user.Password)
+		}
+		if auth == "" {
+			return nil, fmt.Errorf("auth is required for hysteria")
+		}
+		return &hysteriaAccount.Account{Auth: auth}, nil
 	default:
 		return nil, fmt.Errorf("unsupported protocol %q", user.Protocol)
 	}

@@ -157,6 +157,13 @@ func outboundTargetFromConfig(outbound map[string]any) (outboundTarget, bool) {
 		return targetFromArray(settings["vnext"], "address", "port")
 	case "trojan", "shadowsocks", "socks", "http":
 		return targetFromArray(settings["servers"], "address", "port")
+	case "hysteria":
+		address := stringFromMap(settings, "address")
+		port := intFromAny(settings["port"])
+		if strings.TrimSpace(address) == "" || port <= 0 {
+			return targetFromEndpoint(address)
+		}
+		return outboundTarget{Address: strings.Trim(strings.TrimSpace(address), "[]"), Port: port}, true
 	case "wireguard":
 		if target, ok := targetFromArray(settings["peers"], "endpoint", ""); ok {
 			return target, true
