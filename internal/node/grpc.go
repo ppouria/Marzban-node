@@ -174,6 +174,9 @@ func (api *grpcAPI) UpdateUser(ctx context.Context, req *nodev1.InboundUserReque
 	); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
+	if err := api.server.addUserToConfigCache(inboundTag, user); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
 	return api.server.grpcAction(req.GetOperationId(), true, "user updated"), nil
 }
 
@@ -196,6 +199,11 @@ func (api *grpcAPI) RemoveUser(ctx context.Context, req *nodev1.RemoveInboundUse
 		inboundTag,
 		email,
 	); err != nil {
+		if !isIgnorableXrayRemoveError(err) {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
+	}
+	if err := api.server.removeUserFromConfigCache(inboundTag, email); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 	return api.server.grpcAction(req.GetOperationId(), true, "user removed"), nil
@@ -404,6 +412,11 @@ func (s *Server) grpcAddUser(req *nodev1.InboundUserRequest, message string) (*n
 		inboundTag,
 		user,
 	); err != nil {
+		if !isIgnorableXrayAddError(err) {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
+	}
+	if err := s.addUserToConfigCache(inboundTag, user); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil

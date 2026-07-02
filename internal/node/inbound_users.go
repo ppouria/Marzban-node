@@ -46,6 +46,12 @@ func (s *Server) handleAddInboundUser(w http.ResponseWriter, r *http.Request) {
 		payload.InboundTag,
 		payload.User,
 	); err != nil {
+		if !isIgnorableXrayAddError(err) {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+	}
+	if err := s.addUserToConfigCache(payload.InboundTag, payload.User); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
@@ -84,9 +90,36 @@ func (s *Server) handleRemoveInboundUser(w http.ResponseWriter, r *http.Request)
 		payload.InboundTag,
 		payload.Email,
 	); err != nil {
+		if !isIgnorableXrayRemoveError(err) {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+	}
+	if err := s.removeUserFromConfigCache(payload.InboundTag, payload.Email); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"status": "removed"})
+}
+
+func isIgnorableXrayRemoveError(err error) bool {
+	if err == nil {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "not found") ||
+		strings.Contains(message, "not exist") ||
+		strings.Contains(message, "no such user") ||
+		strings.Contains(message, "email not found")
+}
+
+func isIgnorableXrayAddError(err error) bool {
+	if err == nil {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "already exists") ||
+		strings.Contains(message, "email exists") ||
+		strings.Contains(message, "duplicate")
 }
