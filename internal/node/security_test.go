@@ -61,6 +61,7 @@ func TestNodeUpdateArgsSupportsReleaseAndDevChannels(t *testing.T) {
 		{name: "dev channel", channel: "dev", want: []string{"update", "--dev"}},
 		{name: "specific version", version: "v1.2.3", want: []string{"update", "--version", "v1.2.3"}},
 		{name: "latest version", version: "latest", want: []string{"update", "--version", "latest"}},
+		{name: "dev version tag", version: "dev-abcdef0", want: []string{"update", "--dev"}},
 	}
 
 	for _, tt := range tests {

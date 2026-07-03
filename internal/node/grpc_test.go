@@ -209,6 +209,43 @@ func TestGRPCServerAcceptsPinnedTLSWithoutClientCertificate(t *testing.T) {
 	}
 }
 
+func TestGRPCNodeVersionPrefersBinaryMetadata(t *testing.T) {
+	tempDir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(tempDir, ".binary-release.json"),
+		[]byte(`{"install_mode":"binary","tag":"dev-abcdef0","arch":"linux-amd64"}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("failed to write metadata: %v", err)
+	}
+	server := &Server{
+		settings: appconfig.Settings{
+			AppName:        "rebecca-node",
+			InstallMode:    "binary",
+			NodeVersion:    "0.2.2",
+			RebeccaDataDir: tempDir,
+		},
+		core:     &xray.Core{},
+		usage:    newUsageBuffer(),
+		sessions: make(map[string]time.Time),
+	}
+	api := &grpcAPI{server: server}
+
+	hello, err := api.Hello(context.Background(), &nodev1.HelloRequest{})
+	if err != nil {
+		t.Fatalf("hello failed: %v", err)
+	}
+	if hello.GetNodeVersion() != "dev-abcdef0" {
+		t.Fatalf("expected metadata node version, got %q", hello.GetNodeVersion())
+	}
+	if hello.GetUpdateChannel() != "dev" {
+		t.Fatalf("expected dev update channel, got %q", hello.GetUpdateChannel())
+	}
+	if hello.GetRuntime().GetNodeVersion() != "dev-abcdef0" {
+		t.Fatalf("expected runtime metadata node version, got %q", hello.GetRuntime().GetNodeVersion())
+	}
+}
+
 func TestGRPCTestOutboundRejectsMissingTag(t *testing.T) {
 	api := &grpcAPI{server: &Server{core: &xray.Core{}}}
 	response, err := api.TestOutbound(context.Background(), &nodev1.OutboundTestRequest{

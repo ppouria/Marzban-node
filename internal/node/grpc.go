@@ -94,7 +94,7 @@ func loadGRPCServerTLS(settings appconfig.Settings) (*tls.Config, error) {
 func (api *grpcAPI) Hello(ctx context.Context, _ *nodev1.HelloRequest) (*nodev1.HelloResponse, error) {
 	return &nodev1.HelloResponse{
 		NodeName:      api.server.settings.AppName,
-		NodeVersion:   api.server.settings.NodeVersion,
+		NodeVersion:   api.server.nodeVersion(),
 		InstallMode:   api.server.settings.InstallMode,
 		UpdateChannel: api.server.updateChannel(),
 		Runtime:       api.server.grpcRuntimeState("hello"),
@@ -520,7 +520,7 @@ func (s *Server) grpcRuntimeState(message string) *nodev1.RuntimeState {
 		Connected:     connected,
 		Started:       s.core.Started(),
 		CoreVersion:   s.core.Version(),
-		NodeVersion:   s.settings.NodeVersion,
+		NodeVersion:   s.nodeVersion(),
 		InstallMode:   s.settings.InstallMode,
 		UpdateChannel: s.updateChannel(),
 		Message:       message,

@@ -780,7 +780,7 @@ func (s *Server) response(extra map[string]any) map[string]any {
 		"connected":    connected,
 		"started":      s.core.Started(),
 		"core_version": s.core.Version(),
-		"node_version": s.settings.NodeVersion,
+		"node_version": s.nodeVersion(),
 		"install_mode": s.settings.InstallMode,
 	}
 	if s.system != nil {
@@ -816,6 +816,15 @@ func (s *Server) binaryMetadata() map[string]any {
 	return metadata
 }
 
+func (s *Server) nodeVersion() string {
+	if metadata := s.binaryMetadata(); metadata != nil {
+		if tag, ok := metadata["tag"].(string); ok && strings.TrimSpace(tag) != "" {
+			return strings.TrimSpace(tag)
+		}
+	}
+	return s.settings.NodeVersion
+}
+
 func updateChannelForTag(tag string) string {
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(tag)), "dev-") {
 		return "dev"
@@ -837,6 +846,9 @@ func nodeUpdateArgs(channel string, version string) ([]string, error) {
 		case "dev":
 			return append(args, "--dev"), nil
 		default:
+			if strings.HasPrefix(strings.ToLower(normalizedVersion), "dev-") {
+				return append(args, "--dev"), nil
+			}
 			if !releaseVersionPattern.MatchString(normalizedVersion) {
 				return nil, errors.New("invalid update version")
 			}
