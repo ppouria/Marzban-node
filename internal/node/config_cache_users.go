@@ -3,6 +3,7 @@ package node
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/rebeccapanel/rebecca-node/internal/xray"
@@ -14,6 +15,42 @@ func (s *Server) addUserToConfigCache(inboundTag string, user xray.InboundUser) 
 
 func (s *Server) removeUserFromConfigCache(inboundTag string, email string) error {
 	return s.patchConfigCacheUser(inboundTag, xray.InboundUser{}, email)
+}
+
+func (s *Server) applyConfigCacheUserDiff(incomingConfig string) error {
+	s.mu.Lock()
+	payload, ok := s.loadConfigCache()
+	s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	diff, err := configUserDiff(payload.Config, incomingConfig)
+	if err != nil {
+		return err
+	}
+	for _, item := range diff.remove {
+		if err := xray.RemoveInboundUser(
+			s.settings.XrayAPIHost,
+			s.settings.XrayAPIPort,
+			grpcOperationTimeout,
+			item.inboundTag,
+			item.email,
+		); err != nil && !isIgnorableXrayRemoveError(err) {
+			return err
+		}
+	}
+	for _, item := range diff.add {
+		if err := xray.AddInboundUser(
+			s.settings.XrayAPIHost,
+			s.settings.XrayAPIPort,
+			grpcOperationTimeout,
+			item.inboundTag,
+			item.user,
+		); err != nil && !isIgnorableXrayAddError(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Server) patchConfigCacheUser(inboundTag string, user xray.InboundUser, removeEmail string) error {
@@ -158,5 +195,188 @@ func asString(value any) string {
 		return ""
 	default:
 		return fmt.Sprint(value)
+	}
+}
+
+type configUserDiffResult struct {
+	add    []configUserAdd
+	remove []configUserRemove
+}
+
+type configUserAdd struct {
+	inboundTag string
+	user       xray.InboundUser
+}
+
+type configUserRemove struct {
+	inboundTag string
+	email      string
+}
+
+type configClientState struct {
+	protocol string
+	clients  map[string]xray.InboundUser
+	raw      map[string]string
+}
+
+func configUserDiff(cachedConfig string, incomingConfig string) (configUserDiffResult, error) {
+	cached, err := configClientStates(cachedConfig)
+	if err != nil {
+		return configUserDiffResult{}, err
+	}
+	incoming, err := configClientStates(incomingConfig)
+	if err != nil {
+		return configUserDiffResult{}, err
+	}
+	diff := configUserDiffResult{}
+	for tag, incomingState := range incoming {
+		cachedState := cached[tag]
+		for email := range cachedState.clients {
+			if _, ok := incomingState.clients[email]; !ok {
+				diff.remove = append(diff.remove, configUserRemove{inboundTag: tag, email: email})
+			}
+		}
+		for email, user := range incomingState.clients {
+			if cachedState.raw[email] == incomingState.raw[email] {
+				continue
+			}
+			if _, ok := cachedState.clients[email]; ok {
+				diff.remove = append(diff.remove, configUserRemove{inboundTag: tag, email: email})
+			}
+			diff.add = append(diff.add, configUserAdd{inboundTag: tag, user: user})
+		}
+	}
+	return diff, nil
+}
+
+func configClientStates(rawConfig string) (map[string]configClientState, error) {
+	var config map[string]any
+	if err := json.Unmarshal([]byte(rawConfig), &config); err != nil {
+		return nil, err
+	}
+	result := map[string]configClientState{}
+	for _, item := range anySlice(config["inbounds"]) {
+		inbound, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		tag := strings.TrimSpace(asString(inbound["tag"]))
+		protocol := strings.ToLower(strings.TrimSpace(asString(inbound["protocol"])))
+		if tag == "" || protocol == "" {
+			continue
+		}
+		settings, _ := inbound["settings"].(map[string]any)
+		state := configClientState{
+			protocol: protocol,
+			clients:  map[string]xray.InboundUser{},
+			raw:      map[string]string{},
+		}
+		for _, item := range anySlice(settings["clients"]) {
+			client, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			user, err := inboundUserFromClient(protocol, client)
+			if err != nil {
+				return nil, fmt.Errorf("inbound %s client: %w", tag, err)
+			}
+			if user.Email == "" {
+				continue
+			}
+			state.clients[user.Email] = user
+			encoded, _ := json.Marshal(client)
+			state.raw[user.Email] = string(encoded)
+		}
+		result[tag] = state
+	}
+	return result, nil
+}
+
+func inboundUserFromClient(protocol string, client map[string]any) (xray.InboundUser, error) {
+	level, err := uint32ClientValue(client["level"])
+	if err != nil {
+		return xray.InboundUser{}, err
+	}
+	cipherType, err := int32ClientValue(firstPresent(client, "cipher_type", "cipherType"))
+	if err != nil {
+		return xray.InboundUser{}, err
+	}
+	ivCheck, _ := boolClientValue(firstPresent(client, "iv_check", "ivCheck"))
+	auth := strings.TrimSpace(asString(client["auth"]))
+	if auth == "" {
+		auth = strings.TrimSpace(asString(client["password"]))
+	}
+	return xray.InboundUser{
+		Protocol:   protocol,
+		Email:      strings.TrimSpace(asString(client["email"])),
+		Level:      level,
+		ID:         strings.TrimSpace(asString(firstPresent(client, "id", "uuid"))),
+		Password:   strings.TrimSpace(asString(client["password"])),
+		Auth:       auth,
+		Flow:       strings.TrimSpace(asString(client["flow"])),
+		Method:     strings.TrimSpace(asString(client["method"])),
+		CipherType: cipherType,
+		IVCheck:    ivCheck,
+	}, nil
+}
+
+func firstPresent(values map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := values[key]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func uint32ClientValue(value any) (uint32, error) {
+	switch typed := value.(type) {
+	case nil:
+		return 0, nil
+	case float64:
+		return uint32(typed), nil
+	case json.Number:
+		parsed, err := typed.Int64()
+		return uint32(parsed), err
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return 0, nil
+		}
+		parsed, err := strconv.ParseUint(strings.TrimSpace(typed), 10, 32)
+		return uint32(parsed), err
+	default:
+		return 0, fmt.Errorf("level must be numeric")
+	}
+}
+
+func int32ClientValue(value any) (int32, error) {
+	switch typed := value.(type) {
+	case nil:
+		return 0, nil
+	case float64:
+		return int32(typed), nil
+	case json.Number:
+		parsed, err := typed.Int64()
+		return int32(parsed), err
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return 0, nil
+		}
+		parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 32)
+		return int32(parsed), err
+	default:
+		return 0, fmt.Errorf("cipher_type must be numeric")
+	}
+}
+
+func boolClientValue(value any) (bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(typed))
+		return parsed, err == nil
+	default:
+		return false, false
 	}
 }

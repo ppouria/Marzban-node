@@ -69,6 +69,38 @@ func TestPatchConfigCacheUserJSONRemovesUser(t *testing.T) {
 	}
 }
 
+func TestConfigUserDiffAddsUpdatesAndRemovesUsers(t *testing.T) {
+	cached := `{"inbounds":[{"tag":"vless-ws","protocol":"vless","settings":{"clients":[{"email":"1.old","id":"old-id"},{"email":"2.alice","id":"alice-id"}]}}]}`
+	incoming := `{"inbounds":[{"tag":"vless-ws","protocol":"vless","settings":{"clients":[{"email":"2.alice","id":"alice-new-id","flow":"xtls-rprx-vision"},{"email":"3.bob","id":"bob-id"}]}}]}`
+
+	diff, err := configUserDiff(cached, incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diff.remove) != 2 {
+		t.Fatalf("expected one deleted and one replaced user removal, got %#v", diff.remove)
+	}
+	if diff.remove[0].inboundTag != "vless-ws" || diff.remove[0].email != "1.old" {
+		t.Fatalf("unexpected deleted user removal: %#v", diff.remove[0])
+	}
+	if diff.remove[1].inboundTag != "vless-ws" || diff.remove[1].email != "2.alice" {
+		t.Fatalf("unexpected replaced user removal: %#v", diff.remove[1])
+	}
+	if len(diff.add) != 2 {
+		t.Fatalf("expected replaced and new user additions, got %#v", diff.add)
+	}
+	adds := map[string]configUserAdd{}
+	for _, item := range diff.add {
+		adds[item.user.Email] = item
+	}
+	if item := adds["2.alice"]; item.inboundTag != "vless-ws" || item.user.ID != "alice-new-id" || item.user.Flow != "xtls-rprx-vision" {
+		t.Fatalf("unexpected replaced user addition: %#v", item)
+	}
+	if item := adds["3.bob"]; item.inboundTag != "vless-ws" || item.user.ID != "bob-id" {
+		t.Fatalf("unexpected new user addition: %#v", item)
+	}
+}
+
 func cacheTestClients(t *testing.T, raw string) []map[string]any {
 	t.Helper()
 	var config struct {

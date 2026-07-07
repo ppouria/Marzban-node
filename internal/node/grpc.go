@@ -472,6 +472,9 @@ func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeCo
 	if err != nil {
 		return nil, err
 	}
+	if err := s.applyConfigCacheUserDiff(req.GetConfigJson()); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
 	cacheRuntime := runtimeConfig
 	if cacheRuntime == nil {
 		cacheRuntime = s.cachedOVRuntime()
