@@ -302,7 +302,7 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	line(&b, "script-security 3")
 	line(&b, "auth-user-pass-verify "+filepath.Join(dir, "auth.sh")+" via-env")
 	line(&b, "client-disconnect "+filepath.Join(dir, "client-disconnect.sh"))
-	line(&b, "keepalive 10 120")
+	line(&b, "keepalive 10 300")
 	line(&b, "persist-key")
 	line(&b, "persist-tun")
 	line(&b, "status "+filepath.Join(dir, "status.log")+" 60")
