@@ -488,6 +488,12 @@ func applyTProxyRouting() error {
 		}
 	}
 	if output, err := exec.Command(ip, "route", "show", "table", "100").CombinedOutput(); err != nil {
+		if isMissingRouteTableOutput(output) {
+			if err := runCommandIgnoreExists(ip, "route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", "100"); err != nil {
+				return err
+			}
+			return nil
+		}
 		return fmt.Errorf("%s route show table 100: %v: %s", ip, err, strings.TrimSpace(string(output)))
 	} else if strings.TrimSpace(string(output)) != "local default dev lo scope host" {
 		if err := runCommandIgnoreExists(ip, "route", "replace", "local", "0.0.0.0/0", "dev", "lo", "table", "100"); err != nil {
@@ -495,6 +501,12 @@ func applyTProxyRouting() error {
 		}
 	}
 	return nil
+}
+
+func isMissingRouteTableOutput(output []byte) bool {
+	text := strings.ToLower(string(output))
+	return strings.Contains(text, "fib table does not exist") ||
+		strings.Contains(text, "dump terminated")
 }
 
 func runCommandIgnoreExists(command string, args ...string) error {
