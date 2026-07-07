@@ -35,6 +35,7 @@ type Server struct {
 	ov       *ovManager
 	l2tp     *l2tpManager
 	pptp     *pptpManager
+	wg       *wgManager
 	usage    *usageBuffer
 	system   *systemSampler
 
@@ -69,6 +70,7 @@ func New(settings appconfig.Settings) (*Server, error) {
 		ov:       newOVManager(settings.RebeccaDataDir, settings.InstallMode),
 		l2tp:     newL2TPManager(settings.RebeccaDataDir, settings.InstallMode),
 		pptp:     newPPTPManager(settings.RebeccaDataDir, settings.InstallMode),
+		wg:       newWGManager(settings.RebeccaDataDir, settings.InstallMode),
 		usage:    usage,
 		system:   newSystemSampler(),
 		sessions: make(map[string]time.Time),
@@ -220,9 +222,10 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
 	pptpWarning := s.applyPPTPRuntime(payload.PPTPRuntime)
-	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime, payload.PPTPRuntime)
+	wgWarning := s.applyWGRuntime(payload.WGRuntime)
+	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime, payload.PPTPRuntime, payload.WGRuntime)
 	response := s.response(nil)
-	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
+	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
 		response["warning"] = warning
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -243,6 +246,10 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.pptp.Apply(&pptpRuntime{Inbounds: []pptpRuntimeInbound{}}); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if err := s.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
@@ -282,9 +289,10 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}
 	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
 	pptpWarning := s.applyPPTPRuntime(payload.PPTPRuntime)
-	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime, payload.PPTPRuntime)
+	wgWarning := s.applyWGRuntime(payload.WGRuntime)
+	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime, payload.PPTPRuntime, payload.WGRuntime)
 	response := s.response(nil)
-	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
+	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
 		response["warning"] = warning
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -303,15 +311,20 @@ func (s *Server) handleRuntimeOnly(w http.ResponseWriter, payload configPayload)
 	if pptpRuntimeConfig == nil {
 		pptpRuntimeConfig = s.cachedPPTPRuntime()
 	}
+	wgRuntimeConfig := payload.WGRuntime
+	if wgRuntimeConfig == nil {
+		wgRuntimeConfig = s.cachedWGRuntime()
+	}
 	if err := s.ov.Apply(payload.OVRuntime); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
 	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
 	pptpWarning := s.applyPPTPRuntime(payload.PPTPRuntime)
-	s.saveConfigCache(payload.Config, s.currentClientIP(), ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig)
+	wgWarning := s.applyWGRuntime(payload.WGRuntime)
+	s.saveConfigCache(payload.Config, s.currentClientIP(), ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig)
 	response := s.response(nil)
-	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
+	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
 		response["warning"] = warning
 	}
 	writeJSON(w, http.StatusOK, response)
@@ -497,6 +510,9 @@ func (s *Server) snapshotRunningUsage() {
 	if stats := s.pptp.CollectUsage(); len(stats) > 0 {
 		s.usage.addUsers(stats)
 	}
+	if stats := s.wg.CollectUsage(); len(stats) > 0 {
+		s.usage.addUsers(stats)
+	}
 	if !s.core.Started() {
 		return
 	}
@@ -559,6 +575,9 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	if pptpStats := s.pptp.CollectUsage(); len(pptpStats) > 0 {
 		stats = append(stats, pptpStats...)
+	}
+	if wgStats := s.wg.CollectUsage(); len(wgStats) > 0 {
+		stats = append(stats, wgStats...)
 	}
 	batchID, pending := s.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
@@ -747,6 +766,7 @@ type configPayload struct {
 	OVRuntime   *ovRuntime   `json:"ov_runtime,omitempty"`
 	L2TPRuntime *l2tpRuntime `json:"l2tp_runtime,omitempty"`
 	PPTPRuntime *pptpRuntime `json:"pptp_runtime,omitempty"`
+	WGRuntime   *wgRuntime   `json:"wg_runtime,omitempty"`
 }
 
 type cachedConfigPayload struct {
@@ -755,17 +775,18 @@ type cachedConfigPayload struct {
 	OVRuntime   *ovRuntime   `json:"ov_runtime,omitempty"`
 	L2TPRuntime *l2tpRuntime `json:"l2tp_runtime,omitempty"`
 	PPTPRuntime *pptpRuntime `json:"pptp_runtime,omitempty"`
+	WGRuntime   *wgRuntime   `json:"wg_runtime,omitempty"`
 }
 
 func (s *Server) configCachePath() string {
 	return filepath.Join(s.settings.RebeccaDataDir, "xray-config-cache.json")
 }
 
-func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime, pptpRuntimeConfig *pptpRuntime) {
+func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime, pptpRuntimeConfig *pptpRuntime, wgRuntimeConfig *wgRuntime) {
 	if strings.TrimSpace(rawConfig) == "" {
 		return
 	}
-	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig})
+	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig, WGRuntime: wgRuntimeConfig})
 	if err != nil {
 		return
 	}
@@ -821,6 +842,14 @@ func (s *Server) cachedPPTPRuntime() *pptpRuntime {
 	return payload.PPTPRuntime
 }
 
+func (s *Server) cachedWGRuntime() *wgRuntime {
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return nil
+	}
+	return payload.WGRuntime
+}
+
 func (s *Server) applyL2TPRuntime(runtimeConfig *l2tpRuntime) string {
 	if err := s.l2tp.Apply(runtimeConfig); err != nil {
 		warning := "L2TP runtime apply failed: " + err.Error()
@@ -833,6 +862,15 @@ func (s *Server) applyL2TPRuntime(runtimeConfig *l2tpRuntime) string {
 func (s *Server) applyPPTPRuntime(runtimeConfig *pptpRuntime) string {
 	if err := s.pptp.Apply(runtimeConfig); err != nil {
 		warning := "PPTP runtime apply failed: " + err.Error()
+		log.Print(warning)
+		return warning
+	}
+	return ""
+}
+
+func (s *Server) applyWGRuntime(runtimeConfig *wgRuntime) string {
+	if err := s.wg.Apply(runtimeConfig); err != nil {
+		warning := "WireGuard runtime apply failed: " + err.Error()
 		log.Print(warning)
 		return warning
 	}
@@ -881,6 +919,9 @@ func (s *Server) startCachedConfig() {
 	}
 	if err := s.pptp.Apply(payload.PPTPRuntime); err != nil {
 		log.Printf("failed to apply cached PPTP runtime: %v", err)
+	}
+	if err := s.wg.Apply(payload.WGRuntime); err != nil {
+		log.Printf("failed to apply cached WireGuard runtime: %v", err)
 	}
 }
 

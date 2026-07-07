@@ -153,6 +153,9 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 	if err := api.server.pptp.Apply(&pptpRuntime{Inbounds: []pptpRuntimeInbound{}}); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
+	if err := api.server.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
 	api.server.clearConfigCache()
 	return api.server.grpcAction(req.GetOperationId(), true, "runtime stopped"), nil
 }
@@ -310,6 +313,9 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 	if pptpStats := api.server.pptp.CollectUsage(); len(pptpStats) > 0 {
 		stats = append(stats, pptpStats...)
 	}
+	if wgStats := api.server.wg.CollectUsage(); len(wgStats) > 0 {
+		stats = append(stats, wgStats...)
+	}
 	batchID, pending := api.server.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
 	res := &nodev1.UserUsageBatch{BatchId: batchID}
@@ -386,7 +392,7 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if err != nil {
 		return nil, err
 	}
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -410,17 +416,22 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if cachePPTPRuntime == nil {
 		cachePPTPRuntime = s.cachedPPTPRuntime()
 	}
+	cacheWGRuntime := wgRuntimeConfig
+	if cacheWGRuntime == nil {
+		cacheWGRuntime = s.cachedWGRuntime()
+	}
 	if err := s.ov.Apply(runtimeConfig); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
 	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime)
+	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime)
 	message := "runtime started"
 	if sync {
 		message = "runtime config synced"
 	}
-	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
+	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
@@ -431,7 +442,7 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if err != nil {
 		return nil, err
 	}
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -455,20 +466,25 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if cachePPTPRuntime == nil {
 		cachePPTPRuntime = s.cachedPPTPRuntime()
 	}
+	cacheWGRuntime := wgRuntimeConfig
+	if cacheWGRuntime == nil {
+		cacheWGRuntime = s.cachedWGRuntime()
+	}
 	if err := s.ov.Apply(runtimeConfig); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
 	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime)
-	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
+	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime)
+	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
 }
 
 func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeConfigRequest, message string) (*nodev1.RuntimeActionResponse, error) {
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -487,13 +503,18 @@ func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeCo
 	if cachePPTPRuntime == nil {
 		cachePPTPRuntime = s.cachedPPTPRuntime()
 	}
+	cacheWGRuntime := wgRuntimeConfig
+	if cacheWGRuntime == nil {
+		cacheWGRuntime = s.cachedWGRuntime()
+	}
 	if err := s.ov.Apply(runtimeConfig); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
 	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime)
-	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
+	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime)
+	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
@@ -593,10 +614,10 @@ func (s *Server) grpcConfig(ctx context.Context, req *nodev1.RuntimeConfigReques
 	return cfg, nil
 }
 
-func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, *pptpRuntime, error) {
+func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, *pptpRuntime, *wgRuntime, error) {
 	raw := strings.TrimSpace(req.GetOvRuntimeJson())
 	if raw == "" {
-		return nil, nil, nil, nil
+		return nil, nil, nil, nil, nil
 	}
 	var envelope struct {
 		GeneratedAt   string               `json:"generated_at"`
@@ -606,9 +627,11 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 		L2TPGenerated string               `json:"l2tp_generated,omitempty"`
 		PPTPInbounds  []pptpRuntimeInbound `json:"pptp_inbounds"`
 		PPTPGenerated string               `json:"pptp_generated,omitempty"`
+		WGInbounds    []wgRuntimeInbound   `json:"wg_inbounds"`
+		WGGenerated   string               `json:"wg_generated,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
-		return nil, nil, nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
+		return nil, nil, nil, nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
 	}
 	ovRuntimeConfig := &ovRuntime{GeneratedAt: envelope.GeneratedAt, Target: envelope.Target, Inbounds: envelope.Inbounds}
 	if ovRuntimeConfig.Inbounds == nil {
@@ -622,7 +645,11 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 	if pptpRuntimeConfig.Inbounds == nil {
 		pptpRuntimeConfig.Inbounds = []pptpRuntimeInbound{}
 	}
-	return ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, nil
+	wgRuntimeConfig := &wgRuntime{GeneratedAt: envelope.WGGenerated, Target: envelope.Target, Inbounds: envelope.WGInbounds}
+	if wgRuntimeConfig.Inbounds == nil {
+		wgRuntimeConfig.Inbounds = []wgRuntimeInbound{}
+	}
+	return ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, nil
 }
 
 func (s *Server) grpcAddUser(req *nodev1.InboundUserRequest, message string) (*nodev1.RuntimeActionResponse, error) {
