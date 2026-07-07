@@ -199,7 +199,6 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.ov.Apply(payload.OVRuntime); err != nil {
-		s.core.Stop()
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
@@ -244,7 +243,6 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.ov.Apply(payload.OVRuntime); err != nil {
-		s.core.Stop()
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}

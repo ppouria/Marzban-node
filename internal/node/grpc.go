@@ -372,7 +372,6 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 		cacheRuntime = s.cachedOVRuntime()
 	}
 	if err := s.ov.Apply(runtimeConfig); err != nil {
-		s.core.Stop()
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime)
@@ -405,7 +404,6 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 		cacheRuntime = s.cachedOVRuntime()
 	}
 	if err := s.ov.Apply(runtimeConfig); err != nil {
-		s.core.Stop()
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime)
