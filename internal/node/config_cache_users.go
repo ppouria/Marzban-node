@@ -36,7 +36,7 @@ func (s *Server) patchConfigCacheUser(inboundTag string, user xray.InboundUser, 
 	if !changed {
 		return nil
 	}
-	s.saveConfigCache(configJSON, payload.PeerIP, payload.OVRuntime, payload.L2TPRuntime)
+	s.saveConfigCache(configJSON, payload.PeerIP, payload.OVRuntime, payload.L2TPRuntime, payload.PPTPRuntime)
 	return nil
 }
 

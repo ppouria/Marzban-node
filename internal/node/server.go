@@ -34,6 +34,7 @@ type Server struct {
 	core     *xray.Core
 	ov       *ovManager
 	l2tp     *l2tpManager
+	pptp     *pptpManager
 	usage    *usageBuffer
 	system   *systemSampler
 
@@ -67,6 +68,7 @@ func New(settings appconfig.Settings) (*Server, error) {
 		core:     core,
 		ov:       newOVManager(settings.RebeccaDataDir, settings.InstallMode),
 		l2tp:     newL2TPManager(settings.RebeccaDataDir, settings.InstallMode),
+		pptp:     newPPTPManager(settings.RebeccaDataDir, settings.InstallMode),
 		usage:    usage,
 		system:   newSystemSampler(),
 		sessions: make(map[string]time.Time),
@@ -206,10 +208,11 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
-	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime)
+	pptpWarning := s.applyPPTPRuntime(payload.PPTPRuntime)
+	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime, payload.PPTPRuntime)
 	response := s.response(nil)
-	if l2tpWarning != "" {
-		response["warning"] = l2tpWarning
+	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
+		response["warning"] = warning
 	}
 	writeJSON(w, http.StatusOK, response)
 }
@@ -225,6 +228,10 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.l2tp.Apply(&l2tpRuntime{Inbounds: []l2tpRuntimeInbound{}}); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if err := s.pptp.Apply(&pptpRuntime{Inbounds: []pptpRuntimeInbound{}}); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
@@ -259,10 +266,11 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
-	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime)
+	pptpWarning := s.applyPPTPRuntime(payload.PPTPRuntime)
+	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime, payload.PPTPRuntime)
 	response := s.response(nil)
-	if l2tpWarning != "" {
-		response["warning"] = l2tpWarning
+	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
+		response["warning"] = warning
 	}
 	writeJSON(w, http.StatusOK, response)
 }
@@ -444,6 +452,9 @@ func (s *Server) snapshotRunningUsage() {
 	if stats := s.l2tp.CollectUsage(); len(stats) > 0 {
 		s.usage.addUsers(stats)
 	}
+	if stats := s.pptp.CollectUsage(); len(stats) > 0 {
+		s.usage.addUsers(stats)
+	}
 	if !s.core.Started() {
 		return
 	}
@@ -503,6 +514,9 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	if l2tpStats := s.l2tp.CollectUsage(); len(l2tpStats) > 0 {
 		stats = append(stats, l2tpStats...)
+	}
+	if pptpStats := s.pptp.CollectUsage(); len(pptpStats) > 0 {
+		stats = append(stats, pptpStats...)
 	}
 	batchID, pending := s.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
@@ -690,6 +704,7 @@ type configPayload struct {
 	Config      string       `json:"config"`
 	OVRuntime   *ovRuntime   `json:"ov_runtime,omitempty"`
 	L2TPRuntime *l2tpRuntime `json:"l2tp_runtime,omitempty"`
+	PPTPRuntime *pptpRuntime `json:"pptp_runtime,omitempty"`
 }
 
 type cachedConfigPayload struct {
@@ -697,17 +712,18 @@ type cachedConfigPayload struct {
 	PeerIP      string       `json:"peer_ip"`
 	OVRuntime   *ovRuntime   `json:"ov_runtime,omitempty"`
 	L2TPRuntime *l2tpRuntime `json:"l2tp_runtime,omitempty"`
+	PPTPRuntime *pptpRuntime `json:"pptp_runtime,omitempty"`
 }
 
 func (s *Server) configCachePath() string {
 	return filepath.Join(s.settings.RebeccaDataDir, "xray-config-cache.json")
 }
 
-func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime) {
+func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime, pptpRuntimeConfig *pptpRuntime) {
 	if strings.TrimSpace(rawConfig) == "" {
 		return
 	}
-	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig})
+	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig})
 	if err != nil {
 		return
 	}
@@ -755,6 +771,14 @@ func (s *Server) cachedL2TPRuntime() *l2tpRuntime {
 	return payload.L2TPRuntime
 }
 
+func (s *Server) cachedPPTPRuntime() *pptpRuntime {
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return nil
+	}
+	return payload.PPTPRuntime
+}
+
 func (s *Server) applyL2TPRuntime(runtimeConfig *l2tpRuntime) string {
 	if err := s.l2tp.Apply(runtimeConfig); err != nil {
 		warning := "L2TP runtime apply failed: " + err.Error()
@@ -762,6 +786,26 @@ func (s *Server) applyL2TPRuntime(runtimeConfig *l2tpRuntime) string {
 		return warning
 	}
 	return ""
+}
+
+func (s *Server) applyPPTPRuntime(runtimeConfig *pptpRuntime) string {
+	if err := s.pptp.Apply(runtimeConfig); err != nil {
+		warning := "PPTP runtime apply failed: " + err.Error()
+		log.Print(warning)
+		return warning
+	}
+	return ""
+}
+
+func joinedWarnings(values ...string) string {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			parts = append(parts, value)
+		}
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (s *Server) clearConfigCache() {
@@ -792,6 +836,9 @@ func (s *Server) startCachedConfig() {
 	}
 	if err := s.l2tp.Apply(payload.L2TPRuntime); err != nil {
 		log.Printf("failed to apply cached L2TP runtime: %v", err)
+	}
+	if err := s.pptp.Apply(payload.PPTPRuntime); err != nil {
+		log.Printf("failed to apply cached PPTP runtime: %v", err)
 	}
 }
 
