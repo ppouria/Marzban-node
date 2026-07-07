@@ -81,9 +81,12 @@ func (c *Config) applyAPI() {
 	inbound := map[string]any{
 		"listen":   c.settings.XrayAPIHost,
 		"port":     c.settings.XrayAPIPort,
-		"protocol": "dokodemo-door",
-		"settings": map[string]any{"address": "127.0.0.1"},
-		"tag":      "API_INBOUND",
+		"protocol": "tunnel",
+		"settings": map[string]any{
+			"allowedNetwork": "tcp",
+			"rewriteAddress": "127.0.0.1",
+		},
+		"tag": "API_INBOUND",
 	}
 	inbounds, _ := c.data["inbounds"].([]any)
 	c.data["inbounds"] = append([]any{inbound}, inbounds...)
@@ -147,7 +150,7 @@ func (c *Config) filterInbounds() {
 			filtered = append(filtered, item)
 			continue
 		}
-		if inbound["protocol"] == "dokodemo-door" && inbound["tag"] == "API_INBOUND" {
+		if inbound["tag"] == "API_INBOUND" {
 			continue
 		}
 		if len(allowed) > 0 {

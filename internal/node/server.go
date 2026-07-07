@@ -32,6 +32,7 @@ import (
 type Server struct {
 	settings appconfig.Settings
 	core     *xray.Core
+	ov       *ovManager
 	usage    *usageBuffer
 	system   *systemSampler
 
@@ -63,6 +64,7 @@ func New(settings appconfig.Settings) (*Server, error) {
 	server := &Server{
 		settings: settings,
 		core:     core,
+		ov:       newOVManager(settings.RebeccaDataDir, settings.InstallMode),
 		usage:    usage,
 		system:   newSystemSampler(),
 		sessions: make(map[string]time.Time),
@@ -196,7 +198,12 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, strings.Join(s.core.Logs().Snapshot(), "\n"))
 		return
 	}
-	s.saveConfigCache(payload.Config, s.currentClientIP())
+	if err := s.ov.Apply(payload.OVRuntime); err != nil {
+		s.core.Stop()
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime)
 	writeJSON(w, http.StatusOK, s.response(nil))
 }
 
@@ -206,6 +213,10 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 	s.snapshotRunningUsage()
 	s.core.Stop()
+	if err := s.ov.Apply(&ovRuntime{Inbounds: []ovRuntimeInbound{}}); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	s.clearConfigCache()
 	writeJSON(w, http.StatusOK, s.response(nil))
 }
@@ -232,7 +243,12 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, strings.Join(s.core.Logs().Snapshot(), "\n"))
 		return
 	}
-	s.saveConfigCache(payload.Config, s.currentClientIP())
+	if err := s.ov.Apply(payload.OVRuntime); err != nil {
+		s.core.Stop()
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime)
 	writeJSON(w, http.StatusOK, s.response(nil))
 }
 
@@ -396,6 +412,9 @@ func (s *Server) handleOutboundUsage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) snapshotRunningUsage() {
+	if stats := s.ov.CollectUsage(); len(stats) > 0 {
+		s.usage.addUsers(stats)
+	}
 	if !s.core.Started() {
 		return
 	}
@@ -449,6 +468,9 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("failed to query online users: %v", err)
 		}
+	}
+	if OVStats := s.ov.CollectUsage(); len(OVStats) > 0 {
+		stats = append(stats, OVStats...)
 	}
 	batchID, pending := s.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
@@ -616,24 +638,26 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 type configPayload struct {
-	SessionID string `json:"session_id"`
-	Config    string `json:"config"`
+	SessionID string     `json:"session_id"`
+	Config    string     `json:"config"`
+	OVRuntime *ovRuntime `json:"ov_runtime,omitempty"`
 }
 
 type cachedConfigPayload struct {
-	Config string `json:"config"`
-	PeerIP string `json:"peer_ip"`
+	Config    string     `json:"config"`
+	PeerIP    string     `json:"peer_ip"`
+	OVRuntime *ovRuntime `json:"ov_runtime,omitempty"`
 }
 
 func (s *Server) configCachePath() string {
 	return filepath.Join(s.settings.RebeccaDataDir, "xray-config-cache.json")
 }
 
-func (s *Server) saveConfigCache(rawConfig string, peerIP string) {
+func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime) {
 	if strings.TrimSpace(rawConfig) == "" {
 		return
 	}
-	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP})
+	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig})
 	if err != nil {
 		return
 	}
@@ -665,6 +689,14 @@ func (s *Server) loadConfigCache() (cachedConfigPayload, bool) {
 	return payload, true
 }
 
+func (s *Server) cachedOVRuntime() *ovRuntime {
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return nil
+	}
+	return payload.OVRuntime
+}
+
 func (s *Server) clearConfigCache() {
 	if err := os.Remove(s.configCachePath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Printf("failed to clear config cache: %v", err)
@@ -688,6 +720,9 @@ func (s *Server) startCachedConfig() {
 	s.mu.Lock()
 	s.lastConfig = cfg
 	s.mu.Unlock()
+	if err := s.ov.Apply(payload.OVRuntime); err != nil {
+		log.Printf("failed to apply cached OV runtime: %v", err)
+	}
 }
 
 type downloadFile struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -134,6 +135,9 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 		api.server.snapshotRunningUsage()
 	}
 	api.server.core.Stop()
+	if err := api.server.ov.Apply(&ovRuntime{Inbounds: []ovRuntimeInbound{}}); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
 	api.server.clearConfigCache()
 	return api.server.grpcAction(req.GetOperationId(), true, "runtime stopped"), nil
 }
@@ -272,6 +276,9 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 			log.Printf("failed to query online users: %v", err)
 		}
 	}
+	if OVStats := api.server.ov.CollectUsage(); len(OVStats) > 0 {
+		stats = append(stats, OVStats...)
+	}
 	batchID, pending := api.server.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
 	res := &nodev1.UserUsageBatch{BatchId: batchID}
@@ -348,6 +355,10 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if err != nil {
 		return nil, err
 	}
+	runtimeConfig, err := grpcOVRuntime(req)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.core.Start(cfg); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -356,7 +367,15 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if !s.core.Started() {
 		return nil, status.Error(codes.Unavailable, strings.Join(s.core.Logs().Snapshot(), "\n"))
 	}
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx))
+	cacheRuntime := runtimeConfig
+	if cacheRuntime == nil {
+		cacheRuntime = s.cachedOVRuntime()
+	}
+	if err := s.ov.Apply(runtimeConfig); err != nil {
+		s.core.Stop()
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime)
 	message := "runtime started"
 	if sync {
 		message = "runtime config synced"
@@ -369,6 +388,10 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if err != nil {
 		return nil, err
 	}
+	runtimeConfig, err := grpcOVRuntime(req)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.core.Restart(cfg); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -377,7 +400,15 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if !s.core.Started() {
 		return nil, status.Error(codes.Unavailable, strings.Join(s.core.Logs().Snapshot(), "\n"))
 	}
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx))
+	cacheRuntime := runtimeConfig
+	if cacheRuntime == nil {
+		cacheRuntime = s.cachedOVRuntime()
+	}
+	if err := s.ov.Apply(runtimeConfig); err != nil {
+		s.core.Stop()
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime)
 	return s.grpcAction(req.GetOperationId(), true, message), nil
 }
 
@@ -391,6 +422,21 @@ func (s *Server) grpcConfig(ctx context.Context, req *nodev1.RuntimeConfigReques
 		return nil, status.Error(codes.InvalidArgument, "failed to decode config: "+err.Error())
 	}
 	return cfg, nil
+}
+
+func grpcOVRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, error) {
+	raw := strings.TrimSpace(req.GetOvRuntimeJson())
+	if raw == "" {
+		return nil, nil
+	}
+	var runtimeConfig ovRuntime
+	if err := json.Unmarshal([]byte(raw), &runtimeConfig); err != nil {
+		return nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
+	}
+	if runtimeConfig.Inbounds == nil {
+		runtimeConfig.Inbounds = []ovRuntimeInbound{}
+	}
+	return &runtimeConfig, nil
 }
 
 func (s *Server) grpcAddUser(req *nodev1.InboundUserRequest, message string) (*nodev1.RuntimeActionResponse, error) {

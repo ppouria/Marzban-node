@@ -28,6 +28,9 @@ sudo bash -c "$(curl -sL https://raw.githubusercontent.com/rebeccapanel/Rebecca/
 
 The Docker and binary installers are intentionally separate. Use the matching script for update, restart, core update, and script update operations.
 
+OpenVPN runtime support is binary-only. Docker nodes reject OpenVPN runtime payloads
+instead of installing host VPN prerequisites inside the container.
+
 Use `help` to view all commands:
 ```Rebecca-node help```
 
