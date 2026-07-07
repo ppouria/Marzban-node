@@ -152,8 +152,10 @@ func (c *Core) start(config *Config) error {
 	go c.capture(stderr)
 	go func() {
 		err := cmd.Wait()
-		if err != nil && c.debug {
+		if err != nil {
 			log.Printf("xray exited: %v", err)
+		} else if c.debug {
+			log.Print("xray exited")
 		}
 		c.mu.Lock()
 		if c.cmd == cmd {

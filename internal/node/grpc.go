@@ -123,10 +123,19 @@ func (api *grpcAPI) Health(ctx context.Context, req *nodev1.HealthRequest) (*nod
 }
 
 func (api *grpcAPI) StartRuntime(ctx context.Context, req *nodev1.RuntimeConfigRequest) (*nodev1.RuntimeActionResponse, error) {
+	if api.server.core.Started() {
+		if api.server.runtimeConfigMatchesCache(req.GetConfigJson()) {
+			return api.server.grpcApplyRuntimeOnly(ctx, req, "runtime already started")
+		}
+		return api.server.grpcRestartRuntime(ctx, req, "runtime restarted")
+	}
 	return api.server.grpcStartRuntime(ctx, req, false)
 }
 
 func (api *grpcAPI) RestartRuntime(ctx context.Context, req *nodev1.RuntimeConfigRequest) (*nodev1.RuntimeActionResponse, error) {
+	if api.server.core.Started() && api.server.runtimeConfigMatchesCache(req.GetConfigJson()) {
+		return api.server.grpcApplyRuntimeOnly(ctx, req, "runtime config unchanged")
+	}
 	return api.server.grpcRestartRuntime(ctx, req, "runtime restarted")
 }
 
@@ -150,6 +159,9 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 
 func (api *grpcAPI) SyncConfig(ctx context.Context, req *nodev1.RuntimeConfigRequest) (*nodev1.RuntimeActionResponse, error) {
 	if api.server.core.Started() {
+		if api.server.runtimeConfigMatchesCache(req.GetConfigJson()) || api.server.runtimeTopologyMatchesCache(req.GetConfigJson()) {
+			return api.server.grpcApplyRuntimeOnly(ctx, req, "runtime config synced")
+		}
 		return api.server.grpcRestartRuntime(ctx, req, "runtime config synced")
 	}
 	return api.server.grpcStartRuntime(ctx, req, true)
@@ -453,6 +465,117 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
+}
+
+func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeConfigRequest, message string) (*nodev1.RuntimeActionResponse, error) {
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, err := grpcVPNRuntime(req)
+	if err != nil {
+		return nil, err
+	}
+	cacheRuntime := runtimeConfig
+	if cacheRuntime == nil {
+		cacheRuntime = s.cachedOVRuntime()
+	}
+	cacheL2TPRuntime := l2tpRuntimeConfig
+	if cacheL2TPRuntime == nil {
+		cacheL2TPRuntime = s.cachedL2TPRuntime()
+	}
+	cachePPTPRuntime := pptpRuntimeConfig
+	if cachePPTPRuntime == nil {
+		cachePPTPRuntime = s.cachedPPTPRuntime()
+	}
+	if err := s.ov.Apply(runtimeConfig); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
+	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime)
+	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
+		message += "; " + warning
+	}
+	return s.grpcAction(req.GetOperationId(), true, message), nil
+}
+
+func (s *Server) runtimeConfigMatchesCache(configJSON string) bool {
+	incoming, ok := canonicalConfigJSON(configJSON)
+	if !ok {
+		return false
+	}
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return false
+	}
+	cached, ok := canonicalConfigJSON(payload.Config)
+	return ok && cached == incoming
+}
+
+func canonicalConfigJSON(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return "", false
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", false
+	}
+	return string(encoded), true
+}
+
+func (s *Server) runtimeTopologyMatchesCache(configJSON string) bool {
+	incoming, ok := canonicalConfigTopologyJSON(configJSON)
+	if !ok {
+		return false
+	}
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return false
+	}
+	cached, ok := canonicalConfigTopologyJSON(payload.Config)
+	return ok && cached == incoming
+}
+
+func canonicalConfigTopologyJSON(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", false
+	}
+	var value any
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return "", false
+	}
+	stripRuntimeUsers(value)
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", false
+	}
+	return string(encoded), true
+}
+
+func stripRuntimeUsers(value any) {
+	root, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	inbounds, _ := root["inbounds"].([]any)
+	for _, item := range inbounds {
+		inbound, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		settings, ok := inbound["settings"].(map[string]any)
+		if !ok {
+			continue
+		}
+		delete(settings, "clients")
+	}
 }
 
 func (s *Server) grpcConfig(ctx context.Context, req *nodev1.RuntimeConfigRequest) (*xray.Config, error) {

@@ -186,14 +186,25 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if s.core.Started() && s.runtimeConfigMatchesCache(payload.Config) {
+		s.handleRuntimeOnly(w, payload)
+		return
+	}
 	cfg, err := xray.NewConfig(payload.Config, s.currentClientIP(), s.settings)
 	if err != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": map[string]string{"config": "Failed to decode config: " + err.Error()}})
 		return
 	}
-	if err := s.core.Start(cfg); err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
+	if s.core.Started() {
+		if err := s.core.Restart(cfg); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+	} else {
+		if err := s.core.Start(cfg); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 	}
 	s.mu.Lock()
 	s.lastConfig = cfg
@@ -244,6 +255,10 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if s.core.Started() && s.runtimeConfigMatchesCache(payload.Config) {
+		s.handleRuntimeOnly(w, payload)
+		return
+	}
 	cfg, err := xray.NewConfig(payload.Config, s.currentClientIP(), s.settings)
 	if err != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": map[string]string{"config": "Failed to decode config: " + err.Error()}})
@@ -268,6 +283,33 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
 	pptpWarning := s.applyPPTPRuntime(payload.PPTPRuntime)
 	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime, payload.PPTPRuntime)
+	response := s.response(nil)
+	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
+		response["warning"] = warning
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) handleRuntimeOnly(w http.ResponseWriter, payload configPayload) {
+	ovRuntimeConfig := payload.OVRuntime
+	if ovRuntimeConfig == nil {
+		ovRuntimeConfig = s.cachedOVRuntime()
+	}
+	l2tpRuntimeConfig := payload.L2TPRuntime
+	if l2tpRuntimeConfig == nil {
+		l2tpRuntimeConfig = s.cachedL2TPRuntime()
+	}
+	pptpRuntimeConfig := payload.PPTPRuntime
+	if pptpRuntimeConfig == nil {
+		pptpRuntimeConfig = s.cachedPPTPRuntime()
+	}
+	if err := s.ov.Apply(payload.OVRuntime); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
+	pptpWarning := s.applyPPTPRuntime(payload.PPTPRuntime)
+	s.saveConfigCache(payload.Config, s.currentClientIP(), ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig)
 	response := s.response(nil)
 	if warning := joinedWarnings(l2tpWarning, pptpWarning); warning != "" {
 		response["warning"] = warning
