@@ -267,10 +267,24 @@ func l2tpPPPOptions(inbound l2tpRuntimeInbound) string {
 	line(&b, "auth")
 	line(&b, "require-mschap-v2")
 	line(&b, "name rebecca-l2tp")
-	line(&b, "lcp-echo-interval 30")
-	line(&b, "lcp-echo-failure 4")
+	if mtu := boundedInt(inbound.Settings["mtu"], 1410, 576, 1500); mtu > 0 {
+		line(&b, fmt.Sprintf("mtu %d", mtu))
+	}
+	if mru := boundedInt(inbound.Settings["mru"], 1410, 576, 1500); mru > 0 {
+		line(&b, fmt.Sprintf("mru %d", mru))
+	}
+	line(&b, fmt.Sprintf("lcp-echo-interval %d", boundedInt(inbound.Settings["lcp_echo_interval"], 30, 1, 3600)))
+	line(&b, fmt.Sprintf("lcp-echo-failure %d", boundedInt(inbound.Settings["lcp_echo_failure"], 4, 1, 20)))
 	line(&b, "ipparam rebecca-l2tp")
 	return b.String()
+}
+
+func boundedInt(value any, fallback int, min int, max int) int {
+	parsed := intValue(value)
+	if parsed < min || parsed > max {
+		return fallback
+	}
+	return parsed
 }
 
 func l2tpChapSecrets(users []l2tpRuntimeUser) string {
