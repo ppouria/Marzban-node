@@ -159,6 +159,7 @@ func (m *l2tpManager) applyInbound(inbound l2tpRuntimeInbound) error {
 	if strings.TrimSpace(firstString(inbound.Settings["ipsec_psk"])) == "" {
 		return fmt.Errorf("L2TP inbound %s requires ipsec_psk", inbound.Tag)
 	}
+	beforeSystemConfig := l2tpSystemConfigSnapshot()
 	if inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true) {
 		nft, err := exec.LookPath("nft")
 		if err != nil {
@@ -175,7 +176,10 @@ func (m *l2tpManager) applyInbound(inbound l2tpRuntimeInbound) error {
 	if err := m.writeSystemConfig(inbound); err != nil {
 		return err
 	}
-	return restartL2TPServices()
+	if beforeSystemConfig != l2tpSystemConfigSnapshot() || !l2tpServicesRunning() {
+		return restartL2TPServices()
+	}
+	return nil
 }
 
 func (m *l2tpManager) stop() {
@@ -578,6 +582,27 @@ func restartL2TPServices() error {
 		}
 	}
 	return runOptional("service", "xl2tpd", "restart")
+}
+
+func l2tpSystemConfigSnapshot() string {
+	paths := []string{
+		"/etc/ipsec.conf",
+		"/etc/ipsec.secrets",
+		"/etc/xl2tpd/xl2tpd.conf",
+	}
+	var b strings.Builder
+	for _, path := range paths {
+		raw, _ := os.ReadFile(path)
+		b.WriteString(path)
+		b.WriteByte(0)
+		b.Write(raw)
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+func l2tpServicesRunning() bool {
+	return exec.Command("pgrep", "-x", "xl2tpd").Run() == nil && exec.Command("pgrep", "-x", "charon").Run() == nil
 }
 
 func commandOutput(name string, args ...string) string {
