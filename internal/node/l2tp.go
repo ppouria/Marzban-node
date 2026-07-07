@@ -1,0 +1,619 @@
+package node
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"net/netip"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/rebeccapanel/rebecca-node/internal/xray"
+)
+
+type l2tpRuntime struct {
+	GeneratedAt string               `json:"generated_at"`
+	Target      string               `json:"target,omitempty"`
+	Inbounds    []l2tpRuntimeInbound `json:"inbounds"`
+}
+
+type l2tpRuntimeInbound struct {
+	Tag        string            `json:"tag"`
+	TunnelTag  string            `json:"tunnel_tag"`
+	Port       int               `json:"port"`
+	TunnelPort int               `json:"tunnel_port"`
+	Settings   map[string]any    `json:"settings"`
+	Users      []l2tpRuntimeUser `json:"users"`
+}
+
+type l2tpRuntimeUser struct {
+	UserID      int64  `json:"user_id"`
+	Username    string `json:"username"`
+	VPNUsername string `json:"vpn_username"`
+	Password    string `json:"password"`
+	IPv4Address string `json:"ipv4_address"`
+	Status      string `json:"status"`
+	UsedTraffic int64  `json:"used_traffic"`
+	DataLimit   *int64 `json:"data_limit,omitempty"`
+	Expire      *int64 `json:"expire,omitempty"`
+}
+
+type l2tpManager struct {
+	baseDir     string
+	installMode string
+	mu          sync.Mutex
+}
+
+func newL2TPManager(dataDir string, installMode string) *l2tpManager {
+	return &l2tpManager{
+		baseDir:     filepath.Join(dataDir, "l2tp"),
+		installMode: strings.ToLower(strings.TrimSpace(installMode)),
+	}
+}
+
+func (m *l2tpManager) Apply(runtimeConfig *l2tpRuntime) error {
+	if m == nil || runtimeConfig == nil {
+		return nil
+	}
+	if len(runtimeConfig.Inbounds) > 0 && m.installMode != "binary" {
+		return fmt.Errorf("L2TP/IPsec is supported only on binary Rebecca-node installs")
+	}
+	if len(runtimeConfig.Inbounds) > 1 {
+		return fmt.Errorf("only one L2TP/IPsec inbound is supported per node because IPsec UDP 500/4500 are node-wide ports")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(runtimeConfig.Inbounds) > 0 {
+		if err := ensureL2TPPrerequisites(); err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(runtimeConfig, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(m.baseDir, "runtime.json"), raw, 0o600); err != nil {
+		return err
+	}
+	if len(runtimeConfig.Inbounds) == 0 {
+		m.stop()
+		return nil
+	}
+	inbound := runtimeConfig.Inbounds[0]
+	if err := m.writeInbound(inbound); err != nil {
+		return err
+	}
+	m.disconnectStaleSessions(inbound.Users)
+	return m.applyInbound(inbound)
+}
+
+func (m *l2tpManager) CollectUsage() []xray.UserStat {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	path := filepath.Join(m.baseDir, "usage.tsv")
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	stats := map[string]int64{}
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		parts := strings.Split(scanner.Text(), "\t")
+		if len(parts) < 2 {
+			continue
+		}
+		uid := strings.TrimSpace(parts[0])
+		value, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+		if uid == "" || value <= 0 {
+			continue
+		}
+		stats[uid] += value
+	}
+	_ = os.WriteFile(path, nil, 0o600)
+	out := make([]xray.UserStat, 0, len(stats))
+	for uid, value := range stats {
+		out = append(out, xray.UserStat{UID: uid, Value: value})
+	}
+	return out
+}
+
+func (m *l2tpManager) writeInbound(inbound l2tpRuntimeInbound) error {
+	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
+		return err
+	}
+	usersPath := filepath.Join(m.baseDir, "users.tsv")
+	if err := os.WriteFile(usersPath, []byte(l2tpUsersTSV(inbound.Users)), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(m.baseDir, "nftables.nft"), []byte(l2tpNFTScript(inbound)), 0o600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(m.baseDir, "ip-down.sh"), []byte(l2tpIPDownScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "sessions.tsv"))), 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(m.baseDir, "ip-up.sh"), []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "sessions.tsv"))), 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(m.baseDir, "options.xl2tpd"), []byte(l2tpPPPOptions(inbound)), 0o600); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *l2tpManager) applyInbound(inbound l2tpRuntimeInbound) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	if strings.TrimSpace(firstString(inbound.Settings["ipsec_psk"])) == "" {
+		return fmt.Errorf("L2TP inbound %s requires ipsec_psk", inbound.Tag)
+	}
+	if inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true) {
+		nft, err := exec.LookPath("nft")
+		if err != nil {
+			return fmt.Errorf("nft executable not found")
+		}
+		_ = exec.Command(nft, "delete", "table", "inet", "rebecca_l2tp").Run()
+		if output, err := exec.Command(nft, "-f", filepath.Join(m.baseDir, "nftables.nft")).CombinedOutput(); err != nil {
+			return fmt.Errorf("apply L2TP nftables %s: %v: %s", inbound.Tag, err, strings.TrimSpace(string(output)))
+		}
+		if err := applyTProxyRouting(); err != nil {
+			return err
+		}
+	}
+	if err := m.writeSystemConfig(inbound); err != nil {
+		return err
+	}
+	return restartL2TPServices()
+}
+
+func (m *l2tpManager) stop() {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	_ = runOptional("ipsec", "stop")
+	_ = runOptional("systemctl", "stop", "strongswan-starter")
+	_ = runOptional("systemctl", "stop", "strongswan")
+	_ = runOptional("systemctl", "stop", "xl2tpd")
+	if nft, err := exec.LookPath("nft"); err == nil {
+		_ = exec.Command(nft, "delete", "table", "inet", "rebecca_l2tp").Run()
+	}
+	_ = os.WriteFile(filepath.Join(m.baseDir, "sessions.tsv"), nil, 0o600)
+}
+
+func (m *l2tpManager) writeSystemConfig(inbound l2tpRuntimeInbound) error {
+	settings := inbound.Settings
+	psk := firstString(settings["ipsec_psk"])
+	localIP, ipRange := l2tpPoolRange(firstString(settings["ipv4_pool_cidr"], "10.67.0.0/16"))
+	ipsecBlock := fmt.Sprintf(`conn rebecca-l2tp
+  auto=add
+  keyexchange=ikev1
+  authby=secret
+  type=transport
+  left=%%any
+  leftprotoport=17/%d
+  right=%%any
+  rightprotoport=17/%%any
+  rekey=no
+  forceencaps=yes
+  ike=aes256-sha1-modp2048,aes128-sha1-modp2048!
+  esp=aes256-sha1,aes128-sha1!
+`, intValue(firstString(settings["l2tp_port"], "1701")))
+	if err := updateManagedBlock("/etc/ipsec.conf", "# BEGIN REBECCA L2TP IPSEC", "# END REBECCA L2TP IPSEC", ipsecBlock); err != nil {
+		return fmt.Errorf("update /etc/ipsec.conf: %w", err)
+	}
+	if err := updateManagedBlock("/etc/ipsec.secrets", "# BEGIN REBECCA L2TP IPSEC", "# END REBECCA L2TP IPSEC", fmt.Sprintf("%%any %%any : PSK %q\n", psk)); err != nil {
+		return fmt.Errorf("update /etc/ipsec.secrets: %w", err)
+	}
+	if err := os.MkdirAll("/etc/xl2tpd", 0o755); err != nil {
+		return err
+	}
+	xl2tpd := fmt.Sprintf(`[global]
+port = %d
+access control = no
+
+[lns rebecca-l2tp]
+lac = 0.0.0.0 - 255.255.255.255
+ip range = %s
+local ip = %s
+pppoptfile = %s
+length bit = yes
+`, intValue(firstString(settings["l2tp_port"], "1701")), ipRange, localIP, filepath.Join(m.baseDir, "options.xl2tpd"))
+	if err := os.WriteFile("/etc/xl2tpd/xl2tpd.conf", []byte(xl2tpd), 0o600); err != nil {
+		return fmt.Errorf("write /etc/xl2tpd/xl2tpd.conf: %w", err)
+	}
+	if err := updateManagedBlock("/etc/ppp/chap-secrets", "# BEGIN REBECCA L2TP USERS", "# END REBECCA L2TP USERS", l2tpChapSecrets(inbound.Users)); err != nil {
+		return err
+	}
+	if err := os.MkdirAll("/etc/ppp/ip-up.d", 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-l2tp-sessions", []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "sessions.tsv"))), 0o700); err != nil {
+		return fmt.Errorf("write /etc/ppp/ip-up.d/rebecca-l2tp-sessions: %w", err)
+	}
+	if err := os.MkdirAll("/etc/ppp/ip-down.d", 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile("/etc/ppp/ip-down.d/rebecca-l2tp-accounting", []byte(l2tpIPDownScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "sessions.tsv"))), 0o700)
+}
+
+func l2tpPPPOptions(inbound l2tpRuntimeInbound) string {
+	var b strings.Builder
+	line(&b, "ipcp-accept-local")
+	line(&b, "ipcp-accept-remote")
+	dnsServers := stringList(inbound.Settings["dns_servers"])
+	if len(dnsServers) == 0 {
+		dnsServers = []string{"1.1.1.1"}
+	}
+	for _, dns := range dnsServers {
+		line(&b, "ms-dns "+dns)
+	}
+	line(&b, "asyncmap 0")
+	line(&b, "auth")
+	line(&b, "require-mschap-v2")
+	line(&b, "name rebecca-l2tp")
+	line(&b, "lcp-echo-interval 30")
+	line(&b, "lcp-echo-failure 4")
+	line(&b, "ipparam rebecca-l2tp")
+	return b.String()
+}
+
+func l2tpChapSecrets(users []l2tpRuntimeUser) string {
+	var b strings.Builder
+	for _, user := range users {
+		if strings.TrimSpace(user.VPNUsername) == "" || strings.TrimSpace(user.Password) == "" {
+			continue
+		}
+		line(&b, fmt.Sprintf("%q rebecca-l2tp %q %s", user.VPNUsername, user.Password, firstString(user.IPv4Address, "*")))
+	}
+	return b.String()
+}
+
+func l2tpUsersTSV(users []l2tpRuntimeUser) string {
+	var b strings.Builder
+	for _, user := range users {
+		limit := ""
+		if user.DataLimit != nil {
+			limit = strconv.FormatInt(*user.DataLimit, 10)
+		}
+		expire := ""
+		if user.Expire != nil {
+			expire = strconv.FormatInt(*user.Expire, 10)
+		}
+		fields := []string{
+			strconv.FormatInt(user.UserID, 10),
+			user.VPNUsername,
+			user.Password,
+			user.IPv4Address,
+			strconv.FormatInt(user.UsedTraffic, 10),
+			limit,
+			user.Status,
+			expire,
+		}
+		b.WriteString(strings.Join(fields, "\t"))
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func l2tpNFTScript(inbound l2tpRuntimeInbound) string {
+	if inbound.TunnelPort <= 0 || !boolValue(inbound.Settings["tproxy_enabled"], true) {
+		return ""
+	}
+	blockedV4, blockedV6 := ovBlockedDestinations()
+	var rules strings.Builder
+	if len(blockedV4) > 0 {
+		line(&rules, fmt.Sprintf(`    iifname "ppp*" ip daddr { %s } drop`, strings.Join(blockedV4, ", ")))
+	}
+	if len(blockedV6) > 0 {
+		line(&rules, fmt.Sprintf(`    iifname "ppp*" ip6 daddr { %s } drop`, strings.Join(blockedV6, ", ")))
+	}
+	return fmt.Sprintf(`table inet rebecca_l2tp {
+  chain prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+%s
+    iifname "ppp*" meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
+  }
+}
+`, strings.TrimRight(rules.String(), "\n"), inbound.TunnelPort)
+}
+
+func (m *l2tpManager) disconnectStaleSessions(users []l2tpRuntimeUser) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	allowed := map[string]struct{}{}
+	for _, user := range users {
+		username := strings.TrimSpace(user.VPNUsername)
+		if username != "" {
+			allowed[username] = struct{}{}
+		}
+	}
+	sessionsPath := filepath.Join(m.baseDir, "sessions.tsv")
+	raw, err := os.ReadFile(sessionsPath)
+	if err != nil {
+		return
+	}
+	var kept strings.Builder
+	for _, lineText := range strings.Split(string(raw), "\n") {
+		lineText = strings.TrimSpace(lineText)
+		if lineText == "" {
+			continue
+		}
+		parts := strings.Split(lineText, "\t")
+		if len(parts) < 2 {
+			continue
+		}
+		username := strings.TrimSpace(parts[0])
+		if _, ok := allowed[username]; ok {
+			kept.WriteString(lineText)
+			kept.WriteByte('\n')
+			continue
+		}
+		if len(parts) >= 3 {
+			killL2TPProcess(strings.TrimSpace(parts[2]))
+		}
+		deleteL2TPInterface(strings.TrimSpace(parts[1]))
+	}
+	_ = os.WriteFile(sessionsPath, []byte(kept.String()), 0o600)
+}
+
+func killL2TPProcess(pid string) {
+	if pid == "" {
+		return
+	}
+	if _, err := strconv.Atoi(pid); err != nil {
+		return
+	}
+	_ = exec.Command("kill", "-TERM", pid).Run()
+}
+
+func deleteL2TPInterface(ifname string) {
+	if ifname == "" || strings.ContainsAny(ifname, "/ \t\r\n") {
+		return
+	}
+	if ip, err := exec.LookPath("ip"); err == nil {
+		_ = exec.Command(ip, "link", "delete", ifname).Run()
+	}
+}
+
+func l2tpIPUpScript(sessionsPath string) string {
+	return fmt.Sprintf(`#!/bin/sh
+SESSIONS=%q
+peer=${PEERNAME:-}
+ifname=${IFNAME:-}
+pid=${PPPD_PID:-}
+[ -n "$pid" ] || pid=$$
+if [ -n "$peer" ] && [ -n "$ifname" ]; then
+  mkdir -p "$(dirname "$SESSIONS")"
+  tmp="${SESSIONS}.$$"
+  if [ -f "$SESSIONS" ]; then
+    awk -F '\t' -v u="$peer" '$1 != u { print }' "$SESSIONS" > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  printf '%%s\t%%s\t%%s\n' "$peer" "$ifname" "$pid" >> "$tmp"
+  mv "$tmp" "$SESSIONS"
+  chmod 600 "$SESSIONS"
+fi
+`, sessionsPath)
+}
+
+func l2tpIPDownScript(usersPath string, usagePath string, sessionsPath string) string {
+	return fmt.Sprintf(`#!/bin/sh
+USERS=%q
+USAGE=%q
+SESSIONS=%q
+uid=$(awk -F '\t' -v u="$PEERNAME" '$2 == u { print $1; exit }' "$USERS")
+rx=${BYTES_RCVD:-0}
+tx=${BYTES_SENT:-0}
+total=$((rx + tx))
+if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
+  printf 'l2tp:%%s\t%%s\n' "$uid" "$total" >> "$USAGE"
+fi
+if [ -n "$PEERNAME" ] && [ -f "$SESSIONS" ]; then
+  tmp="${SESSIONS}.$$"
+  awk -F '\t' -v u="$PEERNAME" '$1 != u { print }' "$SESSIONS" > "$tmp"
+  mv "$tmp" "$SESSIONS"
+  chmod 600 "$SESSIONS"
+fi
+`, usersPath, usagePath, sessionsPath)
+}
+
+func l2tpPoolRange(pool string) (string, string) {
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(pool))
+	if err != nil || !prefix.Addr().Is4() {
+		prefix, _ = netip.ParsePrefix("10.67.0.0/16")
+	}
+	network := ipv4ToUint32(prefix.Masked().Addr())
+	size := uint64(1) << uint(32-prefix.Bits())
+	if size < 4 {
+		local := uint32ToIPv4(network)
+		return local.String(), local.String() + "-" + local.String()
+	}
+	broadcast := network + uint32(size-1)
+	local := network + 1
+	start := network + 10
+	end := broadcast - 1
+	if start > end {
+		start = network + 2
+	}
+	if start > end {
+		start = local
+	}
+	localAddr := uint32ToIPv4(local)
+	startAddr := uint32ToIPv4(start)
+	endAddr := uint32ToIPv4(end)
+	return localAddr.String(), startAddr.String() + "-" + endAddr.String()
+}
+
+func ipv4ToUint32(addr netip.Addr) uint32 {
+	raw := addr.As4()
+	return uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3])
+}
+
+func uint32ToIPv4(value uint32) netip.Addr {
+	return netip.AddrFrom4([4]byte{
+		byte(value >> 24),
+		byte(value >> 16),
+		byte(value >> 8),
+		byte(value),
+	})
+}
+
+func ensureL2TPPrerequisites() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	missing := missingExecutables("ipsec", "xl2tpd", "pppd", "nft", "ip")
+	if len(missing) > 0 {
+		if err := installL2TPPackages(); err != nil {
+			return err
+		}
+	}
+	for _, executable := range []string{"ipsec", "xl2tpd", "pppd", "nft", "ip"} {
+		if _, err := exec.LookPath(executable); err != nil {
+			return fmt.Errorf("L2TP prerequisite %s was not found after automatic install", executable)
+		}
+	}
+	if err := loadL2TPKernelModules(); err != nil {
+		if installErr := installL2TPKernelModulePackages(); installErr != nil {
+			return fmt.Errorf("%w; automatic kernel module package install failed: %v", err, installErr)
+		}
+		if retryErr := loadL2TPKernelModules(); retryErr != nil {
+			return retryErr
+		}
+	}
+	return nil
+}
+
+func installL2TPPackages() error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("L2TP prerequisites are missing and automatic install requires root")
+	}
+	switch {
+	case commandExists("apt-get"):
+		if commandExists("dpkg") {
+			_ = runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "dpkg", "--configure", "-a")
+		}
+		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
+			return err
+		}
+		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "strongswan", "xl2tpd", "ppp", "nftables", "iproute2", "kmod")
+	case commandExists("dnf"):
+		return runInstallCommand(nil, "dnf", "install", "-y", "strongswan", "xl2tpd", "ppp", "nftables", "iproute", "kmod")
+	case commandExists("yum"):
+		return runInstallCommand(nil, "yum", "install", "-y", "strongswan", "xl2tpd", "ppp", "nftables", "iproute", "kmod")
+	case commandExists("apk"):
+		return runInstallCommand(nil, "apk", "add", "strongswan", "xl2tpd", "ppp", "nftables", "iproute2", "kmod")
+	default:
+		return fmt.Errorf("L2TP prerequisites are missing and no supported package manager was found")
+	}
+}
+
+func loadL2TPKernelModules() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	for _, module := range []string{"ppp_generic", "pppox", "l2tp_ppp"} {
+		if output, err := exec.Command("modprobe", module).CombinedOutput(); err != nil {
+			return fmt.Errorf("load kernel module %s: %v: %s", module, err, strings.TrimSpace(string(output)))
+		}
+	}
+	_ = exec.Command("modprobe", "pppol2tp").Run()
+	return nil
+}
+
+func installL2TPKernelModulePackages() error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("automatic kernel module package install requires root")
+	}
+	kernel := strings.TrimSpace(commandOutput("uname", "-r"))
+	switch {
+	case commandExists("apt-get"):
+		if commandExists("dpkg") {
+			_ = runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "dpkg", "--configure", "-a")
+		}
+		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
+			return err
+		}
+		if kernel == "" {
+			return fmt.Errorf("kernel release is empty")
+		}
+		err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "linux-modules-extra-"+kernel)
+		if err == nil {
+			return nil
+		}
+		if fallbackErr := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "linux-generic"); fallbackErr != nil {
+			return fmt.Errorf("%w; fallback linux-generic install failed: %v", err, fallbackErr)
+		}
+		return fmt.Errorf("%w; installed generic kernel module packages, reboot into the new kernel is required", err)
+	case commandExists("dnf"):
+		return runInstallCommand(nil, "dnf", "install", "-y", "kernel-modules-extra")
+	case commandExists("yum"):
+		return runInstallCommand(nil, "yum", "install", "-y", "kernel-modules-extra")
+	default:
+		return fmt.Errorf("no supported package manager was found")
+	}
+}
+
+func restartL2TPServices() error {
+	if err := runOptional("ipsec", "restart"); err != nil {
+		return err
+	}
+	if commandExists("systemctl") {
+		if err := runOptional("systemctl", "restart", "xl2tpd"); err == nil {
+			return nil
+		}
+	}
+	return runOptional("service", "xl2tpd", "restart")
+}
+
+func commandOutput(name string, args ...string) string {
+	output, err := exec.Command(name, args...).Output()
+	if err != nil {
+		return ""
+	}
+	return string(output)
+}
+
+func runOptional(name string, args ...string) error {
+	path, err := exec.LookPath(name)
+	if err != nil {
+		return err
+	}
+	output, err := exec.Command(path, args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s %s: %v: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func updateManagedBlock(path string, start string, end string, body string) error {
+	existing, _ := os.ReadFile(path)
+	text := string(existing)
+	startIdx := strings.Index(text, start)
+	endIdx := strings.Index(text, end)
+	block := start + "\n" + strings.TrimRight(body, "\n") + "\n" + end + "\n"
+	if startIdx >= 0 && endIdx > startIdx {
+		endIdx += len(end)
+		text = strings.TrimRight(text[:startIdx], "\n") + "\n" + block + strings.TrimLeft(text[endIdx:], "\n")
+	} else {
+		if strings.TrimSpace(text) != "" {
+			text = strings.TrimRight(text, "\n") + "\n"
+		}
+		text += block
+	}
+	return os.WriteFile(path, []byte(text), 0o600)
+}

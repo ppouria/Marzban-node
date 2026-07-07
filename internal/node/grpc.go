@@ -138,6 +138,9 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 	if err := api.server.ov.Apply(&ovRuntime{Inbounds: []ovRuntimeInbound{}}); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
+	if err := api.server.l2tp.Apply(&l2tpRuntime{Inbounds: []l2tpRuntimeInbound{}}); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
 	api.server.clearConfigCache()
 	return api.server.grpcAction(req.GetOperationId(), true, "runtime stopped"), nil
 }
@@ -253,6 +256,13 @@ func (api *grpcAPI) UpdateService(ctx context.Context, req *nodev1.ServiceUpdate
 	return api.server.grpcAction(req.GetOperationId(), true, "service update scheduled"), nil
 }
 
+func (api *grpcAPI) RebootHost(ctx context.Context, req *nodev1.HostRebootRequest) (*nodev1.RuntimeActionResponse, error) {
+	if err := scheduleHostReboot(); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	return api.server.grpcAction(req.GetOperationId(), true, "host reboot scheduled"), nil
+}
+
 func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsageRequest) (*nodev1.UserUsageBatch, error) {
 	var stats []xray.UserStat
 	var onlineUIDs []string
@@ -278,6 +288,9 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 	}
 	if OVStats := api.server.ov.CollectUsage(); len(OVStats) > 0 {
 		stats = append(stats, OVStats...)
+	}
+	if l2tpStats := api.server.l2tp.CollectUsage(); len(l2tpStats) > 0 {
+		stats = append(stats, l2tpStats...)
 	}
 	batchID, pending := api.server.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
@@ -355,7 +368,7 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if err != nil {
 		return nil, err
 	}
-	runtimeConfig, err := grpcOVRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -371,13 +384,21 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if cacheRuntime == nil {
 		cacheRuntime = s.cachedOVRuntime()
 	}
+	cacheL2TPRuntime := l2tpRuntimeConfig
+	if cacheL2TPRuntime == nil {
+		cacheL2TPRuntime = s.cachedL2TPRuntime()
+	}
 	if err := s.ov.Apply(runtimeConfig); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime)
+	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime)
 	message := "runtime started"
 	if sync {
 		message = "runtime config synced"
+	}
+	if l2tpWarning != "" {
+		message += "; " + l2tpWarning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
 }
@@ -387,7 +408,7 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if err != nil {
 		return nil, err
 	}
-	runtimeConfig, err := grpcOVRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -403,10 +424,18 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if cacheRuntime == nil {
 		cacheRuntime = s.cachedOVRuntime()
 	}
+	cacheL2TPRuntime := l2tpRuntimeConfig
+	if cacheL2TPRuntime == nil {
+		cacheL2TPRuntime = s.cachedL2TPRuntime()
+	}
 	if err := s.ov.Apply(runtimeConfig); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime)
+	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime)
+	if l2tpWarning != "" {
+		message += "; " + l2tpWarning
+	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
 }
 
@@ -422,19 +451,30 @@ func (s *Server) grpcConfig(ctx context.Context, req *nodev1.RuntimeConfigReques
 	return cfg, nil
 }
 
-func grpcOVRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, error) {
+func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, error) {
 	raw := strings.TrimSpace(req.GetOvRuntimeJson())
 	if raw == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
-	var runtimeConfig ovRuntime
-	if err := json.Unmarshal([]byte(raw), &runtimeConfig); err != nil {
-		return nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
+	var envelope struct {
+		GeneratedAt   string               `json:"generated_at"`
+		Target        string               `json:"target,omitempty"`
+		Inbounds      []ovRuntimeInbound   `json:"inbounds"`
+		L2TPInbounds  []l2tpRuntimeInbound `json:"l2tp_inbounds"`
+		L2TPGenerated string               `json:"l2tp_generated,omitempty"`
 	}
-	if runtimeConfig.Inbounds == nil {
-		runtimeConfig.Inbounds = []ovRuntimeInbound{}
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		return nil, nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
 	}
-	return &runtimeConfig, nil
+	ovRuntimeConfig := &ovRuntime{GeneratedAt: envelope.GeneratedAt, Target: envelope.Target, Inbounds: envelope.Inbounds}
+	if ovRuntimeConfig.Inbounds == nil {
+		ovRuntimeConfig.Inbounds = []ovRuntimeInbound{}
+	}
+	l2tpRuntimeConfig := &l2tpRuntime{GeneratedAt: envelope.L2TPGenerated, Target: envelope.Target, Inbounds: envelope.L2TPInbounds}
+	if l2tpRuntimeConfig.Inbounds == nil {
+		l2tpRuntimeConfig.Inbounds = []l2tpRuntimeInbound{}
+	}
+	return ovRuntimeConfig, l2tpRuntimeConfig, nil
 }
 
 func (s *Server) grpcAddUser(req *nodev1.InboundUserRequest, message string) (*nodev1.RuntimeActionResponse, error) {

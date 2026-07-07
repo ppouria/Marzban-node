@@ -97,11 +97,18 @@ func (m *ovManager) Apply(runtimeConfig *ovRuntime) error {
 	}
 	for _, inbound := range runtimeConfig.Inbounds {
 		name := safeName(inbound.Tag)
-		m.stopInboundName(name)
+		dir := filepath.Join(m.baseDir, name)
+		oldConfig, _ := os.ReadFile(filepath.Join(dir, "server.conf"))
+		wasRunning, _ := openvpnPIDRunning(filepath.Join(dir, "openvpn.pid"), filepath.Join(dir, "openvpn.log"))
 		if err := m.writeInbound(inbound); err != nil {
 			return err
 		}
-		if err := m.applyInbound(inbound); err != nil {
+		newConfig, _ := os.ReadFile(filepath.Join(dir, "server.conf"))
+		restart := !wasRunning || string(oldConfig) != string(newConfig)
+		if restart {
+			m.stopInboundName(name)
+		}
+		if err := m.applyInbound(inbound, restart); err != nil {
 			return err
 		}
 	}
@@ -146,9 +153,6 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
 	name := safeName(inbound.Tag)
 	dir := filepath.Join(m.baseDir, name)
 	ccdDir := filepath.Join(dir, "ccd")
-	if err := os.RemoveAll(dir); err != nil {
-		return err
-	}
 	if err := os.MkdirAll(ccdDir, 0o700); err != nil {
 		return err
 	}
@@ -157,13 +161,25 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
 	if err := os.WriteFile(usersPath, []byte(usersTSV(inbound.Users)), 0o600); err != nil {
 		return err
 	}
+	desiredCCD := map[string]struct{}{}
 	for _, user := range inbound.Users {
 		if strings.TrimSpace(user.VPNUsername) == "" || strings.TrimSpace(user.IPv4Address) == "" {
 			continue
 		}
+		desiredCCD[safeName(user.VPNUsername)] = struct{}{}
 		ccd := fmt.Sprintf("ifconfig-push %s %s\n", user.IPv4Address, poolMask)
 		if err := os.WriteFile(filepath.Join(ccdDir, safeName(user.VPNUsername)), []byte(ccd), 0o600); err != nil {
 			return err
+		}
+	}
+	if entries, err := os.ReadDir(ccdDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			if _, ok := desiredCCD[entry.Name()]; !ok {
+				_ = os.Remove(filepath.Join(ccdDir, entry.Name()))
+			}
 		}
 	}
 	for path, content := range map[string]string{
@@ -183,7 +199,7 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
 	return nil
 }
 
-func (m *ovManager) applyInbound(inbound ovRuntimeInbound) error {
+func (m *ovManager) applyInbound(inbound ovRuntimeInbound, restart bool) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
@@ -203,6 +219,9 @@ func (m *ovManager) applyInbound(inbound ovRuntimeInbound) error {
 		if err := applyTProxyRouting(); err != nil {
 			return err
 		}
+	}
+	if !restart {
+		return nil
 	}
 	openvpn, err := exec.LookPath("openvpn")
 	if err != nil {

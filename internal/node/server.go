@@ -33,6 +33,7 @@ type Server struct {
 	settings appconfig.Settings
 	core     *xray.Core
 	ov       *ovManager
+	l2tp     *l2tpManager
 	usage    *usageBuffer
 	system   *systemSampler
 
@@ -65,6 +66,7 @@ func New(settings appconfig.Settings) (*Server, error) {
 		settings: settings,
 		core:     core,
 		ov:       newOVManager(settings.RebeccaDataDir, settings.InstallMode),
+		l2tp:     newL2TPManager(settings.RebeccaDataDir, settings.InstallMode),
 		usage:    usage,
 		system:   newSystemSampler(),
 		sessions: make(map[string]time.Time),
@@ -116,6 +118,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/update_geo", s.handleUpdateGeo)
 	mux.HandleFunc("/service/restart", s.handleServiceRestart)
 	mux.HandleFunc("/service/update", s.handleServiceUpdate)
+	mux.HandleFunc("/host/reboot", s.handleHostReboot)
 	mux.HandleFunc("/usage/users", s.handleUserUsage)
 	mux.HandleFunc("/usage/users/ack", s.handleUserUsageAck)
 	mux.HandleFunc("/usage/outbounds", s.handleOutboundUsage)
@@ -202,8 +205,13 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime)
-	writeJSON(w, http.StatusOK, s.response(nil))
+	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
+	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime)
+	response := s.response(nil)
+	if l2tpWarning != "" {
+		response["warning"] = l2tpWarning
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -213,6 +221,10 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	s.snapshotRunningUsage()
 	s.core.Stop()
 	if err := s.ov.Apply(&ovRuntime{Inbounds: []ovRuntimeInbound{}}); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if err := s.l2tp.Apply(&l2tpRuntime{Inbounds: []l2tpRuntimeInbound{}}); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
@@ -246,8 +258,13 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime)
-	writeJSON(w, http.StatusOK, s.response(nil))
+	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
+	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime)
+	response := s.response(nil)
+	if l2tpWarning != "" {
+		response["warning"] = l2tpWarning
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleUpdateCore(w http.ResponseWriter, r *http.Request) {
@@ -387,6 +404,17 @@ func (s *Server) handleServiceUpdate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted"})
 }
 
+func (s *Server) handleHostReboot(w http.ResponseWriter, r *http.Request) {
+	if !s.matchRequestSession(w, r) {
+		return
+	}
+	if err := scheduleHostReboot(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted"})
+}
+
 func (s *Server) handleOutboundUsage(w http.ResponseWriter, r *http.Request) {
 	if !s.matchRequestSession(w, r) {
 		return
@@ -411,6 +439,9 @@ func (s *Server) handleOutboundUsage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) snapshotRunningUsage() {
 	if stats := s.ov.CollectUsage(); len(stats) > 0 {
+		s.usage.addUsers(stats)
+	}
+	if stats := s.l2tp.CollectUsage(); len(stats) > 0 {
 		s.usage.addUsers(stats)
 	}
 	if !s.core.Started() {
@@ -469,6 +500,9 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	if OVStats := s.ov.CollectUsage(); len(OVStats) > 0 {
 		stats = append(stats, OVStats...)
+	}
+	if l2tpStats := s.l2tp.CollectUsage(); len(l2tpStats) > 0 {
+		stats = append(stats, l2tpStats...)
 	}
 	batchID, pending := s.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
@@ -533,6 +567,22 @@ func hostActionCommand(cli string, args ...string) (string, []string) {
 		}
 	}
 	return cli, args
+}
+
+func scheduleHostReboot() error {
+	if runtime.GOOS == "windows" {
+		return errors.New("host reboot is supported only on Linux")
+	}
+	reboot, err := exec.LookPath("reboot")
+	if err != nil {
+		reboot = "/sbin/reboot"
+	}
+	command := fmt.Sprintf("sleep 1; %s", reboot)
+	if systemdRun, err := exec.LookPath("systemd-run"); err == nil {
+		unit := fmt.Sprintf("rebecca-node-host-reboot-%d", time.Now().UnixNano())
+		return exec.Command(systemdRun, "--unit", unit, "--collect", "--description", "Rebecca-node host reboot", "--", "sh", "-c", command).Start()
+	}
+	return exec.Command("sh", "-c", command).Start()
 }
 
 func (s *Server) handleAccessLogs(w http.ResponseWriter, r *http.Request) {
@@ -636,26 +686,28 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 type configPayload struct {
-	SessionID string     `json:"session_id"`
-	Config    string     `json:"config"`
-	OVRuntime *ovRuntime `json:"ov_runtime,omitempty"`
+	SessionID   string       `json:"session_id"`
+	Config      string       `json:"config"`
+	OVRuntime   *ovRuntime   `json:"ov_runtime,omitempty"`
+	L2TPRuntime *l2tpRuntime `json:"l2tp_runtime,omitempty"`
 }
 
 type cachedConfigPayload struct {
-	Config    string     `json:"config"`
-	PeerIP    string     `json:"peer_ip"`
-	OVRuntime *ovRuntime `json:"ov_runtime,omitempty"`
+	Config      string       `json:"config"`
+	PeerIP      string       `json:"peer_ip"`
+	OVRuntime   *ovRuntime   `json:"ov_runtime,omitempty"`
+	L2TPRuntime *l2tpRuntime `json:"l2tp_runtime,omitempty"`
 }
 
 func (s *Server) configCachePath() string {
 	return filepath.Join(s.settings.RebeccaDataDir, "xray-config-cache.json")
 }
 
-func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime) {
+func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime) {
 	if strings.TrimSpace(rawConfig) == "" {
 		return
 	}
-	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig})
+	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig})
 	if err != nil {
 		return
 	}
@@ -695,6 +747,23 @@ func (s *Server) cachedOVRuntime() *ovRuntime {
 	return payload.OVRuntime
 }
 
+func (s *Server) cachedL2TPRuntime() *l2tpRuntime {
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return nil
+	}
+	return payload.L2TPRuntime
+}
+
+func (s *Server) applyL2TPRuntime(runtimeConfig *l2tpRuntime) string {
+	if err := s.l2tp.Apply(runtimeConfig); err != nil {
+		warning := "L2TP runtime apply failed: " + err.Error()
+		log.Print(warning)
+		return warning
+	}
+	return ""
+}
+
 func (s *Server) clearConfigCache() {
 	if err := os.Remove(s.configCachePath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Printf("failed to clear config cache: %v", err)
@@ -720,6 +789,9 @@ func (s *Server) startCachedConfig() {
 	s.mu.Unlock()
 	if err := s.ov.Apply(payload.OVRuntime); err != nil {
 		log.Printf("failed to apply cached OV runtime: %v", err)
+	}
+	if err := s.l2tp.Apply(payload.L2TPRuntime); err != nil {
+		log.Printf("failed to apply cached L2TP runtime: %v", err)
 	}
 }
 
