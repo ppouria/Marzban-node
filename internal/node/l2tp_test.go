@@ -21,3 +21,30 @@ func TestL2TPPoolRangeHandlesSmallCIDR(t *testing.T) {
 		t.Fatalf("unexpected pool range: %s", pool)
 	}
 }
+
+func TestNormalizeL2TPRuntimeInboundLocksPorts(t *testing.T) {
+	inbound := normalizeL2TPRuntimeInbound(l2tpRuntimeInbound{
+		Port:       3974,
+		TunnelPort: 41941,
+		Settings: map[string]any{
+			"l2tp_port":        3974,
+			"ipsec_ike_port":   1500,
+			"ipsec_nat_port":   14500,
+			"xray_tunnel_port": 41941,
+			"tproxy_port":      41941,
+		},
+	})
+
+	if inbound.Port != 1701 || inbound.TunnelPort != 1702 {
+		t.Fatalf("unexpected ports: public=%d tunnel=%d", inbound.Port, inbound.TunnelPort)
+	}
+	if inbound.Settings["l2tp_port"] != 1701 || inbound.Settings["ipsec_ike_port"] != 500 || inbound.Settings["ipsec_nat_port"] != 4500 || inbound.Settings["tunnel_port"] != 1702 {
+		t.Fatalf("fixed settings were not enforced: %#v", inbound.Settings)
+	}
+	if _, ok := inbound.Settings["xray_tunnel_port"]; ok {
+		t.Fatalf("legacy xray_tunnel_port should be removed")
+	}
+	if _, ok := inbound.Settings["tproxy_port"]; ok {
+		t.Fatalf("legacy tproxy_port should be removed")
+	}
+}

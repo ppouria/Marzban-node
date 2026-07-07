@@ -16,6 +16,13 @@ import (
 	"github.com/rebeccapanel/rebecca-node/internal/xray"
 )
 
+const (
+	l2tpFixedIPSecIKEPort = 500
+	l2tpFixedIPSecNATPort = 4500
+	l2tpFixedPort         = 1701
+	l2tpFixedTunnelPort   = 1702
+)
+
 type l2tpRuntime struct {
 	GeneratedAt string               `json:"generated_at"`
 	Target      string               `json:"target,omitempty"`
@@ -72,9 +79,14 @@ func (m *l2tpManager) Apply(runtimeConfig *l2tpRuntime) error {
 		if err := ensureL2TPPrerequisites(); err != nil {
 			return err
 		}
+		runtimeConfig.Inbounds[0] = normalizeL2TPRuntimeInbound(runtimeConfig.Inbounds[0])
 	}
 	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
 		return err
+	}
+	previousUsersFingerprint := ""
+	if previous := m.currentRuntime(); previous != nil && len(previous.Inbounds) > 0 {
+		previousUsersFingerprint = l2tpUsersFingerprint(previous.Inbounds[0].Users)
 	}
 	raw, err := json.MarshalIndent(runtimeConfig, "", "  ")
 	if err != nil {
@@ -91,8 +103,25 @@ func (m *l2tpManager) Apply(runtimeConfig *l2tpRuntime) error {
 	if err := m.writeInbound(inbound); err != nil {
 		return err
 	}
-	m.disconnectStaleSessions(inbound.Users)
+	if previousUsersFingerprint == "" || previousUsersFingerprint != l2tpUsersFingerprint(inbound.Users) {
+		m.disconnectStaleSessions(inbound.Users)
+	}
 	return m.applyInbound(inbound)
+}
+
+func (m *l2tpManager) currentRuntime() *l2tpRuntime {
+	if m == nil {
+		return nil
+	}
+	raw, err := os.ReadFile(filepath.Join(m.baseDir, "runtime.json"))
+	if err != nil {
+		return nil
+	}
+	var payload l2tpRuntime
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	return &payload
 }
 
 func (m *l2tpManager) CollectUsage() []xray.UserStat {
@@ -130,6 +159,7 @@ func (m *l2tpManager) CollectUsage() []xray.UserStat {
 }
 
 func (m *l2tpManager) writeInbound(inbound l2tpRuntimeInbound) error {
+	inbound = normalizeL2TPRuntimeInbound(inbound)
 	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
 		return err
 	}
@@ -153,6 +183,7 @@ func (m *l2tpManager) writeInbound(inbound l2tpRuntimeInbound) error {
 }
 
 func (m *l2tpManager) applyInbound(inbound l2tpRuntimeInbound) error {
+	inbound = normalizeL2TPRuntimeInbound(inbound)
 	if runtime.GOOS == "windows" {
 		return nil
 	}
@@ -197,6 +228,7 @@ func (m *l2tpManager) stop() {
 }
 
 func (m *l2tpManager) writeSystemConfig(inbound l2tpRuntimeInbound) error {
+	inbound = normalizeL2TPRuntimeInbound(inbound)
 	settings := inbound.Settings
 	psk := firstString(settings["ipsec_psk"])
 	localIP, ipRange := l2tpPoolRange(firstString(settings["ipv4_pool_cidr"], "10.67.0.0/16"))
@@ -213,7 +245,7 @@ func (m *l2tpManager) writeSystemConfig(inbound l2tpRuntimeInbound) error {
   forceencaps=yes
   ike=aes256-sha1-modp2048,aes128-sha1-modp2048!
   esp=aes256-sha1,aes128-sha1!
-`, intValue(firstString(settings["l2tp_port"], "1701")))
+`, l2tpFixedPort)
 	if err := updateManagedBlock("/etc/ipsec.conf", "# BEGIN REBECCA L2TP IPSEC", "# END REBECCA L2TP IPSEC", ipsecBlock); err != nil {
 		return fmt.Errorf("update /etc/ipsec.conf: %w", err)
 	}
@@ -233,7 +265,7 @@ ip range = %s
 local ip = %s
 pppoptfile = %s
 length bit = yes
-`, intValue(firstString(settings["l2tp_port"], "1701")), ipRange, localIP, filepath.Join(m.baseDir, "options.xl2tpd"))
+`, l2tpFixedPort, ipRange, localIP, filepath.Join(m.baseDir, "options.xl2tpd"))
 	if err := os.WriteFile("/etc/xl2tpd/xl2tpd.conf", []byte(xl2tpd), 0o600); err != nil {
 		return fmt.Errorf("write /etc/xl2tpd/xl2tpd.conf: %w", err)
 	}
@@ -253,6 +285,7 @@ length bit = yes
 }
 
 func l2tpPPPOptions(inbound l2tpRuntimeInbound) string {
+	inbound = normalizeL2TPRuntimeInbound(inbound)
 	var b strings.Builder
 	line(&b, "ipcp-accept-local")
 	line(&b, "ipcp-accept-remote")
@@ -325,7 +358,33 @@ func l2tpUsersTSV(users []l2tpRuntimeUser) string {
 	return b.String()
 }
 
+func l2tpUsersFingerprint(users []l2tpRuntimeUser) string {
+	var b strings.Builder
+	for _, user := range users {
+		b.WriteString(strconv.FormatInt(user.UserID, 10))
+		b.WriteByte('\t')
+		b.WriteString(user.VPNUsername)
+		b.WriteByte('\t')
+		b.WriteString(user.Password)
+		b.WriteByte('\t')
+		b.WriteString(user.IPv4Address)
+		b.WriteByte('\t')
+		b.WriteString(user.Status)
+		b.WriteByte('\t')
+		if user.DataLimit != nil {
+			b.WriteString(strconv.FormatInt(*user.DataLimit, 10))
+		}
+		b.WriteByte('\t')
+		if user.Expire != nil {
+			b.WriteString(strconv.FormatInt(*user.Expire, 10))
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 func l2tpNFTScript(inbound l2tpRuntimeInbound) string {
+	inbound = normalizeL2TPRuntimeInbound(inbound)
 	if inbound.TunnelPort <= 0 || !boolValue(inbound.Settings["tproxy_enabled"], true) {
 		return ""
 	}
@@ -345,6 +404,22 @@ func l2tpNFTScript(inbound l2tpRuntimeInbound) string {
   }
 }
 `, strings.TrimRight(rules.String(), "\n"), inbound.TunnelPort)
+}
+
+func normalizeL2TPRuntimeInbound(inbound l2tpRuntimeInbound) l2tpRuntimeInbound {
+	if inbound.Settings == nil {
+		inbound.Settings = map[string]any{}
+	}
+	inbound.Port = l2tpFixedPort
+	inbound.TunnelPort = l2tpFixedTunnelPort
+	inbound.Settings["l2tp_port"] = l2tpFixedPort
+	inbound.Settings["ipsec_ike_port"] = l2tpFixedIPSecIKEPort
+	inbound.Settings["ipsec_nat_port"] = l2tpFixedIPSecNATPort
+	inbound.Settings["tunnel_port"] = l2tpFixedTunnelPort
+	delete(inbound.Settings, "xray_tunnel_port")
+	delete(inbound.Settings, "tproxy_port")
+	delete(inbound.Settings, "management_port")
+	return inbound
 }
 
 func (m *l2tpManager) disconnectStaleSessions(users []l2tpRuntimeUser) {
