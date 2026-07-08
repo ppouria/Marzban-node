@@ -2,6 +2,7 @@ package node
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -158,7 +159,7 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
 	}
 	_, poolMask := ovNetworkMask(firstString(inbound.Settings["ipv4_pool_cidr"], "10.66.0.0/16"))
 	usersPath := filepath.Join(dir, "users.tsv")
-	if err := os.WriteFile(usersPath, []byte(usersTSV(inbound.Users)), 0o600); err != nil {
+	if err := writeFileIfChanged(usersPath, []byte(usersTSV(inbound.Users)), 0o600); err != nil {
 		return err
 	}
 	desiredCCD := map[string]struct{}{}
@@ -168,7 +169,7 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
 		}
 		desiredCCD[safeName(user.VPNUsername)] = struct{}{}
 		ccd := fmt.Sprintf("ifconfig-push %s %s\n", user.IPv4Address, poolMask)
-		if err := os.WriteFile(filepath.Join(ccdDir, safeName(user.VPNUsername)), []byte(ccd), 0o600); err != nil {
+		if err := writeFileIfChanged(filepath.Join(ccdDir, safeName(user.VPNUsername)), []byte(ccd), 0o600); err != nil {
 			return err
 		}
 	}
@@ -192,7 +193,7 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
 		if strings.HasSuffix(path, ".sh") {
 			mode = 0o700
 		}
-		if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		if err := writeFileIfChanged(path, []byte(content), mode); err != nil {
 			return err
 		}
 	}
@@ -291,7 +292,11 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	network, mask := ovNetworkMask(pool)
 	var b strings.Builder
 	line(&b, "port "+strconv.Itoa(inbound.Port))
-	line(&b, "proto "+transport)
+	if transport == "tcp" {
+		line(&b, "proto tcp-server")
+	} else {
+		line(&b, "proto udp")
+	}
 	line(&b, "dev "+tunName(inbound.Tag))
 	line(&b, "dev-type tun")
 	line(&b, "topology subnet")
@@ -557,7 +562,8 @@ func authScript(usersPath string) string {
 	return fmt.Sprintf(`#!/bin/sh
 USERS=%q
 now=$(date +%%s)
-awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
+tab=$(printf '\t')
+grep -F "${tab}${username}${tab}" "$USERS" | awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
   $2 == u && $3 == p && ($7 == "" || $7 == "active" || $7 == "on_hold") {
     if ($6 != "" && $5 >= $6) exit 2
     if ($8 != "" && now >= $8) exit 3
@@ -607,6 +613,13 @@ func usersTSV(users []ovRuntimeUser) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+func writeFileIfChanged(path string, content []byte, mode os.FileMode) error {
+	if current, err := os.ReadFile(path); err == nil && bytes.Equal(current, content) {
+		return os.Chmod(path, mode)
+	}
+	return os.WriteFile(path, content, mode)
 }
 
 func ovNetworkMask(cidr string) (string, string) {
