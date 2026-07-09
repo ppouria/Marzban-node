@@ -690,10 +690,17 @@ func installWGPackages() error {
 		if commandExists("dpkg") {
 			_ = runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "dpkg", "--configure", "-a")
 		}
+		_ = runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "-f", "install", "-y")
 		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
 			return err
 		}
-		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "wireguard-tools", "iproute2", "nftables", "iptables", "kmod")
+		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "wireguard-tools", "iproute2", "nftables", "iptables", "kmod"); err != nil {
+			if repairErr := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "-f", "install", "-y"); repairErr != nil {
+				return err
+			}
+			return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "wireguard-tools", "iproute2", "nftables", "iptables", "kmod")
+		}
+		return nil
 	case commandExists("dnf"):
 		return runInstallCommand(nil, "dnf", "install", "-y", "wireguard-tools", "iproute", "nftables", "iptables", "kmod")
 	case commandExists("yum"):
