@@ -44,6 +44,14 @@ type Server struct {
 	clientIP   string
 	sessions   map[string]time.Time
 	lastConfig *xray.Config
+
+	// runtimeMu serializes whole runtime operations (start/restart/stop/sync and
+	// user add/update/remove) so two concurrent pushes from the master can never
+	// interleave a core restart, a config-cache write, or a VPN apply. It is a
+	// separate lock from mu (which only guards session/connection state) and is
+	// taken only at the public entry points, never in the internal helpers they
+	// call, so the operations do not deadlock on themselves.
+	runtimeMu sync.Mutex
 }
 
 const sessionTTL = 30 * time.Minute
@@ -174,11 +182,13 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 	s.clientIP = ""
 	s.sessions = make(map[string]time.Time)
 	s.mu.Unlock()
+	s.runtimeMu.Lock()
 	if s.core.Started() {
 		s.snapshotRunningUsage()
 		s.core.Stop()
 	}
 	s.clearConfigCache()
+	s.runtimeMu.Unlock()
 	writeJSON(w, http.StatusOK, s.response(nil))
 }
 
@@ -194,6 +204,8 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	if s.core.Started() && s.runtimeConfigMatchesCache(payload.Config) {
 		s.handleRuntimeOnly(w, payload)
 		return
@@ -257,6 +269,8 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if !s.matchRequestSession(w, r) {
 		return
 	}
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	s.snapshotRunningUsage()
 	s.core.Stop()
 	if err := s.ov.Apply(&ovRuntime{Inbounds: []ovRuntimeInbound{}}); err != nil {
@@ -283,6 +297,8 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	if s.core.Started() && s.runtimeConfigMatchesCache(payload.Config) {
 		s.handleRuntimeOnly(w, payload)
 		return

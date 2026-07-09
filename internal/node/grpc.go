@@ -123,6 +123,8 @@ func (api *grpcAPI) Health(ctx context.Context, req *nodev1.HealthRequest) (*nod
 }
 
 func (api *grpcAPI) StartRuntime(ctx context.Context, req *nodev1.RuntimeConfigRequest) (*nodev1.RuntimeActionResponse, error) {
+	api.server.runtimeMu.Lock()
+	defer api.server.runtimeMu.Unlock()
 	if api.server.core.Started() {
 		if api.server.runtimeConfigMatchesCache(req.GetConfigJson()) {
 			return api.server.grpcApplyRuntimeOnly(ctx, req, "runtime already started")
@@ -133,6 +135,8 @@ func (api *grpcAPI) StartRuntime(ctx context.Context, req *nodev1.RuntimeConfigR
 }
 
 func (api *grpcAPI) RestartRuntime(ctx context.Context, req *nodev1.RuntimeConfigRequest) (*nodev1.RuntimeActionResponse, error) {
+	api.server.runtimeMu.Lock()
+	defer api.server.runtimeMu.Unlock()
 	if api.server.core.Started() && api.server.runtimeConfigMatchesCache(req.GetConfigJson()) {
 		return api.server.grpcApplyRuntimeOnly(ctx, req, "runtime config unchanged")
 	}
@@ -140,6 +144,8 @@ func (api *grpcAPI) RestartRuntime(ctx context.Context, req *nodev1.RuntimeConfi
 }
 
 func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequest) (*nodev1.RuntimeActionResponse, error) {
+	api.server.runtimeMu.Lock()
+	defer api.server.runtimeMu.Unlock()
 	if req.GetCollectUsageBeforeStop() {
 		api.server.snapshotRunningUsage()
 	}
@@ -161,6 +167,8 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 }
 
 func (api *grpcAPI) SyncConfig(ctx context.Context, req *nodev1.RuntimeConfigRequest) (*nodev1.RuntimeActionResponse, error) {
+	api.server.runtimeMu.Lock()
+	defer api.server.runtimeMu.Unlock()
 	if api.server.core.Started() {
 		if api.server.runtimeConfigMatchesCache(req.GetConfigJson()) || api.server.runtimeTopologyMatchesCache(req.GetConfigJson()) {
 			return api.server.grpcApplyRuntimeOnly(ctx, req, "runtime config synced")
@@ -171,10 +179,14 @@ func (api *grpcAPI) SyncConfig(ctx context.Context, req *nodev1.RuntimeConfigReq
 }
 
 func (api *grpcAPI) AddUser(ctx context.Context, req *nodev1.InboundUserRequest) (*nodev1.RuntimeActionResponse, error) {
+	api.server.runtimeMu.Lock()
+	defer api.server.runtimeMu.Unlock()
 	return api.server.grpcAddUser(req, "user added")
 }
 
 func (api *grpcAPI) UpdateUser(ctx context.Context, req *nodev1.InboundUserRequest) (*nodev1.RuntimeActionResponse, error) {
+	api.server.runtimeMu.Lock()
+	defer api.server.runtimeMu.Unlock()
 	if !api.server.core.Started() {
 		return nil, status.Error(codes.FailedPrecondition, "Xray is not started")
 	}
@@ -206,6 +218,8 @@ func (api *grpcAPI) UpdateUser(ctx context.Context, req *nodev1.InboundUserReque
 }
 
 func (api *grpcAPI) RemoveUser(ctx context.Context, req *nodev1.RemoveInboundUserRequest) (*nodev1.RuntimeActionResponse, error) {
+	api.server.runtimeMu.Lock()
+	defer api.server.runtimeMu.Unlock()
 	if !api.server.core.Started() {
 		return nil, status.Error(codes.FailedPrecondition, "Xray is not started")
 	}
