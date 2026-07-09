@@ -154,7 +154,7 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 	if err := api.server.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+		log.Printf("WireGuard runtime stop failed: %v", err)
 	}
 	api.server.clearConfigCache()
 	return api.server.grpcAction(req.GetOperationId(), true, "runtime stopped"), nil

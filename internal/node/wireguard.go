@@ -41,7 +41,9 @@ type wgRuntime struct {
 
 type wgRuntimeInbound struct {
 	Tag        string          `json:"tag"`
+	TunnelTag  string          `json:"tunnel_tag,omitempty"`
 	ListenPort int             `json:"listen_port"`
+	TunnelPort int             `json:"tunnel_port,omitempty"`
 	Settings   map[string]any  `json:"settings"`
 	Peers      []wgRuntimePeer `json:"peers"`
 }
@@ -219,6 +221,9 @@ func (m *wgManager) applyInbound(client *wgctrl.Client, inbound wgRuntimeInbound
 	}
 	mtu := boundedInt(settings["mtu"], wgDefaultMTU, 576, 1500)
 	iface := wgIfaceName(inbound.Tag)
+	if err := os.MkdirAll(filepath.Join(m.baseDir, iface), 0o700); err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), wgCommandTimeout)
 	defer cancel()
@@ -248,8 +253,23 @@ func (m *wgManager) applyInbound(client *wgctrl.Client, inbound wgRuntimeInbound
 		return fmt.Errorf("configure WireGuard device %s: %w", iface, err)
 	}
 
-	if err := wgApplyNAT(ctx, iface, wgNetwork(pool)); err != nil {
-		return fmt.Errorf("WireGuard inbound %s: %w", inbound.Tag, err)
+	if boolValue(settings["tproxy_enabled"], true) {
+		if inbound.TunnelPort <= 0 {
+			return fmt.Errorf("WireGuard inbound %s requires tunnel_port when tproxy_enabled is true", inbound.Tag)
+		}
+		if err := wgApplyTProxy(ctx, m.baseDir, inbound, iface); err != nil {
+			return fmt.Errorf("WireGuard inbound %s: %w", inbound.Tag, err)
+		}
+		_ = wgRemoveNAT(ctx, iface)
+	} else if boolValue(settings["nat_enabled"], false) {
+		enableWGForwarding()
+		if err := wgApplyNAT(ctx, iface, wgNetwork(pool)); err != nil {
+			return fmt.Errorf("WireGuard inbound %s: %w", inbound.Tag, err)
+		}
+		_ = wgRemoveTProxy(ctx, iface)
+	} else {
+		_ = wgRemoveNAT(ctx, iface)
+		_ = wgRemoveTProxy(ctx, iface)
 	}
 	m.pruneBaselines(iface, desiredKeys)
 	return nil
@@ -302,6 +322,7 @@ func (m *wgManager) teardownInterface(iface string) {
 	ctx, cancel := context.WithTimeout(context.Background(), wgCommandTimeout)
 	defer cancel()
 	_ = wgRemoveNAT(ctx, iface)
+	_ = wgRemoveTProxy(ctx, iface)
 	_, _ = wgRunIP(ctx, "link", "del", "dev", iface)
 }
 
@@ -354,6 +375,9 @@ func normalizeWGRuntimeInbound(inbound wgRuntimeInbound) wgRuntimeInbound {
 	if inbound.ListenPort == 0 {
 		inbound.ListenPort = intValue(inbound.Settings["listen_port"])
 	}
+	if inbound.TunnelPort == 0 {
+		inbound.TunnelPort = intValue(firstString(inbound.Settings["tunnel_port"], inbound.Settings["xray_tunnel_port"], inbound.Settings["tproxy_port"]))
+	}
 	return inbound
 }
 
@@ -384,8 +408,59 @@ func wgValidateInbounds(inbounds []wgRuntimeInbound) error {
 			}
 		}
 		claimed = append(claimed, network)
+		serverAddress := firstString(inbound.Settings["server_address"])
+		if serverAddress == "" {
+			serverAddress, _ = wgServerAddress(pool)
+		}
+		if err := wgValidatePeerAddresses(inbound.Tag, pool, serverAddress, inbound.Peers); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func wgValidatePeerAddresses(tag string, pool string, serverAddress string, peers []wgRuntimePeer) error {
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(pool))
+	if err != nil {
+		return fmt.Errorf("WireGuard inbound %s has invalid address_pool %q: %w", tag, pool, err)
+	}
+	var server netip.Addr
+	if strings.TrimSpace(serverAddress) != "" {
+		server, _ = wgPeerAddr(serverAddress)
+	}
+	seen := map[netip.Addr]int64{}
+	for _, peer := range peers {
+		address := strings.TrimSpace(peer.Address)
+		if address == "" {
+			continue
+		}
+		addr, err := wgPeerAddr(address)
+		if err != nil {
+			return fmt.Errorf("WireGuard inbound %s peer %d has invalid address %q: %w", tag, peer.UserID, address, err)
+		}
+		if !prefix.Contains(addr) {
+			return fmt.Errorf("WireGuard inbound %s peer %d address %s is outside pool %s", tag, peer.UserID, addr.String(), prefix.String())
+		}
+		if addr == prefix.Addr() {
+			return fmt.Errorf("WireGuard inbound %s peer %d address %s is the pool network address", tag, peer.UserID, addr.String())
+		}
+		if server.IsValid() && addr == server {
+			return fmt.Errorf("WireGuard inbound %s peer %d address %s is the server address", tag, peer.UserID, addr.String())
+		}
+		if other, ok := seen[addr]; ok {
+			return fmt.Errorf("WireGuard inbound %s peers %d and %d share address %s", tag, other, peer.UserID, addr.String())
+		}
+		seen[addr] = peer.UserID
+	}
+	return nil
+}
+
+func wgPeerAddr(address string) (netip.Addr, error) {
+	address = strings.TrimSpace(address)
+	if prefix, err := netip.ParsePrefix(address); err == nil {
+		return prefix.Addr(), nil
+	}
+	return netip.ParseAddr(address)
 }
 
 func wgPeerActive(peer wgRuntimePeer) bool {
@@ -556,13 +631,13 @@ func ensureWGPrerequisites() error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
-	missing := missingExecutables("wg", "ip", "iptables")
+	missing := missingExecutables("wg", "ip", "nft", "iptables")
 	if len(missing) > 0 {
 		if err := installWGPackages(); err != nil {
 			return err
 		}
 	}
-	for _, executable := range []string{"wg", "ip", "iptables"} {
+	for _, executable := range []string{"wg", "ip", "nft", "iptables"} {
 		if _, err := exec.LookPath(executable); err != nil {
 			return fmt.Errorf("WireGuard prerequisite %s was not found after automatic install", executable)
 		}
@@ -570,7 +645,6 @@ func ensureWGPrerequisites() error {
 	if err := loadWGKernelModule(); err != nil {
 		return err
 	}
-	enableWGForwarding()
 	return nil
 }
 
@@ -586,13 +660,13 @@ func installWGPackages() error {
 		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
 			return err
 		}
-		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "wireguard-tools", "iproute2", "iptables", "kmod")
+		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "wireguard-tools", "iproute2", "nftables", "iptables", "kmod")
 	case commandExists("dnf"):
-		return runInstallCommand(nil, "dnf", "install", "-y", "wireguard-tools", "iproute", "iptables", "kmod")
+		return runInstallCommand(nil, "dnf", "install", "-y", "wireguard-tools", "iproute", "nftables", "iptables", "kmod")
 	case commandExists("yum"):
-		return runInstallCommand(nil, "yum", "install", "-y", "wireguard-tools", "iproute", "iptables", "kmod")
+		return runInstallCommand(nil, "yum", "install", "-y", "wireguard-tools", "iproute", "nftables", "iptables", "kmod")
 	case commandExists("apk"):
-		return runInstallCommand(nil, "apk", "add", "wireguard-tools", "iproute2", "iptables", "kmod")
+		return runInstallCommand(nil, "apk", "add", "wireguard-tools", "iproute2", "nftables", "iptables", "kmod")
 	default:
 		return fmt.Errorf("WireGuard prerequisites are missing and no supported package manager was found")
 	}

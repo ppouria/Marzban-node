@@ -32,13 +32,14 @@ OpenVPN runtime support is binary-only. Docker nodes reject OpenVPN runtime payl
 instead of installing host VPN prerequisites inside the container.
 
 WireGuard runtime support is binary-only for the same reason. On first use the node installs
-`wireguard-tools`, loads the kernel module, and enables IPv4/IPv6 forwarding (persisted via
-`/etc/sysctl.d/99-rebecca-wireguard.conf`). Each WireGuard inbound owns its own kernel interface,
-UDP listen port, address pool and NAT rules, so multiple inbounds coexist on distinct ports. The
-master pushes WireGuard state inside the shared runtime envelope (`ov_runtime_json`) under
-`wg_inbounds`, each with a server `private_key`, `address_pool`, `listen_port` and a `peers` list
-(`public_key`, optional `preshared_key`, `address`). Per-peer rx+tx is read from the kernel and
-reported to the master as `wg:<user_id>` usage deltas.
+`wireguard-tools`, `nftables`, loads the kernel module, and reconciles one kernel interface per
+inbound. By default each WireGuard inbound sends TCP/UDP traffic through nftables TPROXY to its
+Xray tunnel port, so Rebecca routing rules still apply. Direct MASQUERADE/NAT is available only
+when the runtime explicitly sets `nat_enabled=true`. The master pushes WireGuard state inside the
+shared runtime envelope (`ov_runtime_json`) under `wg_inbounds`, each with a server `private_key`,
+`address_pool`, `listen_port`, `tunnel_port` and a `peers` list (`public_key`, optional
+`preshared_key`, `address`). Per-peer rx+tx is read from the kernel and reported to the master as
+`wg:<user_id>` usage deltas.
 
 Use `help` to view all commands:
 ```Rebecca-node help```

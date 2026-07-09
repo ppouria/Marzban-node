@@ -3,7 +3,9 @@ package node
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -151,4 +153,61 @@ func wgDefaultRouteIface(ctx context.Context) (string, error) {
 func wgRunIPT(ctx context.Context, args ...string) (string, error) {
 	out, err := exec.CommandContext(ctx, "iptables", args...).CombinedOutput()
 	return string(out), err
+}
+
+func wgApplyTProxy(ctx context.Context, baseDir string, inbound wgRuntimeInbound, iface string) error {
+	nft, err := exec.LookPath("nft")
+	if err != nil {
+		return fmt.Errorf("nft executable not found")
+	}
+	dir := filepath.Join(baseDir, iface)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "nftables.nft")
+	if err := os.WriteFile(path, []byte(wgTProxyScript(inbound, iface)), 0o600); err != nil {
+		return err
+	}
+	if output, err := exec.CommandContext(ctx, nft, "-f", path).CombinedOutput(); err != nil {
+		return fmt.Errorf("apply WireGuard nftables %s: %v: %s", inbound.Tag, err, strings.TrimSpace(string(output)))
+	}
+	if err := applyTProxyRouting(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func wgRemoveTProxy(ctx context.Context, iface string) error {
+	nft, err := exec.LookPath("nft")
+	if err != nil {
+		return nil
+	}
+	output, err := exec.CommandContext(ctx, nft, "delete", "table", "inet", wgTProxyTableName(iface)).CombinedOutput()
+	if err != nil && !strings.Contains(strings.ToLower(string(output)), "no such file or directory") {
+		return fmt.Errorf("delete WireGuard nftables table %s: %v: %s", iface, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func wgTProxyTableName(iface string) string {
+	return "rebecca_wireguard_" + iface
+}
+
+func wgTProxyScript(inbound wgRuntimeInbound, iface string) string {
+	blockedV4, blockedV6 := ovBlockedDestinations()
+	var rules strings.Builder
+	if len(blockedV4) > 0 {
+		line(&rules, fmt.Sprintf(`    iifname "%s" ip daddr { %s } drop`, iface, strings.Join(blockedV4, ", ")))
+	}
+	if len(blockedV6) > 0 {
+		line(&rules, fmt.Sprintf(`    iifname "%s" ip6 daddr { %s } drop`, iface, strings.Join(blockedV6, ", ")))
+	}
+	return fmt.Sprintf(`table inet %s {
+  chain prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+%s
+    iifname "%s" meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
+  }
+}
+`, wgTProxyTableName(iface), strings.TrimRight(rules.String(), "\n"), iface, inbound.TunnelPort)
 }

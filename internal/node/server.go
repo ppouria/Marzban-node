@@ -250,8 +250,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
+		log.Printf("WireGuard runtime stop failed: %v", err)
 	}
 	s.clearConfigCache()
 	writeJSON(w, http.StatusOK, s.response(nil))
