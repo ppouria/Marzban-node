@@ -132,6 +132,9 @@ func (m *pptpManager) writeInbound(inbound pptpRuntimeInbound) error {
 	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
 		return err
 	}
+	if err := writeVPNSessionCallback(vpnSessionCallbackPath(m.baseDir), nil); err != nil {
+		return err
+	}
 	usersPath := filepath.Join(m.baseDir, "users.tsv")
 	if err := os.WriteFile(usersPath, []byte(pptpUsersTSV(inbound.Users)), 0o600); err != nil {
 		return err
@@ -211,7 +214,7 @@ remoteip %s
 	if err := os.MkdirAll("/etc/ppp/ip-up.d", 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-pptp-sessions", []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "sessions.tsv"))), 0o700); err != nil {
+	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-pptp-sessions", []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), vpnSessionCallbackPath(m.baseDir), vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700); err != nil {
 		return fmt.Errorf("write /etc/ppp/ip-up.d/rebecca-pptp-sessions: %w", err)
 	}
 	if err := os.MkdirAll("/etc/ppp/ip-down.d", 0o755); err != nil {
@@ -363,7 +366,7 @@ func (m *pptpManager) disconnectStaleSessions(users []pptpRuntimeUser) {
 }
 
 func pptpIPDownScript(usersPath string, usagePath string, sessionsPath string) string {
-	return strings.ReplaceAll(l2tpIPDownScript(usersPath, usagePath, sessionsPath), "l2tp:%s", "pptp:%s")
+	return strings.ReplaceAll(l2tpIPDownScript(usersPath, usagePath, sessionsPath, vpnSessionCallbackPath(filepath.Dir(usersPath)), vpnSessionsPath(filepath.Dir(usersPath)), "pptp"), "l2tp", "pptp")
 }
 
 func ensurePPTPPrerequisites() error {

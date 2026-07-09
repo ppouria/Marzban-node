@@ -22,9 +22,10 @@ import (
 )
 
 type ovRuntime struct {
-	GeneratedAt string             `json:"generated_at"`
-	Target      string             `json:"target,omitempty"`
-	Inbounds    []ovRuntimeInbound `json:"inbounds"`
+	GeneratedAt     string              `json:"generated_at"`
+	Target          string              `json:"target,omitempty"`
+	SessionCallback *vpnSessionCallback `json:"session_callback,omitempty"`
+	Inbounds        []ovRuntimeInbound  `json:"inbounds"`
 }
 
 type ovRuntimeInbound struct {
@@ -47,6 +48,7 @@ type ovRuntimeUser struct {
 	UsedTraffic int64  `json:"used_traffic"`
 	DataLimit   *int64 `json:"data_limit,omitempty"`
 	Expire      *int64 `json:"expire,omitempty"`
+	DeviceLimit int64  `json:"device_limit,omitempty"`
 }
 
 type ovManager struct {
@@ -111,7 +113,7 @@ func (m *ovManager) Apply(runtimeConfig *ovRuntime) error {
 				return fmt.Errorf("OV inbound %s requires DCO: %w", inbound.Tag, err)
 			}
 		}
-		if err := m.writeInbound(inbound); err != nil {
+		if err := m.writeInbound(inbound, runtimeConfig.SessionCallback); err != nil {
 			return err
 		}
 		newConfig, _ := os.ReadFile(filepath.Join(dir, "server.conf"))
@@ -160,7 +162,7 @@ func (m *ovManager) CollectUsage() []xray.UserStat {
 	return out
 }
 
-func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
+func (m *ovManager) writeInbound(inbound ovRuntimeInbound, callback *vpnSessionCallback) error {
 	name := safeName(inbound.Tag)
 	dir := filepath.Join(m.baseDir, name)
 	ccdDir := filepath.Join(dir, "ccd")
@@ -170,6 +172,10 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
 	_, poolMask := ovNetworkMask(firstString(inbound.Settings["ipv4_pool_cidr"], "10.66.0.0/16"))
 	usersPath := filepath.Join(dir, "users.tsv")
 	if err := writeFileIfChanged(usersPath, []byte(usersTSV(inbound.Users)), 0o600); err != nil {
+		return err
+	}
+	callbackPath := vpnSessionCallbackPath(dir)
+	if err := writeVPNSessionCallback(callbackPath, callback); err != nil {
 		return err
 	}
 	desiredCCD := map[string]struct{}{}
@@ -194,8 +200,8 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
 		}
 	}
 	for path, content := range map[string]string{
-		filepath.Join(dir, "auth.sh"):              authScript(usersPath),
-		filepath.Join(dir, "client-disconnect.sh"): disconnectScript(usersPath, filepath.Join(m.baseDir, "usage.tsv")),
+		filepath.Join(dir, "auth.sh"):              authScript(usersPath, callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag),
+		filepath.Join(dir, "client-disconnect.sh"): disconnectScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag),
 		filepath.Join(dir, "nftables.nft"):         nftScript(inbound, tunName(inbound.Tag)),
 		filepath.Join(dir, "server.conf"):          serverConfig(inbound, dir, ccdDir),
 	} {
@@ -722,26 +728,33 @@ func ovDCOInactiveReason(logText string) string {
 	return ""
 }
 
-func authScript(usersPath string) string {
+func authScript(usersPath string, callbackPath string, sessionsPath string, inboundTag string) string {
 	return fmt.Sprintf(`#!/bin/sh
 USERS=%q
 now=$(date +%%s)
-tab=$(printf '\t')
-grep -F "${tab}${username}${tab}" "$USERS" | awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
+%s
+info=$(awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
   $2 == u && $3 == p && ($7 == "" || $7 == "active" || $7 == "on_hold") {
     if ($6 != "" && $5 >= $6) exit 2
     if ($8 != "" && now >= $8) exit 3
+    print $1 "\t" $9
     found=1
+    exit 0
   }
   END { exit found ? 0 : 1 }
-' "$USERS"
-`, usersPath)
+' "$USERS") || exit 1
+uid=$(printf '%%s' "$info" | awk -F '\t' '{print $1}')
+device_limit=$(printf '%%s' "$info" | awk -F '\t' '{print $2}')
+session=$(vpn_safe "ov:${trusted_ip:-unknown}:${trusted_port:-0}:${username}")
+vpn_admit "$uid" "ov" %q "$session" "" "$device_limit" || exit 1
+`, usersPath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 
-func disconnectScript(usersPath string, usagePath string) string {
+func disconnectScript(usersPath string, usagePath string, callbackPath string, sessionsPath string, inboundTag string) string {
 	return fmt.Sprintf(`#!/bin/sh
 USERS=%q
 USAGE=%q
+%s
 uid=$(awk -F '\t' -v u="$username" '$2 == u { print $1; exit }' "$USERS")
 rx=${bytes_received:-0}
 tx=${bytes_sent:-0}
@@ -749,7 +762,9 @@ total=$((rx + tx))
 if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
   printf 'openvpn:%%s\t%%s\n' "$uid" "$total" >> "$USAGE"
 fi
-`, usersPath, usagePath)
+session=$(vpn_safe "ov:${trusted_ip:-unknown}:${trusted_port:-0}:${username}")
+vpn_release "$uid" "ov" %q "$session" ""
+`, usersPath, usagePath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 
 func usersTSV(users []ovRuntimeUser) string {
@@ -772,6 +787,7 @@ func usersTSV(users []ovRuntimeUser) string {
 			limit,
 			user.Status,
 			expire,
+			strconv.FormatInt(user.DeviceLimit, 10),
 		}
 		b.WriteString(strings.Join(fields, "\t"))
 		b.WriteByte('\n')

@@ -1,0 +1,281 @@
+package node
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type vpnSessionCallback struct {
+	URL    string `json:"url,omitempty"`
+	Token  string `json:"token,omitempty"`
+	NodeID int64  `json:"node_id,omitempty"`
+}
+
+type vpnSessionEvent struct {
+	NodeID     int64  `json:"node_id"`
+	UserID     int64  `json:"user_id"`
+	Protocol   string `json:"protocol"`
+	InboundTag string `json:"inbound_tag,omitempty"`
+	SessionID  string `json:"session_id"`
+	AssignedIP string `json:"assigned_ip,omitempty"`
+	Event      string `json:"event"`
+}
+
+var vpnSessionMu sync.Mutex
+
+func vpnSessionsPath(baseDir string) string {
+	return filepath.Join(filepath.Dir(baseDir), "vpn-sessions.tsv")
+}
+
+func vpnSessionCallbackPath(dir string) string {
+	return filepath.Join(dir, "session-callback.env")
+}
+
+func writeVPNSessionCallback(path string, callback *vpnSessionCallback) error {
+	body := "CALLBACK_URL=\nCALLBACK_TOKEN=\nCALLBACK_NODE_ID=\n"
+	if callback != nil && strings.TrimSpace(callback.URL) != "" && strings.TrimSpace(callback.Token) != "" && callback.NodeID > 0 {
+		body = "CALLBACK_URL=" + strconv.Quote(strings.TrimSpace(callback.URL)) + "\n" +
+			"CALLBACK_TOKEN=" + strconv.Quote(strings.TrimSpace(callback.Token)) + "\n" +
+			"CALLBACK_NODE_ID=" + strconv.FormatInt(callback.NodeID, 10) + "\n"
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return writeFileIfChanged(path, []byte(body), 0o600)
+}
+
+func vpnSessionShell(callbackPath string, sessionsPath string) string {
+	return fmt.Sprintf(`
+VPN_CALLBACK=%q
+VPN_SESSIONS=%q
+VPN_LOCK="${VPN_SESSIONS}.lock"
+
+vpn_safe() {
+  printf '%%s' "$1" | tr -c 'A-Za-z0-9_.:-' '_'
+}
+
+vpn_notify() {
+  event=$1
+  uid=$2
+  proto=$3
+  tag=$4
+  session=$5
+  ip=$6
+  [ -f "$VPN_CALLBACK" ] && . "$VPN_CALLBACK"
+  [ -n "$CALLBACK_URL" ] && [ -n "$CALLBACK_TOKEN" ] && [ -n "$CALLBACK_NODE_ID" ] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  json=$(printf '{"node_id":%%s,"user_id":%%s,"protocol":"%%s","inbound_tag":"%%s","session_id":"%%s","assigned_ip":"%%s","event":"%%s"}' "$CALLBACK_NODE_ID" "$uid" "$(vpn_safe "$proto")" "$(vpn_safe "$tag")" "$(vpn_safe "$session")" "$(vpn_safe "$ip")" "$event")
+  curl -fsS -m 3 -H "Authorization: Bearer $CALLBACK_TOKEN" -H "Content-Type: application/json" --data "$json" "$CALLBACK_URL" >/dev/null 2>&1 || true
+}
+
+vpn_admit() {
+  uid=$1
+  proto=$2
+  tag=$3
+  session=$4
+  ip=$5
+  limit=$6
+  [ -n "$uid" ] && [ -n "$session" ] || return 1
+  case "$limit" in ''|*[!0-9]*) limit=0 ;; esac
+  mkdir -p "$(dirname "$VPN_SESSIONS")"
+  touch "$VPN_SESSIONS"
+  (
+    flock -x 9 || exit 50
+    tmp="${VPN_SESSIONS}.$$"
+    awk -F '\t' -v sid="$session" '$4 != sid { print }' "$VPN_SESSIONS" > "$tmp"
+    count=$(awk -F '\t' -v uid="$uid" '$1 == uid { n++ } END { print n+0 }' "$tmp")
+    if [ "$limit" -gt 0 ] && [ "$count" -ge "$limit" ]; then
+      rm -f "$tmp"
+      exit 30
+    fi
+    printf '%%s\t%%s\t%%s\t%%s\t%%s\t%%s\n' "$uid" "$proto" "$tag" "$session" "$ip" "$(date +%%s)" >> "$tmp"
+    mv "$tmp" "$VPN_SESSIONS"
+    chmod 600 "$VPN_SESSIONS"
+  ) 9>"$VPN_LOCK"
+  rc=$?
+  [ "$rc" -eq 0 ] && vpn_notify start "$uid" "$proto" "$tag" "$session" "$ip"
+  return "$rc"
+}
+
+vpn_release() {
+  uid=$1
+  proto=$2
+  tag=$3
+  session=$4
+  ip=$5
+  [ -n "$uid" ] && [ -n "$session" ] || return 0
+  mkdir -p "$(dirname "$VPN_SESSIONS")"
+  touch "$VPN_SESSIONS"
+  (
+    flock -x 9 || exit 0
+    tmp="${VPN_SESSIONS}.$$"
+    awk -F '\t' -v sid="$session" '$4 != sid { print }' "$VPN_SESSIONS" > "$tmp"
+    mv "$tmp" "$VPN_SESSIONS"
+    chmod 600 "$VPN_SESSIONS"
+  ) 9>"$VPN_LOCK"
+  vpn_notify stop "$uid" "$proto" "$tag" "$session" "$ip"
+  return 0
+}
+`, callbackPath, sessionsPath)
+}
+
+func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessionEvent, limit int64) bool {
+	if event.UserID <= 0 || strings.TrimSpace(event.SessionID) == "" {
+		return false
+	}
+	sessionID := safeName(event.SessionID)
+	_ = os.MkdirAll(filepath.Dir(path), 0o700)
+	admitted := false
+	if err := withVPNSessionLock(path, func() {
+		records := vpnSessionRecordsLocked(path)
+		next := records[:0]
+		for _, record := range records {
+			if len(record) >= 4 && record[3] == sessionID {
+				continue
+			}
+			next = append(next, record)
+		}
+		count := 0
+		uidText := strconv.FormatInt(event.UserID, 10)
+		for _, record := range next {
+			if len(record) >= 1 && record[0] == uidText {
+				count++
+			}
+		}
+		if limit > 0 && int64(count) >= limit {
+			return
+		}
+		next = append(next, []string{
+			uidText,
+			normalizedVPNProtocol(event.Protocol),
+			safeName(event.InboundTag),
+			sessionID,
+			strings.TrimSpace(event.AssignedIP),
+			strconv.FormatInt(time.Now().Unix(), 10),
+		})
+		vpnWriteSessionRecordsLocked(path, next)
+		admitted = true
+	}); err != nil {
+		return false
+	}
+	if admitted {
+		go vpnNotifySession(callback, event)
+	}
+	return admitted
+}
+
+func vpnReleaseGoSession(path string, callback *vpnSessionCallback, event vpnSessionEvent) {
+	if event.UserID <= 0 || strings.TrimSpace(event.SessionID) == "" {
+		return
+	}
+	sessionID := safeName(event.SessionID)
+	_ = withVPNSessionLock(path, func() {
+		records := vpnSessionRecordsLocked(path)
+		next := records[:0]
+		for _, record := range records {
+			if len(record) >= 4 && record[3] == sessionID {
+				continue
+			}
+			next = append(next, record)
+		}
+		vpnWriteSessionRecordsLocked(path, next)
+	})
+	go vpnNotifySession(callback, event)
+}
+
+func vpnUserCanOpenSession(path string, userID int64, limit int64) bool {
+	if userID <= 0 || limit <= 0 {
+		return true
+	}
+	count := 0
+	if err := withVPNSessionLock(path, func() {
+		uidText := strconv.FormatInt(userID, 10)
+		for _, record := range vpnSessionRecordsLocked(path) {
+			if len(record) >= 1 && record[0] == uidText {
+				count++
+			}
+		}
+	}); err != nil {
+		return false
+	}
+	return int64(count) < limit
+}
+
+func withVPNSessionLock(path string, fn func()) error {
+	vpnSessionMu.Lock()
+	defer vpnSessionMu.Unlock()
+	return withVPNFileLock(path+".lock", fn)
+}
+
+func vpnSessionRecordsLocked(path string) [][]string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	records := [][]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		records = append(records, strings.Split(line, "\t"))
+	}
+	return records
+}
+
+func vpnWriteSessionRecordsLocked(path string, records [][]string) {
+	var b strings.Builder
+	for _, record := range records {
+		if len(record) == 0 {
+			continue
+		}
+		b.WriteString(strings.Join(record, "\t"))
+		b.WriteByte('\n')
+	}
+	_ = os.WriteFile(path, []byte(b.String()), 0o600)
+}
+
+func vpnNotifySession(callback *vpnSessionCallback, event vpnSessionEvent) {
+	if callback == nil || strings.TrimSpace(callback.URL) == "" || strings.TrimSpace(callback.Token) == "" || callback.NodeID <= 0 {
+		return
+	}
+	event.NodeID = callback.NodeID
+	event.Protocol = normalizedVPNProtocol(event.Protocol)
+	event.InboundTag = safeName(event.InboundTag)
+	event.SessionID = safeName(event.SessionID)
+	body, err := json.Marshal(event)
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimSpace(callback.URL), bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(callback.Token))
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 3 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	_ = res.Body.Close()
+}
+
+func normalizedVPNProtocol(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "openvpn":
+		return "ov"
+	case "wireguard":
+		return "wg"
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+}

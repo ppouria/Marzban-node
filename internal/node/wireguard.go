@@ -27,6 +27,7 @@ const (
 	wgDefaultPool          = "10.70.0.0/16"
 	wgListenPortLo         = 51820
 	wgListenPortHi         = 51920
+	wgSessionTimeout       = 3 * time.Minute
 	wgIfacePrefix          = "rbwg"
 	wgCommandTimeout       = 15 * time.Second
 	wgUsagePrefix          = "wg"
@@ -34,9 +35,10 @@ const (
 )
 
 type wgRuntime struct {
-	GeneratedAt string             `json:"generated_at"`
-	Target      string             `json:"target,omitempty"`
-	Inbounds    []wgRuntimeInbound `json:"inbounds"`
+	GeneratedAt     string              `json:"generated_at"`
+	Target          string              `json:"target,omitempty"`
+	SessionCallback *vpnSessionCallback `json:"session_callback,omitempty"`
+	Inbounds        []wgRuntimeInbound  `json:"inbounds"`
 }
 
 type wgRuntimeInbound struct {
@@ -58,6 +60,7 @@ type wgRuntimePeer struct {
 	UsedTraffic  int64  `json:"used_traffic"`
 	DataLimit    *int64 `json:"data_limit,omitempty"`
 	Expire       *int64 `json:"expire,omitempty"`
+	DeviceLimit  int64  `json:"device_limit,omitempty"`
 }
 
 type wgManager struct {
@@ -155,6 +158,7 @@ func (m *wgManager) CollectUsage() []xray.UserStat {
 	if runtimeConfig == nil || len(runtimeConfig.Inbounds) == 0 {
 		return nil
 	}
+	callback := runtimeConfig.SessionCallback
 
 	totals := map[string]int64{}
 	for _, inbound := range runtimeConfig.Inbounds {
@@ -164,12 +168,15 @@ func (m *wgManager) CollectUsage() []xray.UserStat {
 			continue
 		}
 		userByKey := map[string]int64{}
+		peerByKey := map[string]wgRuntimePeer{}
 		for _, peer := range inbound.Peers {
 			key := strings.TrimSpace(peer.PublicKey)
 			if key != "" {
 				userByKey[key] = peer.UserID
+				peerByKey[key] = peer
 			}
 		}
+		m.syncPeerSessions(client, iface, inbound, device, peerByKey, callback)
 		baselines := m.loadBaselines(iface)
 		next := map[string]int64{}
 		for _, peer := range device.Peers {
@@ -199,6 +206,133 @@ func (m *wgManager) CollectUsage() []xray.UserStat {
 		}
 	}
 	return out
+}
+
+type wgSessionState struct {
+	UserID    int64  `json:"user_id"`
+	SessionID string `json:"session_id"`
+	Address   string `json:"address,omitempty"`
+}
+
+func (m *wgManager) syncPeerSessions(client *wgctrl.Client, iface string, inbound wgRuntimeInbound, device *wgtypes.Device, peerByKey map[string]wgRuntimePeer, callback *vpnSessionCallback) {
+	if m == nil || client == nil || device == nil {
+		return
+	}
+	now := time.Now()
+	previous := m.loadActiveSessions(iface)
+	current := map[string]wgSessionState{}
+	present := map[string]struct{}{}
+	for _, devicePeer := range device.Peers {
+		key := devicePeer.PublicKey.String()
+		present[key] = struct{}{}
+		runtimePeer, ok := peerByKey[key]
+		if !ok || !wgPeerActive(runtimePeer) {
+			continue
+		}
+		if devicePeer.LastHandshakeTime.IsZero() || now.Sub(devicePeer.LastHandshakeTime) > wgSessionTimeout {
+			continue
+		}
+		sessionID := "wg:" + iface + ":" + key
+		state := wgSessionState{UserID: runtimePeer.UserID, SessionID: sessionID, Address: runtimePeer.Address}
+		if _, ok := previous[key]; !ok {
+			event := vpnSessionEvent{
+				UserID:     runtimePeer.UserID,
+				Protocol:   "wg",
+				InboundTag: inbound.Tag,
+				SessionID:  sessionID,
+				AssignedIP: wgPeerAddressHost(runtimePeer.Address),
+				Event:      "start",
+			}
+			if !vpnAdmitGoSession(vpnSessionsPath(m.baseDir), callback, event, runtimePeer.DeviceLimit) {
+				m.removePeer(client, iface, devicePeer.PublicKey)
+				delete(present, key)
+				continue
+			}
+		}
+		current[key] = state
+	}
+	for key, state := range previous {
+		if _, ok := current[key]; ok {
+			continue
+		}
+		vpnReleaseGoSession(vpnSessionsPath(m.baseDir), callback, vpnSessionEvent{
+			UserID:     state.UserID,
+			Protocol:   "wg",
+			InboundTag: inbound.Tag,
+			SessionID:  state.SessionID,
+			AssignedIP: wgPeerAddressHost(state.Address),
+			Event:      "stop",
+		})
+	}
+	m.restoreAvailablePeers(client, iface, inbound, present)
+	m.saveActiveSessions(iface, current)
+}
+
+func (m *wgManager) removePeer(client *wgctrl.Client, iface string, key wgtypes.Key) {
+	if client == nil || strings.TrimSpace(iface) == "" {
+		return
+	}
+	_ = client.ConfigureDevice(iface, wgtypes.Config{Peers: []wgtypes.PeerConfig{{PublicKey: key, Remove: true}}})
+}
+
+func (m *wgManager) restoreAvailablePeers(client *wgctrl.Client, iface string, inbound wgRuntimeInbound, present map[string]struct{}) {
+	if client == nil || strings.TrimSpace(iface) == "" {
+		return
+	}
+	sessionsPath := vpnSessionsPath(m.baseDir)
+	for _, peer := range inbound.Peers {
+		key := strings.TrimSpace(peer.PublicKey)
+		if key == "" || !wgPeerActive(peer) {
+			continue
+		}
+		if _, ok := present[key]; ok {
+			continue
+		}
+		if !vpnUserCanOpenSession(sessionsPath, peer.UserID, peer.DeviceLimit) {
+			continue
+		}
+		config, err := wgPeerConfig(peer)
+		if err != nil {
+			continue
+		}
+		_ = client.ConfigureDevice(iface, wgtypes.Config{Peers: []wgtypes.PeerConfig{config}})
+	}
+}
+
+func wgPeerAddressHost(address string) string {
+	host := strings.TrimSpace(address)
+	if before, _, ok := strings.Cut(host, "/"); ok {
+		return strings.TrimSpace(before)
+	}
+	return host
+}
+
+func (m *wgManager) activeSessionsPath(iface string) string {
+	return filepath.Join(m.baseDir, iface, "active-sessions.json")
+}
+
+func (m *wgManager) loadActiveSessions(iface string) map[string]wgSessionState {
+	raw, err := os.ReadFile(m.activeSessionsPath(iface))
+	if err != nil {
+		return map[string]wgSessionState{}
+	}
+	out := map[string]wgSessionState{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return map[string]wgSessionState{}
+	}
+	return out
+}
+
+func (m *wgManager) saveActiveSessions(iface string, sessions map[string]wgSessionState) {
+	dir := filepath.Join(m.baseDir, iface)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	raw, err := json.Marshal(sessions)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(m.activeSessionsPath(iface), raw, 0o600)
 }
 
 func (m *wgManager) applyInbound(client *wgctrl.Client, inbound wgRuntimeInbound) error {

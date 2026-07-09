@@ -634,24 +634,25 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 		return nil, nil, nil, nil, nil
 	}
 	var envelope struct {
-		GeneratedAt   string               `json:"generated_at"`
-		Target        string               `json:"target,omitempty"`
-		Inbounds      []ovRuntimeInbound   `json:"inbounds"`
-		L2TPInbounds  []l2tpRuntimeInbound `json:"l2tp_inbounds"`
-		L2TPGenerated string               `json:"l2tp_generated,omitempty"`
-		PPTPInbounds  []pptpRuntimeInbound `json:"pptp_inbounds"`
-		PPTPGenerated string               `json:"pptp_generated,omitempty"`
-		WGInbounds    []wgRuntimeInbound   `json:"wg_inbounds"`
-		WGGenerated   string               `json:"wg_generated,omitempty"`
+		GeneratedAt     string               `json:"generated_at"`
+		Target          string               `json:"target,omitempty"`
+		SessionCallback *vpnSessionCallback  `json:"session_callback,omitempty"`
+		Inbounds        []ovRuntimeInbound   `json:"inbounds"`
+		L2TPInbounds    []l2tpRuntimeInbound `json:"l2tp_inbounds"`
+		L2TPGenerated   string               `json:"l2tp_generated,omitempty"`
+		PPTPInbounds    []pptpRuntimeInbound `json:"pptp_inbounds"`
+		PPTPGenerated   string               `json:"pptp_generated,omitempty"`
+		WGInbounds      []wgRuntimeInbound   `json:"wg_inbounds"`
+		WGGenerated     string               `json:"wg_generated,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
 		return nil, nil, nil, nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
 	}
-	ovRuntimeConfig := &ovRuntime{GeneratedAt: envelope.GeneratedAt, Target: envelope.Target, Inbounds: envelope.Inbounds}
+	ovRuntimeConfig := &ovRuntime{GeneratedAt: envelope.GeneratedAt, Target: envelope.Target, SessionCallback: envelope.SessionCallback, Inbounds: envelope.Inbounds}
 	if ovRuntimeConfig.Inbounds == nil {
 		ovRuntimeConfig.Inbounds = []ovRuntimeInbound{}
 	}
-	l2tpRuntimeConfig := &l2tpRuntime{GeneratedAt: envelope.L2TPGenerated, Target: envelope.Target, Inbounds: envelope.L2TPInbounds}
+	l2tpRuntimeConfig := &l2tpRuntime{GeneratedAt: envelope.L2TPGenerated, Target: envelope.Target, SessionCallback: envelope.SessionCallback, Inbounds: envelope.L2TPInbounds}
 	if l2tpRuntimeConfig.Inbounds == nil {
 		l2tpRuntimeConfig.Inbounds = []l2tpRuntimeInbound{}
 	}
@@ -659,7 +660,7 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 	if pptpRuntimeConfig.Inbounds == nil {
 		pptpRuntimeConfig.Inbounds = []pptpRuntimeInbound{}
 	}
-	wgRuntimeConfig := &wgRuntime{GeneratedAt: envelope.WGGenerated, Target: envelope.Target, Inbounds: envelope.WGInbounds}
+	wgRuntimeConfig := &wgRuntime{GeneratedAt: envelope.WGGenerated, Target: envelope.Target, SessionCallback: envelope.SessionCallback, Inbounds: envelope.WGInbounds}
 	if wgRuntimeConfig.Inbounds == nil {
 		wgRuntimeConfig.Inbounds = []wgRuntimeInbound{}
 	}
