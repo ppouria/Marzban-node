@@ -9,6 +9,7 @@ func TestWGValidateInboundsRejectsPeerOutsidePool(t *testing.T) {
 	err := wgValidateInbounds([]wgRuntimeInbound{{
 		Tag:        "wg",
 		ListenPort: 51820,
+		TunnelPort: 17020,
 		Settings:   map[string]any{"address_pool": "10.70.0.0/24"},
 		Peers:      []wgRuntimePeer{{UserID: 7, Address: "10.71.0.2"}},
 	}})
@@ -21,6 +22,7 @@ func TestWGValidateInboundsRejectsPeerServerAddress(t *testing.T) {
 	err := wgValidateInbounds([]wgRuntimeInbound{{
 		Tag:        "wg",
 		ListenPort: 51820,
+		TunnelPort: 17020,
 		Settings:   map[string]any{"address_pool": "10.70.0.0/24"},
 		Peers:      []wgRuntimePeer{{UserID: 7, Address: "10.70.0.1"}},
 	}})
@@ -33,6 +35,7 @@ func TestWGValidateInboundsRejectsDuplicatePeerAddress(t *testing.T) {
 	err := wgValidateInbounds([]wgRuntimeInbound{{
 		Tag:        "wg",
 		ListenPort: 51820,
+		TunnelPort: 17020,
 		Settings:   map[string]any{"address_pool": "10.70.0.0/24"},
 		Peers: []wgRuntimePeer{
 			{UserID: 7, Address: "10.70.0.2"},
@@ -41,6 +44,49 @@ func TestWGValidateInboundsRejectsDuplicatePeerAddress(t *testing.T) {
 	}})
 	if err == nil || !strings.Contains(err.Error(), "share address") {
 		t.Fatalf("expected duplicate address error, got %v", err)
+	}
+}
+
+func TestWGValidateInboundsRejectsMissingTunnelPort(t *testing.T) {
+	err := wgValidateInbounds([]wgRuntimeInbound{{
+		Tag:        "wg",
+		ListenPort: 51820,
+		Settings:   map[string]any{"address_pool": "10.70.0.0/24"},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "requires tunnel_port") {
+		t.Fatalf("expected missing tunnel port error, got %v", err)
+	}
+}
+
+func TestWGValidateInboundsRejectsServerAddressOutsidePool(t *testing.T) {
+	err := wgValidateInbounds([]wgRuntimeInbound{{
+		Tag:        "wg",
+		ListenPort: 51820,
+		TunnelPort: 17020,
+		Settings: map[string]any{
+			"address_pool":   "10.70.0.0/24",
+			"server_address": "10.71.0.1",
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "server_address") || !strings.Contains(err.Error(), "outside pool") {
+		t.Fatalf("expected server address outside pool error, got %v", err)
+	}
+}
+
+func TestWGValidateInboundsRejectsDuplicatePublicKey(t *testing.T) {
+	key := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	err := wgValidateInbounds([]wgRuntimeInbound{{
+		Tag:        "wg",
+		ListenPort: 51820,
+		TunnelPort: 17020,
+		Settings:   map[string]any{"address_pool": "10.70.0.0/24"},
+		Peers: []wgRuntimePeer{
+			{UserID: 7, PublicKey: key, Address: "10.70.0.2"},
+			{UserID: 8, PublicKey: key, Address: "10.70.0.3"},
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "share public_key") {
+		t.Fatalf("expected duplicate public key error, got %v", err)
 	}
 }
 

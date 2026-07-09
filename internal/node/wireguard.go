@@ -389,8 +389,14 @@ func wgValidateInbounds(inbounds []wgRuntimeInbound) error {
 	usedPorts := map[int]string{}
 	var claimed []*net.IPNet
 	for _, inbound := range inbounds {
+		if strings.TrimSpace(inbound.Tag) == "" {
+			return fmt.Errorf("WireGuard inbound tag is required")
+		}
 		if inbound.ListenPort < 1 || inbound.ListenPort > 65535 {
 			return fmt.Errorf("WireGuard inbound %s has invalid listen_port %d", inbound.Tag, inbound.ListenPort)
+		}
+		if boolValue(inbound.Settings["tproxy_enabled"], true) && inbound.TunnelPort <= 0 {
+			return fmt.Errorf("WireGuard inbound %s requires tunnel_port when tproxy_enabled is true", inbound.Tag)
 		}
 		if other, ok := usedPorts[inbound.ListenPort]; ok {
 			return fmt.Errorf("WireGuard inbounds %s and %s share listen_port %d", other, inbound.Tag, inbound.ListenPort)
@@ -401,6 +407,9 @@ func wgValidateInbounds(inbounds []wgRuntimeInbound) error {
 		_, network, err := net.ParseCIDR(strings.TrimSpace(pool))
 		if err != nil {
 			return fmt.Errorf("WireGuard inbound %s has invalid address_pool %q: %w", inbound.Tag, pool, err)
+		}
+		if network.IP.To4() == nil {
+			return fmt.Errorf("WireGuard inbound %s address_pool %s must be IPv4", inbound.Tag, network.String())
 		}
 		for _, existing := range claimed {
 			if network.Contains(existing.IP) || existing.Contains(network.IP) {
@@ -426,10 +435,30 @@ func wgValidatePeerAddresses(tag string, pool string, serverAddress string, peer
 	}
 	var server netip.Addr
 	if strings.TrimSpace(serverAddress) != "" {
-		server, _ = wgPeerAddr(serverAddress)
+		server, err = wgPeerAddr(serverAddress)
+		if err != nil {
+			return fmt.Errorf("WireGuard inbound %s has invalid server_address %q: %w", tag, serverAddress, err)
+		}
+		if !server.Is4() {
+			return fmt.Errorf("WireGuard inbound %s server_address %s must be IPv4", tag, server.String())
+		}
+		if !prefix.Contains(server) {
+			return fmt.Errorf("WireGuard inbound %s server_address %s is outside pool %s", tag, server.String(), prefix.String())
+		}
 	}
 	seen := map[netip.Addr]int64{}
+	seenKeys := map[string]int64{}
 	for _, peer := range peers {
+		publicKey := strings.TrimSpace(peer.PublicKey)
+		if publicKey != "" {
+			if _, err := wgtypes.ParseKey(publicKey); err != nil {
+				return fmt.Errorf("WireGuard inbound %s peer %d has invalid public_key: %w", tag, peer.UserID, err)
+			}
+			if other, ok := seenKeys[publicKey]; ok {
+				return fmt.Errorf("WireGuard inbound %s peers %d and %d share public_key", tag, other, peer.UserID)
+			}
+			seenKeys[publicKey] = peer.UserID
+		}
 		address := strings.TrimSpace(peer.Address)
 		if address == "" {
 			continue

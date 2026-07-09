@@ -216,14 +216,30 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, strings.Join(s.core.Logs().Snapshot(), "\n"))
 		return
 	}
-	if err := s.ov.Apply(payload.OVRuntime); err != nil {
+	ovRuntimeConfig := payload.OVRuntime
+	if ovRuntimeConfig == nil {
+		ovRuntimeConfig = s.cachedOVRuntime()
+	}
+	l2tpRuntimeConfig := payload.L2TPRuntime
+	if l2tpRuntimeConfig == nil {
+		l2tpRuntimeConfig = s.cachedL2TPRuntime()
+	}
+	pptpRuntimeConfig := payload.PPTPRuntime
+	if pptpRuntimeConfig == nil {
+		pptpRuntimeConfig = s.cachedPPTPRuntime()
+	}
+	wgRuntimeConfig := payload.WGRuntime
+	if wgRuntimeConfig == nil {
+		wgRuntimeConfig = s.cachedWGRuntime()
+	}
+	if err := s.ov.Apply(ovRuntimeConfig); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
-	pptpWarning := s.applyPPTPRuntime(payload.PPTPRuntime)
-	wgWarning := s.applyWGRuntime(payload.WGRuntime)
-	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime, payload.PPTPRuntime, payload.WGRuntime)
+	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
+	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
+	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
+	s.saveConfigCache(payload.Config, s.currentClientIP(), ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig)
 	response := s.response(nil)
 	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
 		response["warning"] = warning
@@ -282,14 +298,30 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, strings.Join(s.core.Logs().Snapshot(), "\n"))
 		return
 	}
-	if err := s.ov.Apply(payload.OVRuntime); err != nil {
+	ovRuntimeConfig := payload.OVRuntime
+	if ovRuntimeConfig == nil {
+		ovRuntimeConfig = s.cachedOVRuntime()
+	}
+	l2tpRuntimeConfig := payload.L2TPRuntime
+	if l2tpRuntimeConfig == nil {
+		l2tpRuntimeConfig = s.cachedL2TPRuntime()
+	}
+	pptpRuntimeConfig := payload.PPTPRuntime
+	if pptpRuntimeConfig == nil {
+		pptpRuntimeConfig = s.cachedPPTPRuntime()
+	}
+	wgRuntimeConfig := payload.WGRuntime
+	if wgRuntimeConfig == nil {
+		wgRuntimeConfig = s.cachedWGRuntime()
+	}
+	if err := s.ov.Apply(ovRuntimeConfig); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
-	pptpWarning := s.applyPPTPRuntime(payload.PPTPRuntime)
-	wgWarning := s.applyWGRuntime(payload.WGRuntime)
-	s.saveConfigCache(payload.Config, s.currentClientIP(), payload.OVRuntime, payload.L2TPRuntime, payload.PPTPRuntime, payload.WGRuntime)
+	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
+	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
+	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
+	s.saveConfigCache(payload.Config, s.currentClientIP(), ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig)
 	response := s.response(nil)
 	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
 		response["warning"] = warning
@@ -314,13 +346,13 @@ func (s *Server) handleRuntimeOnly(w http.ResponseWriter, payload configPayload)
 	if wgRuntimeConfig == nil {
 		wgRuntimeConfig = s.cachedWGRuntime()
 	}
-	if err := s.ov.Apply(payload.OVRuntime); err != nil {
+	if err := s.ov.Apply(ovRuntimeConfig); err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	l2tpWarning := s.applyL2TPRuntime(payload.L2TPRuntime)
-	pptpWarning := s.applyPPTPRuntime(payload.PPTPRuntime)
-	wgWarning := s.applyWGRuntime(payload.WGRuntime)
+	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
+	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
+	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
 	s.saveConfigCache(payload.Config, s.currentClientIP(), ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig)
 	response := s.response(nil)
 	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {

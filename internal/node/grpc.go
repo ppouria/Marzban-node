@@ -420,12 +420,12 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if cacheWGRuntime == nil {
 		cacheWGRuntime = s.cachedWGRuntime()
 	}
-	if err := s.ov.Apply(runtimeConfig); err != nil {
+	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
-	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
-	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
+	l2tpWarning := s.applyL2TPRuntime(cacheL2TPRuntime)
+	pptpWarning := s.applyPPTPRuntime(cachePPTPRuntime)
+	wgWarning := s.applyWGRuntime(cacheWGRuntime)
 	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime)
 	message := "runtime started"
 	if sync {
@@ -470,12 +470,12 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if cacheWGRuntime == nil {
 		cacheWGRuntime = s.cachedWGRuntime()
 	}
-	if err := s.ov.Apply(runtimeConfig); err != nil {
+	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
-	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
-	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
+	l2tpWarning := s.applyL2TPRuntime(cacheL2TPRuntime)
+	pptpWarning := s.applyPPTPRuntime(cachePPTPRuntime)
+	wgWarning := s.applyWGRuntime(cacheWGRuntime)
 	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime)
 	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
 		message += "; " + warning
@@ -507,12 +507,12 @@ func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeCo
 	if cacheWGRuntime == nil {
 		cacheWGRuntime = s.cachedWGRuntime()
 	}
-	if err := s.ov.Apply(runtimeConfig); err != nil {
+	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
-	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
-	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
-	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
+	l2tpWarning := s.applyL2TPRuntime(cacheL2TPRuntime)
+	pptpWarning := s.applyPPTPRuntime(cachePPTPRuntime)
+	wgWarning := s.applyWGRuntime(cacheWGRuntime)
 	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime)
 	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
 		message += "; " + warning
