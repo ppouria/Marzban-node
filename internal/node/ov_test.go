@@ -17,3 +17,44 @@ func TestOVServerConfigUsesTCPServerProto(t *testing.T) {
 		t.Fatalf("server config does not use tcp-server:\n%s", config)
 	}
 }
+
+func TestOVServerConfigRequiresDCODataCiphers(t *testing.T) {
+	config := serverConfig(ovRuntimeInbound{
+		Tag:       "ov-dco",
+		Port:      1194,
+		Transport: "udp",
+		Settings: map[string]any{
+			"transport":   "udp",
+			"require_dco": true,
+			"cipher":      "AES-256-GCM",
+		},
+	}, "/tmp/ov", "/tmp/ov/ccd")
+
+	for _, want := range []string{
+		"proto udp\n",
+		"fast-io\n",
+		"cipher AES-256-GCM\n",
+		"data-ciphers " + ovDCODataCiphers + "\n",
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("server config missing %q:\n%s", want, config)
+		}
+	}
+}
+
+func TestOVDCORejectsLegacyCipher(t *testing.T) {
+	err := validateOVDCOSettings(ovRuntimeInbound{
+		Tag:      "ov",
+		Settings: map[string]any{"require_dco": true, "cipher": "AES-256-CBC"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not DCO-compatible") {
+		t.Fatalf("expected DCO cipher error, got %v", err)
+	}
+}
+
+func TestOVDCOInactiveReasonDetectsFallback(t *testing.T) {
+	reason := ovDCOInactiveReason("Kernel support for ovpn-dco missing, disabling data channel offload.")
+	if reason == "" {
+		t.Fatal("expected inactive DCO reason")
+	}
+}

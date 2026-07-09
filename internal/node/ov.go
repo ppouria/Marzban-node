@@ -55,6 +55,8 @@ type ovManager struct {
 	mu          sync.Mutex
 }
 
+const ovDCODataCiphers = "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"
+
 func newOVManager(dataDir string, installMode string) *ovManager {
 	return &ovManager{
 		baseDir:     filepath.Join(dataDir, "openvpn"),
@@ -101,6 +103,14 @@ func (m *ovManager) Apply(runtimeConfig *ovRuntime) error {
 		dir := filepath.Join(m.baseDir, name)
 		oldConfig, _ := os.ReadFile(filepath.Join(dir, "server.conf"))
 		wasRunning, _ := openvpnPIDRunning(filepath.Join(dir, "openvpn.pid"), filepath.Join(dir, "openvpn.log"))
+		if err := validateOVDCOSettings(inbound); err != nil {
+			return err
+		}
+		if boolValue(inbound.Settings["require_dco"], false) {
+			if err := ensureOVDCOSupport(); err != nil {
+				return fmt.Errorf("OV inbound %s requires DCO: %w", inbound.Tag, err)
+			}
+		}
 		if err := m.writeInbound(inbound); err != nil {
 			return err
 		}
@@ -238,6 +248,12 @@ func (m *ovManager) applyInbound(inbound ovRuntimeInbound, restart bool) error {
 	if running, detail := openvpnPIDRunning(pidPath, filepath.Join(dir, "openvpn.log")); !running {
 		return fmt.Errorf("start OV %s: process stopped after launch: %s", inbound.Tag, detail)
 	}
+	if boolValue(inbound.Settings["require_dco"], false) {
+		if reason := ovDCOInactiveReason(tailOVFile(filepath.Join(dir, "openvpn.log"), 8192)); reason != "" {
+			m.stopInboundName(name)
+			return fmt.Errorf("start OV %s: DCO was required but is inactive: %s", inbound.Tag, reason)
+		}
+	}
 	return nil
 }
 
@@ -296,6 +312,9 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 		line(&b, "proto tcp-server")
 	} else {
 		line(&b, "proto udp")
+		if boolValue(settings["fast_io"], true) {
+			line(&b, "fast-io")
+		}
 	}
 	line(&b, "dev "+tunName(inbound.Tag))
 	line(&b, "dev-type tun")
@@ -321,6 +340,9 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	}
 	if cipher := firstString(settings["cipher"]); cipher != "" {
 		line(&b, "cipher "+cipher)
+	}
+	if boolValue(settings["require_dco"], false) {
+		line(&b, "data-ciphers "+ovDCODataCiphers)
 	}
 	if auth := firstString(settings["auth"]); auth != "" {
 		line(&b, "auth "+auth)
@@ -556,6 +578,134 @@ func validateServerCredentials(inbound ovRuntimeInbound) error {
 		return fmt.Errorf("OV inbound %s requires server_key", inbound.Tag)
 	}
 	return nil
+}
+
+func validateOVDCOSettings(inbound ovRuntimeInbound) error {
+	if !boolValue(inbound.Settings["require_dco"], false) {
+		return nil
+	}
+	if cipher := strings.TrimSpace(firstString(inbound.Settings["cipher"])); cipher != "" && !ovDCOCipherAllowed(cipher) {
+		return fmt.Errorf("OV inbound %s requires DCO but cipher %s is not DCO-compatible", inbound.Tag, cipher)
+	}
+	if dataCiphers := strings.TrimSpace(firstString(inbound.Settings["data_ciphers"], inbound.Settings["data-ciphers"])); dataCiphers != "" {
+		for _, cipher := range strings.Split(dataCiphers, ":") {
+			if !ovDCOCipherAllowed(cipher) {
+				return fmt.Errorf("OV inbound %s requires DCO but data cipher %s is not DCO-compatible", inbound.Tag, strings.TrimSpace(cipher))
+			}
+		}
+	}
+	return nil
+}
+
+func ovDCOCipherAllowed(cipher string) bool {
+	switch strings.ToUpper(strings.TrimSpace(cipher)) {
+	case "", "AES-256-GCM", "AES-128-GCM", "CHACHA20-POLY1305":
+		return true
+	default:
+		return false
+	}
+}
+
+func ensureOVDCOSupport() error {
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("DCO is only supported on Linux nodes")
+	}
+	if !openvpnSupportsDCO() {
+		return fmt.Errorf("installed OpenVPN binary was built without DCO support")
+	}
+	if ovDCOModuleAvailable() {
+		return nil
+	}
+	loadOVDCOModules()
+	if ovDCOModuleAvailable() {
+		return nil
+	}
+	if err := installOVDCOPackages(); err != nil {
+		return err
+	}
+	loadOVDCOModules()
+	if ovDCOModuleAvailable() {
+		return nil
+	}
+	return fmt.Errorf("kernel DCO module is unavailable after automatic install")
+}
+
+func openvpnSupportsDCO() bool {
+	openvpn, err := exec.LookPath("openvpn")
+	if err != nil {
+		return false
+	}
+	output, err := exec.Command(openvpn, "--version").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(output)), "dco")
+}
+
+func ovDCOModuleAvailable() bool {
+	for _, path := range []string{"/sys/module/ovpn", "/sys/module/ovpn_dco_v2", "/sys/module/ovpn_dco"} {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func loadOVDCOModules() {
+	modprobe, err := exec.LookPath("modprobe")
+	if err != nil {
+		return
+	}
+	for _, module := range []string{"ovpn", "ovpn-dco-v2", "ovpn-dco"} {
+		_ = exec.Command(modprobe, module).Run()
+	}
+}
+
+func installOVDCOPackages() error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("automatic DCO install requires root")
+	}
+	kernelRelease := strings.TrimSpace(commandOutput("uname", "-r"))
+	switch {
+	case commandExists("apt-get"):
+		_ = runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update")
+		packages := []string{"dkms", "openvpn-dco-dkms"}
+		if kernelRelease != "" {
+			packages = append([]string{"linux-headers-" + kernelRelease}, packages...)
+		}
+		args := append([]string{"install", "-y", "--no-install-recommends"}, packages...)
+		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", args...)
+	case commandExists("dnf"):
+		packages := []string{"dkms", "openvpn-dco-dkms"}
+		if kernelRelease != "" {
+			packages = append([]string{"kernel-devel-" + kernelRelease}, packages...)
+		}
+		return runInstallCommand(nil, "dnf", append([]string{"install", "-y"}, packages...)...)
+	case commandExists("yum"):
+		packages := []string{"dkms", "openvpn-dco-dkms"}
+		if kernelRelease != "" {
+			packages = append([]string{"kernel-devel-" + kernelRelease}, packages...)
+		}
+		return runInstallCommand(nil, "yum", append([]string{"install", "-y"}, packages...)...)
+	default:
+		return fmt.Errorf("no supported package manager was found for DCO module install")
+	}
+}
+
+func ovDCOInactiveReason(logText string) string {
+	lower := strings.ToLower(logText)
+	for _, marker := range []string{
+		"disabling data channel offload",
+		"kernel support for ovpn-dco missing",
+		"dco disabled",
+		"cannot use dco",
+		"dco will be disabled",
+	} {
+		if strings.Contains(lower, marker) {
+			return marker
+		}
+	}
+	return ""
 }
 
 func authScript(usersPath string) string {
