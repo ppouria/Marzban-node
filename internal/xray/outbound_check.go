@@ -86,6 +86,7 @@ func (c *Core) TestOutbound(outboundTag string, outboundProtocol string, allOutb
 	c.mu.Unlock()
 
 	cmd := exec.Command(executable, "run", "-config", "stdin:")
+	configureManagedProcess(cmd)
 	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+assets)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -433,5 +434,5 @@ func stopTestProcess(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	_ = cmd.Process.Kill()
+	terminateManagedProcess(cmd)
 }

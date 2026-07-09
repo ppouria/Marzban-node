@@ -107,6 +107,7 @@ func (c *Core) start(config *Config) error {
 	executable := c.executablePath
 	assets := c.assetsPath
 	c.mu.Unlock()
+	cleanupStaleManagedProcesses(executable)
 
 	if err := config.NormalizeLogPaths(); err != nil {
 		return err
@@ -120,6 +121,7 @@ func (c *Core) start(config *Config) error {
 	}
 
 	cmd := exec.Command(executable, "run", "-config", "stdin:")
+	configureManagedProcess(cmd)
 	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+assets)
 
 	stdin, err := cmd.StdinPipe()
@@ -138,7 +140,7 @@ func (c *Core) start(config *Config) error {
 		return err
 	}
 	if _, err := stdin.Write(configJSON); err != nil {
-		_ = cmd.Process.Kill()
+		terminateManagedProcess(cmd)
 		return err
 	}
 	_ = stdin.Close()
@@ -182,7 +184,7 @@ func (c *Core) stop() {
 	c.mu.Unlock()
 
 	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+		terminateManagedProcess(cmd)
 	}
 }
 
