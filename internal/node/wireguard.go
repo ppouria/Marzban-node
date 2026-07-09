@@ -449,19 +449,23 @@ func wgValidatePeerAddresses(tag string, pool string, serverAddress string, peer
 	seen := map[netip.Addr]int64{}
 	seenKeys := map[string]int64{}
 	for _, peer := range peers {
-		publicKey := strings.TrimSpace(peer.PublicKey)
-		if publicKey != "" {
-			if _, err := wgtypes.ParseKey(publicKey); err != nil {
-				return fmt.Errorf("WireGuard inbound %s peer %d has invalid public_key: %w", tag, peer.UserID, err)
-			}
-			if other, ok := seenKeys[publicKey]; ok {
-				return fmt.Errorf("WireGuard inbound %s peers %d and %d share public_key", tag, other, peer.UserID)
-			}
-			seenKeys[publicKey] = peer.UserID
+		if peer.UserID <= 0 {
+			return fmt.Errorf("WireGuard inbound %s peer has invalid user_id %d", tag, peer.UserID)
 		}
+		publicKey := strings.TrimSpace(peer.PublicKey)
+		if publicKey == "" {
+			return fmt.Errorf("WireGuard inbound %s peer %d requires public_key", tag, peer.UserID)
+		}
+		if _, err := wgtypes.ParseKey(publicKey); err != nil {
+			return fmt.Errorf("WireGuard inbound %s peer %d has invalid public_key: %w", tag, peer.UserID, err)
+		}
+		if other, ok := seenKeys[publicKey]; ok {
+			return fmt.Errorf("WireGuard inbound %s peers %d and %d share public_key", tag, other, peer.UserID)
+		}
+		seenKeys[publicKey] = peer.UserID
 		address := strings.TrimSpace(peer.Address)
 		if address == "" {
-			continue
+			return fmt.Errorf("WireGuard inbound %s peer %d requires address", tag, peer.UserID)
 		}
 		addr, err := wgPeerAddr(address)
 		if err != nil {

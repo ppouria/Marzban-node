@@ -11,7 +11,7 @@ func TestWGValidateInboundsRejectsPeerOutsidePool(t *testing.T) {
 		ListenPort: 51820,
 		TunnelPort: 17020,
 		Settings:   map[string]any{"address_pool": "10.70.0.0/24"},
-		Peers:      []wgRuntimePeer{{UserID: 7, Address: "10.71.0.2"}},
+		Peers:      []wgRuntimePeer{{UserID: 7, PublicKey: wgTestKey1, Address: "10.71.0.2"}},
 	}})
 	if err == nil || !strings.Contains(err.Error(), "outside pool") {
 		t.Fatalf("expected outside pool error, got %v", err)
@@ -24,7 +24,7 @@ func TestWGValidateInboundsRejectsPeerServerAddress(t *testing.T) {
 		ListenPort: 51820,
 		TunnelPort: 17020,
 		Settings:   map[string]any{"address_pool": "10.70.0.0/24"},
-		Peers:      []wgRuntimePeer{{UserID: 7, Address: "10.70.0.1"}},
+		Peers:      []wgRuntimePeer{{UserID: 7, PublicKey: wgTestKey1, Address: "10.70.0.1"}},
 	}})
 	if err == nil || !strings.Contains(err.Error(), "server address") {
 		t.Fatalf("expected server address error, got %v", err)
@@ -38,8 +38,8 @@ func TestWGValidateInboundsRejectsDuplicatePeerAddress(t *testing.T) {
 		TunnelPort: 17020,
 		Settings:   map[string]any{"address_pool": "10.70.0.0/24"},
 		Peers: []wgRuntimePeer{
-			{UserID: 7, Address: "10.70.0.2"},
-			{UserID: 8, Address: "10.70.0.2/32"},
+			{UserID: 7, PublicKey: wgTestKey1, Address: "10.70.0.2"},
+			{UserID: 8, PublicKey: wgTestKey2, Address: "10.70.0.2/32"},
 		},
 	}})
 	if err == nil || !strings.Contains(err.Error(), "share address") {
@@ -74,7 +74,7 @@ func TestWGValidateInboundsRejectsServerAddressOutsidePool(t *testing.T) {
 }
 
 func TestWGValidateInboundsRejectsDuplicatePublicKey(t *testing.T) {
-	key := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	key := wgTestKey1
 	err := wgValidateInbounds([]wgRuntimeInbound{{
 		Tag:        "wg",
 		ListenPort: 51820,
@@ -87,6 +87,32 @@ func TestWGValidateInboundsRejectsDuplicatePublicKey(t *testing.T) {
 	}})
 	if err == nil || !strings.Contains(err.Error(), "share public_key") {
 		t.Fatalf("expected duplicate public key error, got %v", err)
+	}
+}
+
+func TestWGValidateInboundsRejectsPeerWithoutAddress(t *testing.T) {
+	err := wgValidateInbounds([]wgRuntimeInbound{{
+		Tag:        "wg",
+		ListenPort: 51820,
+		TunnelPort: 17020,
+		Settings:   map[string]any{"address_pool": "10.70.0.0/24"},
+		Peers:      []wgRuntimePeer{{UserID: 7, PublicKey: wgTestKey1}},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "requires address") {
+		t.Fatalf("expected missing address error, got %v", err)
+	}
+}
+
+func TestWGValidateInboundsRejectsPeerWithoutPublicKey(t *testing.T) {
+	err := wgValidateInbounds([]wgRuntimeInbound{{
+		Tag:        "wg",
+		ListenPort: 51820,
+		TunnelPort: 17020,
+		Settings:   map[string]any{"address_pool": "10.70.0.0/24"},
+		Peers:      []wgRuntimePeer{{UserID: 7, Address: "10.70.0.2"}},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "requires public_key") {
+		t.Fatalf("expected missing public key error, got %v", err)
 	}
 }
 
@@ -103,3 +129,8 @@ func TestWGTProxyScriptRoutesToTunnelPort(t *testing.T) {
 		}
 	}
 }
+
+const (
+	wgTestKey1 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+	wgTestKey2 = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+)
