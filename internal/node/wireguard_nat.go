@@ -168,6 +168,7 @@ func wgApplyTProxy(ctx context.Context, baseDir string, inbound wgRuntimeInbound
 	if err := os.WriteFile(path, []byte(wgTProxyScript(inbound, iface)), 0o600); err != nil {
 		return err
 	}
+	_ = exec.CommandContext(ctx, nft, "delete", "table", "inet", wgTProxyTableName(iface)).Run()
 	if output, err := exec.CommandContext(ctx, nft, "-f", path).CombinedOutput(); err != nil {
 		return fmt.Errorf("apply WireGuard nftables %s: %v: %s", inbound.Tag, err, strings.TrimSpace(string(output)))
 	}

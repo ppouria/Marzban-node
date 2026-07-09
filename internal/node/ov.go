@@ -214,6 +214,7 @@ func (m *ovManager) applyInbound(inbound ovRuntimeInbound, restart bool) error {
 		if err != nil {
 			return fmt.Errorf("nft executable not found")
 		}
+		_ = exec.Command(nft, "delete", "table", "inet", "rebecca_openvpn_"+safeName(inbound.Tag)).Run()
 		if output, err := exec.Command(nft, "-f", filepath.Join(dir, "nftables.nft")).CombinedOutput(); err != nil {
 			return fmt.Errorf("apply OV nftables %s: %v: %s", inbound.Tag, err, strings.TrimSpace(string(output)))
 		}
@@ -296,6 +297,9 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 		line(&b, "proto tcp-server")
 	} else {
 		line(&b, "proto udp")
+		if boolValue(settings["fast_io"], true) {
+			line(&b, "fast-io")
+		}
 	}
 	line(&b, "dev "+tunName(inbound.Tag))
 	line(&b, "dev-type tun")

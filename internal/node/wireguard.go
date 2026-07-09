@@ -235,8 +235,9 @@ func (m *wgManager) applyInbound(client *wgctrl.Client, inbound wgRuntimeInbound
 	deviceConfig := wgtypes.Config{
 		PrivateKey:   &privateKey,
 		ListenPort:   &port,
-		ReplacePeers: true,
+		ReplacePeers: false,
 	}
+	currentPeers := wgCurrentPeers(client, iface)
 	desiredKeys := map[string]struct{}{}
 	for _, peer := range inbound.Peers {
 		if !wgPeerActive(peer) {
@@ -246,8 +247,22 @@ func (m *wgManager) applyInbound(client *wgctrl.Client, inbound wgRuntimeInbound
 		if err != nil {
 			return fmt.Errorf("WireGuard inbound %s: %w", inbound.Tag, err)
 		}
+		keyText := strings.TrimSpace(peer.PublicKey)
+		peerConfig.ReplaceAllowedIPs = true
+		if current, ok := currentPeers[keyText]; ok && current.endpoint != nil {
+			peerConfig.Endpoint = current.endpoint
+		}
 		deviceConfig.Peers = append(deviceConfig.Peers, peerConfig)
-		desiredKeys[strings.TrimSpace(peer.PublicKey)] = struct{}{}
+		desiredKeys[keyText] = struct{}{}
+	}
+	for keyText, current := range currentPeers {
+		if _, ok := desiredKeys[keyText]; ok {
+			continue
+		}
+		deviceConfig.Peers = append(deviceConfig.Peers, wgtypes.PeerConfig{
+			PublicKey: current.publicKey,
+			Remove:    true,
+		})
 	}
 	if err := client.ConfigureDevice(iface, deviceConfig); err != nil {
 		return fmt.Errorf("configure WireGuard device %s: %w", iface, err)
@@ -273,6 +288,33 @@ func (m *wgManager) applyInbound(client *wgctrl.Client, inbound wgRuntimeInbound
 	}
 	m.pruneBaselines(iface, desiredKeys)
 	return nil
+}
+
+type wgCurrentPeer struct {
+	publicKey wgtypes.Key
+	endpoint  *net.UDPAddr
+}
+
+func wgCurrentPeers(client *wgctrl.Client, iface string) map[string]wgCurrentPeer {
+	out := map[string]wgCurrentPeer{}
+	if client == nil || strings.TrimSpace(iface) == "" {
+		return out
+	}
+	device, err := client.Device(iface)
+	if err != nil {
+		return out
+	}
+	for _, peer := range device.Peers {
+		current := wgCurrentPeer{publicKey: peer.PublicKey}
+		if peer.Endpoint == nil {
+			out[peer.PublicKey.String()] = current
+			continue
+		}
+		endpoint := *peer.Endpoint
+		current.endpoint = &endpoint
+		out[peer.PublicKey.String()] = current
+	}
+	return out
 }
 
 func (m *wgManager) currentRuntime() *wgRuntime {
