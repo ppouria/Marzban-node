@@ -21,6 +21,8 @@ type removeInboundUserPayload struct {
 }
 
 func (s *Server) handleAddInboundUser(w http.ResponseWriter, r *http.Request) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	var payload addInboundUserPayload
 	if !decodeJSON(w, r, &payload) {
 		return
@@ -60,6 +62,8 @@ func (s *Server) handleAddInboundUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRemoveInboundUser(w http.ResponseWriter, r *http.Request) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	var payload removeInboundUserPayload
 	if !decodeJSON(w, r, &payload) {
 		return
