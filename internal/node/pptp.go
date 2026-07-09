@@ -272,7 +272,14 @@ func pptpChapSecrets(users []pptpRuntimeUser) string {
 		if strings.TrimSpace(user.VPNUsername) == "" || strings.TrimSpace(user.Password) == "" {
 			continue
 		}
-		line(&b, fmt.Sprintf("%q pptpd %q %s", user.VPNUsername, user.Password, firstString(user.IPv4Address, "*")))
+		// A fixed address pins the user to one IP, which a second device cannot
+		// share. When the device limit is above one, hand out "*" so each session
+		// draws a distinct address from the pool range.
+		address := firstString(user.IPv4Address, "*")
+		if user.DeviceLimit != nil && *user.DeviceLimit > 1 {
+			address = "*"
+		}
+		line(&b, fmt.Sprintf("%q pptpd %q %s", user.VPNUsername, user.Password, address))
 	}
 	return b.String()
 }

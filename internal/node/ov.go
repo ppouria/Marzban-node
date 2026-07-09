@@ -178,6 +178,13 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
 		if strings.TrimSpace(user.VPNUsername) == "" || strings.TrimSpace(user.IPv4Address) == "" {
 			continue
 		}
+		// A fixed ifconfig-push pins the user to one tunnel IP, which is fine for a
+		// single device but collides once the user connects a second device. When
+		// the device limit is above one, skip the pinned address so each of the
+		// user's devices is handed a distinct IP from the server pool instead.
+		if ovMultiDevice(user) {
+			continue
+		}
 		desiredCCD[safeName(user.VPNUsername)] = struct{}{}
 		ccd := fmt.Sprintf("ifconfig-push %s %s\n", user.IPv4Address, poolMask)
 		if err := writeFileIfChanged(filepath.Join(ccdDir, safeName(user.VPNUsername)), []byte(ccd), 0o600); err != nil {
@@ -770,6 +777,14 @@ if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
   printf 'openvpn:%%s\t%%s\n' "$uid" "$total" >> "$USAGE"
 fi
 `, usersPath, usagePath)
+}
+
+// ovMultiDevice reports whether a user is allowed more than one simultaneous
+// device, in which case they must draw tunnel IPs from the pool rather than a
+// single pinned address. An unset or <= 1 limit keeps the historical one-device,
+// fixed-IP behavior.
+func ovMultiDevice(user ovRuntimeUser) bool {
+	return user.DeviceLimit != nil && *user.DeviceLimit > 1
 }
 
 func usersTSV(users []ovRuntimeUser) string {

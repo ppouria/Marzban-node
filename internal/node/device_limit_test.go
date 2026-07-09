@@ -80,3 +80,61 @@ func TestL2TPUsersTSVCarriesDeviceLimit(t *testing.T) {
 		t.Fatalf("device limit column = %q (fields=%d), want 5/9", fields[8], len(fields))
 	}
 }
+
+func TestL2TPChapSecretsUsesPoolForMultiDevice(t *testing.T) {
+	users := []l2tpRuntimeUser{
+		{VPNUsername: "single", Password: "pw", IPv4Address: "10.67.0.5", DeviceLimit: intPtr(1)},
+		{VPNUsername: "multi", Password: "pw", IPv4Address: "10.67.0.6", DeviceLimit: intPtr(3)},
+	}
+	out := l2tpChapSecrets(users)
+	if !strings.Contains(out, `"single" rebecca-l2tp "pw" 10.67.0.5`) {
+		t.Fatalf("single-device user should keep its pinned IP:\n%s", out)
+	}
+	if !strings.Contains(out, `"multi" rebecca-l2tp "pw" *`) {
+		t.Fatalf("multi-device user should draw from the pool (*):\n%s", out)
+	}
+}
+
+func TestWGDeviceLimitCapsActivePeersPerUser(t *testing.T) {
+	// User 1 is capped at 2 devices but sends 3 active peers; user 2 is unlimited.
+	peers := []wgRuntimePeer{
+		{UserID: 1, PublicKey: "kC", Address: "10.70.0.4", Status: "active", DeviceLimit: intPtr(2)},
+		{UserID: 1, PublicKey: "kA", Address: "10.70.0.2", Status: "active", DeviceLimit: intPtr(2)},
+		{UserID: 1, PublicKey: "kB", Address: "10.70.0.3", Status: "active", DeviceLimit: intPtr(2)},
+		{UserID: 2, PublicKey: "zz", Address: "10.70.0.9", Status: "active"},
+	}
+	allowed := wgAllowedByDeviceLimit(peers)
+	if len(allowed) != 3 {
+		t.Fatalf("expected 3 allowed peers (2 capped + 1 unlimited), got %d: %v", len(allowed), allowed)
+	}
+	// Selection is by public-key order, so kA and kB win, kC is dropped.
+	if _, ok := allowed["kC"]; ok {
+		t.Fatalf("kC should be dropped as the surplus peer over the limit: %v", allowed)
+	}
+	for _, want := range []string{"kA", "kB", "zz"} {
+		if _, ok := allowed[want]; !ok {
+			t.Fatalf("expected %q to stay on the interface: %v", want, allowed)
+		}
+	}
+}
+
+func TestWGDeviceLimitUnsetIsUnlimited(t *testing.T) {
+	peers := []wgRuntimePeer{
+		{UserID: 5, PublicKey: "a", Address: "10.70.0.2", Status: "active"},
+		{UserID: 5, PublicKey: "b", Address: "10.70.0.3", Status: "active"},
+	}
+	if allowed := wgAllowedByDeviceLimit(peers); len(allowed) != 2 {
+		t.Fatalf("unset limit must keep all peers, got %d: %v", len(allowed), allowed)
+	}
+}
+
+func TestWGDeviceLimitIgnoresInactivePeers(t *testing.T) {
+	peers := []wgRuntimePeer{
+		{UserID: 9, PublicKey: "live", Address: "10.70.0.2", Status: "active", DeviceLimit: intPtr(1)},
+		{UserID: 9, PublicKey: "dead", Address: "10.70.0.3", Status: "disabled", DeviceLimit: intPtr(1)},
+	}
+	allowed := wgAllowedByDeviceLimit(peers)
+	if _, ok := allowed["live"]; !ok || len(allowed) != 1 {
+		t.Fatalf("only the active peer should count toward the limit: %v", allowed)
+	}
+}

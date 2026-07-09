@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +59,7 @@ type wgRuntimePeer struct {
 	UsedTraffic  int64  `json:"used_traffic"`
 	DataLimit    *int64 `json:"data_limit,omitempty"`
 	Expire       *int64 `json:"expire,omitempty"`
+	DeviceLimit  *int64 `json:"device_limit,omitempty"`
 }
 
 type wgManager struct {
@@ -238,9 +240,15 @@ func (m *wgManager) applyInbound(client *wgctrl.Client, inbound wgRuntimeInbound
 		ReplacePeers: false,
 	}
 	currentPeers := wgCurrentPeers(client, iface)
+	allowed := wgAllowedByDeviceLimit(inbound.Peers)
 	desiredKeys := map[string]struct{}{}
 	for _, peer := range inbound.Peers {
 		if !wgPeerActive(peer) {
+			continue
+		}
+		if _, ok := allowed[strings.TrimSpace(peer.PublicKey)]; !ok {
+			// Over this user's device limit: leave the peer off the interface so it
+			// cannot connect, exactly as if it were disabled.
 			continue
 		}
 		peerConfig, err := wgPeerConfig(peer)
@@ -570,6 +578,48 @@ func wgPeerActive(peer wgRuntimePeer) bool {
 		return false
 	}
 	return true
+}
+
+// wgAllowedByDeviceLimit returns the set of peer public keys that may stay on the
+// interface once each user's device limit is applied. WireGuard has no login or
+// session, so one device is one peer (one key): capping a user to N devices means
+// keeping at most N of their active peers on the wire. When a user has more active
+// peers than their limit, the surplus is left off so those devices cannot connect.
+// Selection is by public key order so the same peers win on every reconcile
+// (stable, no flapping). A peer whose device_limit is unset or <= 0 is unlimited.
+func wgAllowedByDeviceLimit(peers []wgRuntimePeer) map[string]struct{} {
+	byUser := map[int64][]wgRuntimePeer{}
+	limits := map[int64]int64{}
+	for _, peer := range peers {
+		if !wgPeerActive(peer) {
+			continue
+		}
+		byUser[peer.UserID] = append(byUser[peer.UserID], peer)
+		if peer.DeviceLimit != nil && *peer.DeviceLimit > 0 {
+			// All of a user's peers should carry the same limit; keep the smallest
+			// positive one seen so a stray zero cannot lift the cap.
+			if existing, ok := limits[peer.UserID]; !ok || *peer.DeviceLimit < existing {
+				limits[peer.UserID] = *peer.DeviceLimit
+			}
+		}
+	}
+	allowed := make(map[string]struct{})
+	for userID, userPeers := range byUser {
+		limit, capped := limits[userID]
+		if !capped || int64(len(userPeers)) <= limit {
+			for _, peer := range userPeers {
+				allowed[strings.TrimSpace(peer.PublicKey)] = struct{}{}
+			}
+			continue
+		}
+		sort.Slice(userPeers, func(i, j int) bool {
+			return userPeers[i].PublicKey < userPeers[j].PublicKey
+		})
+		for _, peer := range userPeers[:limit] {
+			allowed[strings.TrimSpace(peer.PublicKey)] = struct{}{}
+		}
+	}
+	return allowed
 }
 
 func wgPeerConfig(peer wgRuntimePeer) (wgtypes.PeerConfig, error) {
