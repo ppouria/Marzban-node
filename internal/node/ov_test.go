@@ -56,6 +56,25 @@ func TestOVServerConfigRequiresDCODataCiphers(t *testing.T) {
 			t.Fatalf("server config missing %q:\n%s", want, config)
 		}
 	}
+	if strings.Contains(config, "disable-dco\n") {
+		t.Fatalf("DCO-required config should not disable DCO:\n%s", config)
+	}
+}
+
+func TestOVServerConfigDisablesDCOByDefault(t *testing.T) {
+	config := serverConfig(ovRuntimeInbound{
+		Tag:       "ov-no-dco",
+		Port:      1194,
+		Transport: "udp",
+		Settings:  map[string]any{"transport": "udp"},
+	}, "/tmp/ov", "/tmp/ov/ccd")
+
+	if !strings.Contains(config, "disable-dco\n") {
+		t.Fatalf("server config should disable DCO unless required:\n%s", config)
+	}
+	if strings.Contains(config, "data-ciphers "+ovDCODataCiphers+"\n") {
+		t.Fatalf("DCO-disabled config should not force DCO data ciphers:\n%s", config)
+	}
 }
 
 func TestOVDCORejectsLegacyCipher(t *testing.T) {

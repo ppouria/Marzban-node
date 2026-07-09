@@ -355,6 +355,8 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	}
 	if boolValue(settings["require_dco"], false) {
 		line(&b, "data-ciphers "+ovDCODataCiphers)
+	} else {
+		line(&b, "disable-dco")
 	}
 	if auth := firstString(settings["auth"]); auth != "" {
 		line(&b, "auth "+auth)
