@@ -191,7 +191,8 @@ func (m *l2tpManager) applyInbound(inbound l2tpRuntimeInbound) error {
 		return fmt.Errorf("L2TP inbound %s requires ipsec_psk", inbound.Tag)
 	}
 	beforeSystemConfig := l2tpSystemConfigSnapshot()
-	if inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true) {
+	tproxyEnabled := inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true)
+	if tproxyEnabled {
 		nft, err := exec.LookPath("nft")
 		if err != nil {
 			return fmt.Errorf("nft executable not found")
@@ -202,6 +203,15 @@ func (m *l2tpManager) applyInbound(inbound l2tpRuntimeInbound) error {
 		}
 		if err := applyTProxyRouting(); err != nil {
 			return err
+		}
+		_ = vpnRemoveDirectNAT("l2tp")
+	} else {
+		if nft, err := exec.LookPath("nft"); err == nil {
+			_ = exec.Command(nft, "delete", "table", "inet", "rebecca_l2tp").Run()
+		}
+		pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.67.0.0/16")
+		if err := vpnApplyDirectNAT("l2tp", "ppp+", pool); err != nil {
+			return fmt.Errorf("apply L2TP direct NAT %s: %w", inbound.Tag, err)
 		}
 	}
 	if err := m.writeSystemConfig(inbound); err != nil {
@@ -224,6 +234,7 @@ func (m *l2tpManager) stop() {
 	if nft, err := exec.LookPath("nft"); err == nil {
 		_ = exec.Command(nft, "delete", "table", "inet", "rebecca_l2tp").Run()
 	}
+	_ = vpnRemoveDirectNAT("l2tp")
 	_ = os.WriteFile(filepath.Join(m.baseDir, "sessions.tsv"), nil, 0o600)
 }
 
@@ -569,13 +580,13 @@ func ensureL2TPPrerequisites() error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
-	missing := missingExecutables("ipsec", "xl2tpd", "pppd", "nft", "ip")
+	missing := missingExecutables("ipsec", "xl2tpd", "pppd", "nft", "ip", "iptables")
 	if len(missing) > 0 {
 		if err := installL2TPPackages(); err != nil {
 			return err
 		}
 	}
-	for _, executable := range []string{"ipsec", "xl2tpd", "pppd", "nft", "ip"} {
+	for _, executable := range []string{"ipsec", "xl2tpd", "pppd", "nft", "ip", "iptables"} {
 		if _, err := exec.LookPath(executable); err != nil {
 			return fmt.Errorf("L2TP prerequisite %s was not found after automatic install", executable)
 		}
@@ -603,13 +614,13 @@ func installL2TPPackages() error {
 		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
 			return err
 		}
-		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "strongswan", "xl2tpd", "ppp", "nftables", "iproute2", "kmod")
+		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "strongswan", "xl2tpd", "ppp", "nftables", "iproute2", "iptables", "kmod")
 	case commandExists("dnf"):
-		return runInstallCommand(nil, "dnf", "install", "-y", "strongswan", "xl2tpd", "ppp", "nftables", "iproute", "kmod")
+		return runInstallCommand(nil, "dnf", "install", "-y", "strongswan", "xl2tpd", "ppp", "nftables", "iproute", "iptables", "kmod")
 	case commandExists("yum"):
-		return runInstallCommand(nil, "yum", "install", "-y", "strongswan", "xl2tpd", "ppp", "nftables", "iproute", "kmod")
+		return runInstallCommand(nil, "yum", "install", "-y", "strongswan", "xl2tpd", "ppp", "nftables", "iproute", "iptables", "kmod")
 	case commandExists("apk"):
-		return runInstallCommand(nil, "apk", "add", "strongswan", "xl2tpd", "ppp", "nftables", "iproute2", "kmod")
+		return runInstallCommand(nil, "apk", "add", "strongswan", "xl2tpd", "ppp", "nftables", "iproute2", "iptables", "kmod")
 	default:
 		return fmt.Errorf("L2TP prerequisites are missing and no supported package manager was found")
 	}

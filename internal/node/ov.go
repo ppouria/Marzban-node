@@ -219,16 +219,27 @@ func (m *ovManager) applyInbound(inbound ovRuntimeInbound, restart bool) error {
 	}
 	name := safeName(inbound.Tag)
 	dir := filepath.Join(m.baseDir, name)
-	if inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true) {
+	tproxyEnabled := inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true)
+	if tproxyEnabled {
 		nft, err := exec.LookPath("nft")
 		if err != nil {
 			return fmt.Errorf("nft executable not found")
 		}
+		_ = exec.Command(nft, "delete", "table", "inet", "rebecca_openvpn_"+safeName(inbound.Tag)).Run()
 		if output, err := exec.Command(nft, "-f", filepath.Join(dir, "nftables.nft")).CombinedOutput(); err != nil {
 			return fmt.Errorf("apply OV nftables %s: %v: %s", inbound.Tag, err, strings.TrimSpace(string(output)))
 		}
 		if err := applyTProxyRouting(); err != nil {
 			return err
+		}
+		_ = vpnRemoveDirectNAT("openvpn-" + inbound.Tag)
+	} else {
+		if nft, err := exec.LookPath("nft"); err == nil {
+			_ = exec.Command(nft, "delete", "table", "inet", "rebecca_openvpn_"+safeName(inbound.Tag)).Run()
+		}
+		pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.66.0.0/16")
+		if err := vpnApplyDirectNAT("openvpn-"+inbound.Tag, tunName(inbound.Tag), pool); err != nil {
+			return fmt.Errorf("apply OV direct NAT %s: %w", inbound.Tag, err)
 		}
 	}
 	if !restart {
@@ -296,6 +307,7 @@ func (m *ovManager) stopInboundName(name string) {
 	if nft, err := exec.LookPath("nft"); err == nil {
 		_ = exec.Command(nft, "delete", "table", "inet", "rebecca_openvpn_"+safeName(name)).Run()
 	}
+	_ = vpnRemoveDirectNAT("openvpn-" + name)
 }
 
 func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
@@ -400,13 +412,13 @@ func ensureOVPrerequisites() error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
-	missing := missingExecutables("openvpn", "nft", "ip")
+	missing := missingExecutables("openvpn", "nft", "ip", "iptables")
 	if len(missing) > 0 {
 		if err := installOVPackages(); err != nil {
 			return err
 		}
 	}
-	for _, executable := range []string{"openvpn", "nft", "ip"} {
+	for _, executable := range []string{"openvpn", "nft", "ip", "iptables"} {
 		if _, err := exec.LookPath(executable); err != nil {
 			return fmt.Errorf("OV prerequisite %s was not found after automatic install", executable)
 		}
@@ -439,13 +451,13 @@ func installOVPackages() error {
 		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
 			return err
 		}
-		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "openvpn", "nftables", "iproute2", "kmod")
+		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "openvpn", "nftables", "iproute2", "iptables", "kmod")
 	case commandExists("dnf"):
-		return runInstallCommand(nil, "dnf", "install", "-y", "openvpn", "nftables", "iproute", "kmod")
+		return runInstallCommand(nil, "dnf", "install", "-y", "openvpn", "nftables", "iproute", "iptables", "kmod")
 	case commandExists("yum"):
-		return runInstallCommand(nil, "yum", "install", "-y", "openvpn", "nftables", "iproute", "kmod")
+		return runInstallCommand(nil, "yum", "install", "-y", "openvpn", "nftables", "iproute", "iptables", "kmod")
 	case commandExists("apk"):
-		return runInstallCommand(nil, "apk", "add", "openvpn", "nftables", "iproute2", "kmod")
+		return runInstallCommand(nil, "apk", "add", "openvpn", "nftables", "iproute2", "iptables", "kmod")
 	default:
 		return fmt.Errorf("OV prerequisites are missing and no supported package manager was found")
 	}

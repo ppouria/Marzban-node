@@ -150,7 +150,8 @@ func (m *pptpManager) applyInbound(inbound pptpRuntimeInbound) error {
 		return nil
 	}
 	beforeSystemConfig := pptpSystemConfigSnapshot()
-	if inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true) {
+	tproxyEnabled := inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true)
+	if tproxyEnabled {
 		nft, err := exec.LookPath("nft")
 		if err != nil {
 			return fmt.Errorf("nft executable not found")
@@ -161,6 +162,15 @@ func (m *pptpManager) applyInbound(inbound pptpRuntimeInbound) error {
 		}
 		if err := applyTProxyRouting(); err != nil {
 			return err
+		}
+		_ = vpnRemoveDirectNAT("pptp")
+	} else {
+		if nft, err := exec.LookPath("nft"); err == nil {
+			_ = exec.Command(nft, "delete", "table", "inet", "rebecca_pptp").Run()
+		}
+		pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.68.0.0/16")
+		if err := vpnApplyDirectNAT("pptp", "ppp+", pool); err != nil {
+			return fmt.Errorf("apply PPTP direct NAT %s: %w", inbound.Tag, err)
 		}
 	}
 	if err := m.writeSystemConfig(inbound); err != nil {
@@ -181,6 +191,7 @@ func (m *pptpManager) stop() {
 	if nft, err := exec.LookPath("nft"); err == nil {
 		_ = exec.Command(nft, "delete", "table", "inet", "rebecca_pptp").Run()
 	}
+	_ = vpnRemoveDirectNAT("pptp")
 	_ = os.WriteFile(filepath.Join(m.baseDir, "sessions.tsv"), nil, 0o600)
 }
 
@@ -359,13 +370,13 @@ func ensurePPTPPrerequisites() error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
-	missing := missingExecutables("pptpd", "pppd", "nft", "ip")
+	missing := missingExecutables("pptpd", "pppd", "nft", "ip", "iptables")
 	if len(missing) > 0 || !debianPackageConfigured("pptpd") {
 		if err := installPPTPPackages(); err != nil {
 			return err
 		}
 	}
-	for _, executable := range []string{"pptpd", "pppd", "nft", "ip"} {
+	for _, executable := range []string{"pptpd", "pppd", "nft", "ip", "iptables"} {
 		if _, err := exec.LookPath(executable); err != nil {
 			return fmt.Errorf("PPTP prerequisite %s was not found after automatic install", executable)
 		}
@@ -399,11 +410,11 @@ func installPPTPPackages() error {
 		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
 			return err
 		}
-		err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "pptpd", "ppp", "nftables", "iproute2", "kmod")
+		err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "pptpd", "ppp", "nftables", "iproute2", "iptables", "kmod")
 		if err == nil {
 			return nil
 		}
-		if baseErr := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "ppp", "nftables", "iproute2", "kmod", "curl", "ca-certificates"); baseErr != nil {
+		if baseErr := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "ppp", "nftables", "iproute2", "iptables", "kmod", "curl", "ca-certificates"); baseErr != nil {
 			return fmt.Errorf("%w; installing PPTP base dependencies failed: %v", err, baseErr)
 		}
 		if debErr := installDebianPPTPD(); debErr != nil {
@@ -411,11 +422,11 @@ func installPPTPPackages() error {
 		}
 		return nil
 	case commandExists("dnf"):
-		return runInstallCommand(nil, "dnf", "install", "-y", "pptpd", "ppp", "nftables", "iproute", "kmod")
+		return runInstallCommand(nil, "dnf", "install", "-y", "pptpd", "ppp", "nftables", "iproute", "iptables", "kmod")
 	case commandExists("yum"):
-		return runInstallCommand(nil, "yum", "install", "-y", "pptpd", "ppp", "nftables", "iproute", "kmod")
+		return runInstallCommand(nil, "yum", "install", "-y", "pptpd", "ppp", "nftables", "iproute", "iptables", "kmod")
 	case commandExists("apk"):
-		return runInstallCommand(nil, "apk", "add", "pptpd", "ppp", "nftables", "iproute2", "kmod")
+		return runInstallCommand(nil, "apk", "add", "pptpd", "ppp", "nftables", "iproute2", "iptables", "kmod")
 	default:
 		return fmt.Errorf("PPTP prerequisites are missing and no supported package manager was found")
 	}
