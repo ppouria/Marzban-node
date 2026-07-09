@@ -174,6 +174,8 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	if !s.matchRequestSession(w, r) {
 		return
 	}
@@ -182,13 +184,11 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 	s.clientIP = ""
 	s.sessions = make(map[string]time.Time)
 	s.mu.Unlock()
-	s.runtimeMu.Lock()
 	if s.core.Started() {
 		s.snapshotRunningUsage()
 		s.core.Stop()
 	}
 	s.clearConfigCache()
-	s.runtimeMu.Unlock()
 	writeJSON(w, http.StatusOK, s.response(nil))
 }
 
@@ -200,12 +200,12 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	payload, ok := s.readConfigPayload(w, r)
 	if !ok {
 		return
 	}
-	s.runtimeMu.Lock()
-	defer s.runtimeMu.Unlock()
 	if s.core.Started() && s.runtimeConfigMatchesCache(payload.Config) {
 		s.handleRuntimeOnly(w, payload)
 		return
@@ -266,11 +266,11 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	if !s.matchRequestSession(w, r) {
 		return
 	}
-	s.runtimeMu.Lock()
-	defer s.runtimeMu.Unlock()
 	s.snapshotRunningUsage()
 	s.core.Stop()
 	if err := s.ov.Apply(&ovRuntime{Inbounds: []ovRuntimeInbound{}}); err != nil {
@@ -293,12 +293,12 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	payload, ok := s.readConfigPayload(w, r)
 	if !ok {
 		return
 	}
-	s.runtimeMu.Lock()
-	defer s.runtimeMu.Unlock()
 	if s.core.Started() && s.runtimeConfigMatchesCache(payload.Config) {
 		s.handleRuntimeOnly(w, payload)
 		return

@@ -21,6 +21,8 @@ type removeInboundUserPayload struct {
 }
 
 func (s *Server) handleAddInboundUser(w http.ResponseWriter, r *http.Request) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	var payload addInboundUserPayload
 	if !decodeJSON(w, r, &payload) {
 		return
@@ -28,8 +30,6 @@ func (s *Server) handleAddInboundUser(w http.ResponseWriter, r *http.Request) {
 	if !s.matchSession(w, payload.SessionID) {
 		return
 	}
-	s.runtimeMu.Lock()
-	defer s.runtimeMu.Unlock()
 	if !s.core.Started() {
 		writeError(w, http.StatusServiceUnavailable, "Xray is not started")
 		return
@@ -62,6 +62,8 @@ func (s *Server) handleAddInboundUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRemoveInboundUser(w http.ResponseWriter, r *http.Request) {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
 	var payload removeInboundUserPayload
 	if !decodeJSON(w, r, &payload) {
 		return
@@ -69,8 +71,6 @@ func (s *Server) handleRemoveInboundUser(w http.ResponseWriter, r *http.Request)
 	if !s.matchSession(w, payload.SessionID) {
 		return
 	}
-	s.runtimeMu.Lock()
-	defer s.runtimeMu.Unlock()
 	if !s.core.Started() {
 		writeError(w, http.StatusServiceUnavailable, "Xray is not started")
 		return
