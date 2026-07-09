@@ -40,6 +40,7 @@ type pptpRuntimeUser struct {
 	UsedTraffic int64  `json:"used_traffic"`
 	DataLimit   *int64 `json:"data_limit,omitempty"`
 	Expire      *int64 `json:"expire,omitempty"`
+	DeviceLimit *int64 `json:"device_limit,omitempty"`
 }
 
 type pptpManager struct {
@@ -211,7 +212,7 @@ remoteip %s
 	if err := os.MkdirAll("/etc/ppp/ip-up.d", 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-pptp-sessions", []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "sessions.tsv"))), 0o700); err != nil {
+	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-pptp-sessions", []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "sessions.tsv"), filepath.Join(m.baseDir, "users.tsv"))), 0o700); err != nil {
 		return fmt.Errorf("write /etc/ppp/ip-up.d/rebecca-pptp-sessions: %w", err)
 	}
 	if err := os.MkdirAll("/etc/ppp/ip-down.d", 0o755); err != nil {
@@ -287,6 +288,10 @@ func pptpUsersTSV(users []pptpRuntimeUser) string {
 		if user.Expire != nil {
 			expire = strconv.FormatInt(*user.Expire, 10)
 		}
+		deviceLimit := ""
+		if user.DeviceLimit != nil && *user.DeviceLimit > 0 {
+			deviceLimit = strconv.FormatInt(*user.DeviceLimit, 10)
+		}
 		fields := []string{
 			strconv.FormatInt(user.UserID, 10),
 			user.VPNUsername,
@@ -296,6 +301,7 @@ func pptpUsersTSV(users []pptpRuntimeUser) string {
 			limit,
 			user.Status,
 			expire,
+			deviceLimit,
 		}
 		b.WriteString(strings.Join(fields, "\t"))
 		b.WriteByte('\n')

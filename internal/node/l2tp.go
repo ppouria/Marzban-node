@@ -48,6 +48,7 @@ type l2tpRuntimeUser struct {
 	UsedTraffic int64  `json:"used_traffic"`
 	DataLimit   *int64 `json:"data_limit,omitempty"`
 	Expire      *int64 `json:"expire,omitempty"`
+	DeviceLimit *int64 `json:"device_limit,omitempty"`
 }
 
 type l2tpManager struct {
@@ -173,7 +174,7 @@ func (m *l2tpManager) writeInbound(inbound l2tpRuntimeInbound) error {
 	if err := os.WriteFile(filepath.Join(m.baseDir, "ip-down.sh"), []byte(l2tpIPDownScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "sessions.tsv"))), 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(m.baseDir, "ip-up.sh"), []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "sessions.tsv"))), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(m.baseDir, "ip-up.sh"), []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "sessions.tsv"), usersPath)), 0o700); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(m.baseDir, "options.xl2tpd"), []byte(l2tpPPPOptions(inbound)), 0o600); err != nil {
@@ -286,7 +287,7 @@ length bit = yes
 	if err := os.MkdirAll("/etc/ppp/ip-up.d", 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-l2tp-sessions", []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "sessions.tsv"))), 0o700); err != nil {
+	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-l2tp-sessions", []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "sessions.tsv"), filepath.Join(m.baseDir, "users.tsv"))), 0o700); err != nil {
 		return fmt.Errorf("write /etc/ppp/ip-up.d/rebecca-l2tp-sessions: %w", err)
 	}
 	if err := os.MkdirAll("/etc/ppp/ip-down.d", 0o755); err != nil {
@@ -353,6 +354,10 @@ func l2tpUsersTSV(users []l2tpRuntimeUser) string {
 		if user.Expire != nil {
 			expire = strconv.FormatInt(*user.Expire, 10)
 		}
+		deviceLimit := ""
+		if user.DeviceLimit != nil && *user.DeviceLimit > 0 {
+			deviceLimit = strconv.FormatInt(*user.DeviceLimit, 10)
+		}
 		fields := []string{
 			strconv.FormatInt(user.UserID, 10),
 			user.VPNUsername,
@@ -362,6 +367,7 @@ func l2tpUsersTSV(users []l2tpRuntimeUser) string {
 			limit,
 			user.Status,
 			expire,
+			deviceLimit,
 		}
 		b.WriteString(strings.Join(fields, "\t"))
 		b.WriteByte('\n')
@@ -492,26 +498,40 @@ func deleteL2TPInterface(ifname string) {
 	}
 }
 
-func l2tpIPUpScript(sessionsPath string) string {
+func l2tpIPUpScript(sessionsPath string, usersPath string) string {
 	return fmt.Sprintf(`#!/bin/sh
 SESSIONS=%q
+USERS=%q
 peer=${PEERNAME:-}
 ifname=${IFNAME:-}
 pid=${PPPD_PID:-}
 [ -n "$pid" ] || pid=$$
-if [ -n "$peer" ] && [ -n "$ifname" ]; then
-  mkdir -p "$(dirname "$SESSIONS")"
-  tmp="${SESSIONS}.$$"
-  if [ -f "$SESSIONS" ]; then
-    awk -F '\t' -v u="$peer" '$1 != u { print }' "$SESSIONS" > "$tmp"
-  else
-    : > "$tmp"
-  fi
-  printf '%%s\t%%s\t%%s\n' "$peer" "$ifname" "$pid" >> "$tmp"
-  mv "$tmp" "$SESSIONS"
-  chmod 600 "$SESSIONS"
+[ -n "$peer" ] && [ -n "$ifname" ] || exit 0
+mkdir -p "$(dirname "$SESSIONS")"
+tmp="${SESSIONS}.$$"
+# Drop any stale row for this interface, and count how many other sessions this
+# user already holds. Sessions are keyed by interface (column 2) so one user can
+# have several at once, up to their device limit.
+if [ -f "$SESSIONS" ]; then
+  awk -F '\t' -v i="$ifname" '$2 != i { print }' "$SESSIONS" > "$tmp"
+else
+  : > "$tmp"
 fi
-`, sessionsPath)
+active=$(awk -F '\t' -v u="$peer" '$1 == u { n++ } END { print n+0 }' "$tmp")
+tab=$(printf '\t')
+limit=$(grep -F "${tab}${peer}${tab}" "$USERS" | awk -F '\t' -v u="$peer" '$2 == u { print $9; exit }')
+# Enforce the concurrent device limit (users.tsv column 9) if one is set. This
+# new session is not counted in "active" yet, so reject once the user is already
+# at the limit by tearing down this pppd instead of recording it.
+if [ -n "$limit" ] && [ "$limit" -gt 0 ] 2>/dev/null && [ "$active" -ge "$limit" ]; then
+  rm -f "$tmp"
+  kill -TERM "$pid" 2>/dev/null
+  exit 0
+fi
+printf '%%s\t%%s\t%%s\n' "$peer" "$ifname" "$pid" >> "$tmp"
+mv "$tmp" "$SESSIONS"
+chmod 600 "$SESSIONS"
+`, sessionsPath, usersPath)
 }
 
 func l2tpIPDownScript(usersPath string, usagePath string, sessionsPath string) string {
@@ -526,9 +546,9 @@ total=$((rx + tx))
 if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
   printf 'l2tp:%%s\t%%s\n' "$uid" "$total" >> "$USAGE"
 fi
-if [ -n "$PEERNAME" ] && [ -f "$SESSIONS" ]; then
+if [ -n "$IFNAME" ] && [ -f "$SESSIONS" ]; then
   tmp="${SESSIONS}.$$"
-  awk -F '\t' -v u="$PEERNAME" '$1 != u { print }' "$SESSIONS" > "$tmp"
+  awk -F '\t' -v i="$IFNAME" '$2 != i { print }' "$SESSIONS" > "$tmp"
   mv "$tmp" "$SESSIONS"
   chmod 600 "$SESSIONS"
 fi

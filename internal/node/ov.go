@@ -47,6 +47,7 @@ type ovRuntimeUser struct {
 	UsedTraffic int64  `json:"used_traffic"`
 	DataLimit   *int64 `json:"data_limit,omitempty"`
 	Expire      *int64 `json:"expire,omitempty"`
+	DeviceLimit *int64 `json:"device_limit,omitempty"`
 }
 
 type ovManager struct {
@@ -194,7 +195,7 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound) error {
 		}
 	}
 	for path, content := range map[string]string{
-		filepath.Join(dir, "auth.sh"):              authScript(usersPath),
+		filepath.Join(dir, "auth.sh"):              authScript(usersPath, filepath.Join(dir, "status.log")),
 		filepath.Join(dir, "client-disconnect.sh"): disconnectScript(usersPath, filepath.Join(m.baseDir, "usage.tsv")),
 		filepath.Join(dir, "nftables.nft"):         nftScript(inbound, tunName(inbound.Tag)),
 		filepath.Join(dir, "server.conf"):          serverConfig(inbound, dir, ccdDir),
@@ -335,6 +336,11 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	line(&b, "client-config-dir "+ccdDir)
 	line(&b, "verify-client-cert none")
 	line(&b, "username-as-common-name")
+	// Allow more than one tunnel per username. Without this OpenVPN drops any
+	// second connection sharing a common-name, so the per-user device limit
+	// (enforced in auth.sh) could never exceed one. auth.sh is what actually caps
+	// the count; this only lifts OpenVPN's own one-CN-one-connection rule.
+	line(&b, "duplicate-cn")
 	line(&b, "script-security 3")
 	line(&b, "auth-user-pass-verify "+filepath.Join(dir, "auth.sh")+" via-env")
 	line(&b, "client-disconnect "+filepath.Join(dir, "client-disconnect.sh"))
@@ -722,20 +728,34 @@ func ovDCOInactiveReason(logText string) string {
 	return ""
 }
 
-func authScript(usersPath string) string {
+func authScript(usersPath string, statusPath string) string {
 	return fmt.Sprintf(`#!/bin/sh
 USERS=%q
+STATUS=%q
 now=$(date +%%s)
 tab=$(printf '\t')
-grep -F "${tab}${username}${tab}" "$USERS" | awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
+limit=$(grep -F "${tab}${username}${tab}" "$USERS" | awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
   $2 == u && $3 == p && ($7 == "" || $7 == "active" || $7 == "on_hold") {
     if ($6 != "" && $5 >= $6) exit 2
     if ($8 != "" && now >= $8) exit 3
     found=1
+    dl=$9
   }
-  END { exit found ? 0 : 1 }
-' "$USERS"
-`, usersPath)
+  END { if (!found) exit 1; print dl }
+')
+rc=$?
+[ $rc -eq 0 ] || exit $rc
+# Enforce the concurrent device limit (column 9) when one is set. The connecting
+# client is not in the status log yet during auth, so the current CLIENT_LIST
+# count already excludes it: reject once the user is at or above the limit.
+if [ -n "$limit" ] && [ "$limit" -gt 0 ] 2>/dev/null && [ -f "$STATUS" ]; then
+  active=$(awk -F ',' -v u="$username" '$1 == "CLIENT_LIST" && $2 == u { n++ } END { print n+0 }' "$STATUS")
+  if [ "$active" -ge "$limit" ]; then
+    exit 4
+  fi
+fi
+exit 0
+`, usersPath, statusPath)
 }
 
 func disconnectScript(usersPath string, usagePath string) string {
@@ -763,6 +783,10 @@ func usersTSV(users []ovRuntimeUser) string {
 		if user.Expire != nil {
 			expire = strconv.FormatInt(*user.Expire, 10)
 		}
+		deviceLimit := ""
+		if user.DeviceLimit != nil && *user.DeviceLimit > 0 {
+			deviceLimit = strconv.FormatInt(*user.DeviceLimit, 10)
+		}
 		fields := []string{
 			strconv.FormatInt(user.UserID, 10),
 			user.VPNUsername,
@@ -772,6 +796,7 @@ func usersTSV(users []ovRuntimeUser) string {
 			limit,
 			user.Status,
 			expire,
+			deviceLimit,
 		}
 		b.WriteString(strings.Join(fields, "\t"))
 		b.WriteByte('\n')
