@@ -101,10 +101,49 @@ func (b *usageBuffer) persistLocked() error {
 		return err
 	}
 	tempPath := b.spoolPath + ".tmp"
-	if err := os.WriteFile(tempPath, payload, 0o600); err != nil {
+	if err := writeFileSync(tempPath, payload, 0o600); err != nil {
 		return err
 	}
-	return replaceFile(tempPath, b.spoolPath)
+	if err := replaceFile(tempPath, b.spoolPath); err != nil {
+		return err
+	}
+	// fsync the directory so the rename itself is durable: without it a crash
+	// right after the rename can leave the directory entry unwritten and the
+	// spool reverting to its previous contents on the next boot.
+	syncDir(filepath.Dir(b.spoolPath))
+	return nil
+}
+
+// writeFileSync writes data to path and fsyncs the file before closing, so the
+// bytes are on stable storage before the spool is renamed into place. A plain
+// os.WriteFile only guarantees the write reached the OS cache, which a power
+// loss can still drop.
+func writeFileSync(path string, data []byte, perm os.FileMode) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+// syncDir fsyncs a directory so a rename inside it is durable. Best-effort:
+// some platforms (notably Windows) do not support syncing a directory handle,
+// where the rename is durable enough on its own.
+func syncDir(dir string) {
+	handle, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = handle.Sync()
+	_ = handle.Close()
 }
 
 func (b *usageBuffer) persistBestEffortLocked() {

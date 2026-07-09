@@ -75,6 +75,12 @@ func New(settings appconfig.Settings) (*Server, error) {
 		system:   newSystemSampler(),
 		sessions: make(map[string]time.Time),
 	}
+	// Rebuild WireGuard interfaces from disk first, independently of Xray: kernel
+	// WG state does not survive a reboot, and its ingress should come back even if
+	// the cached Xray config fails to start below.
+	if err := server.wg.Reconcile(); err != nil {
+		log.Printf("failed to reconcile WireGuard runtime on startup: %v", err)
+	}
 	server.startCachedConfig()
 	return server, nil
 }

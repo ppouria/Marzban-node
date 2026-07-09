@@ -290,6 +290,23 @@ func (m *wgManager) currentRuntime() *wgRuntime {
 	return &payload
 }
 
+// Reconcile re-applies the last persisted WireGuard runtime from disk. Kernel
+// WireGuard interfaces (and their NAT rules) do not survive a host reboot, so on
+// startup the node must rebuild them from runtime.json. Unlike the Xray config
+// cache this runs independently of Xray: WireGuard ingress is kernel-level and
+// should come back even if Xray fails to start. Apply is idempotent, so this is
+// safe when the interfaces already exist (e.g. a plain service restart).
+func (m *wgManager) Reconcile() error {
+	if m == nil {
+		return nil
+	}
+	runtimeConfig := m.currentRuntime()
+	if runtimeConfig == nil || len(runtimeConfig.Inbounds) == 0 {
+		return nil
+	}
+	return m.Apply(runtimeConfig)
+}
+
 func (m *wgManager) pruneRemovedInbounds(desired map[string]struct{}) error {
 	entries, err := os.ReadDir(m.baseDir)
 	if err != nil {
