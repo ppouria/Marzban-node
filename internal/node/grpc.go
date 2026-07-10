@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -162,6 +163,9 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 	if err := api.server.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
 		log.Printf("WireGuard runtime stop failed: %v", err)
 	}
+	if err := api.server.ipBlocks.Clear(ctx); err != nil {
+		log.Printf("source IP block cleanup failed: %v", err)
+	}
 	api.server.clearConfigCache()
 	return api.server.grpcAction(req.GetOperationId(), true, "runtime stopped"), nil
 }
@@ -295,9 +299,40 @@ func (api *grpcAPI) RebootHost(ctx context.Context, req *nodev1.HostRebootReques
 	return api.server.grpcAction(req.GetOperationId(), true, "host reboot scheduled"), nil
 }
 
+func (api *grpcAPI) ApplyIPBlocks(ctx context.Context, req *nodev1.IPBlockRequest) (*nodev1.RuntimeActionResponse, error) {
+	if req == nil {
+		req = &nodev1.IPBlockRequest{}
+	}
+	blocks := make([]sourceIPBlockEntry, 0, len(req.GetBlocks()))
+	for _, block := range req.GetBlocks() {
+		if block == nil {
+			continue
+		}
+		blocks = append(blocks, sourceIPBlockEntry{
+			IP:         block.GetIp(),
+			TTLSeconds: block.GetTtlSeconds(),
+			UserUID:    block.GetUserUid(),
+			Reason:     block.GetReason(),
+		})
+	}
+	var ports sourceIPBlockPorts
+	if len(blocks) > 0 {
+		var err error
+		ports, err = api.server.sourceIPBlockPorts(req.GetTcpPorts(), req.GetUdpPorts())
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+	}
+	if err := api.server.ipBlocks.Apply(ctx, blocks, ports, api.server.protectedSourceIPs()); err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	return api.server.grpcAction(req.GetOperationId(), true, "IP blocks applied"), nil
+}
+
 func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsageRequest) (*nodev1.UserUsageBatch, error) {
 	var stats []xray.UserStat
 	var onlineUIDs []string
+	var onlineIPs []xray.OnlineUserIP
 	if api.server.core.Started() {
 		var err error
 		stats, err = xray.QueryUserStats(
@@ -309,13 +344,23 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 		if err != nil {
 			return nil, status.Error(codes.Unavailable, err.Error())
 		}
-		onlineUIDs, err = xray.QueryOnlineUserUIDs(
+		onlineIPs, err = xray.QueryOnlineUserIPs(
 			api.server.settings.XrayAPIHost,
 			api.server.settings.XrayAPIPort,
 			5*time.Second,
 		)
 		if err != nil {
-			log.Printf("failed to query online users: %v", err)
+			log.Printf("failed to query online user IPs: %v", err)
+			onlineUIDs, err = xray.QueryOnlineUserUIDs(
+				api.server.settings.XrayAPIHost,
+				api.server.settings.XrayAPIPort,
+				5*time.Second,
+			)
+			if err != nil {
+				log.Printf("failed to query online users: %v", err)
+			}
+		} else {
+			onlineUIDs = onlineUserIPUIDs(onlineIPs)
 		}
 	}
 	if OVStats := api.server.ov.CollectUsage(); len(OVStats) > 0 {
@@ -332,7 +377,7 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 	}
 	batchID, pending := api.server.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
-	res := &nodev1.UserUsageBatch{BatchId: batchID}
+	res := &nodev1.UserUsageBatch{BatchId: batchID, OnlineIps: protoOnlineUserIPs(onlineIPs)}
 	for _, stat := range pending {
 		res.Stats = append(res.Stats, &nodev1.UserUsageSample{
 			Uid:   stat.UID,
@@ -922,6 +967,35 @@ func maxInt64(value int64, minimum int64) int64 {
 		return minimum
 	}
 	return value
+}
+
+func onlineUserIPUIDs(users []xray.OnlineUserIP) []string {
+	seen := map[string]struct{}{}
+	for _, user := range users {
+		uid := strings.TrimSpace(user.UID)
+		if uid == "" {
+			continue
+		}
+		seen[uid] = struct{}{}
+	}
+	uids := make([]string, 0, len(seen))
+	for uid := range seen {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	return uids
+}
+
+func protoOnlineUserIPs(users []xray.OnlineUserIP) []*nodev1.OnlineUserIP {
+	result := make([]*nodev1.OnlineUserIP, 0, len(users))
+	for _, user := range users {
+		item := &nodev1.OnlineUserIP{Uid: user.UID, Email: user.Email}
+		for _, ip := range user.IPs {
+			item.Ips = append(item.Ips, &nodev1.OnlineIP{Ip: ip.IP, LastSeenUnix: ip.LastSeenUnix})
+		}
+		result = append(result, item)
+	}
+	return result
 }
 
 func init() {

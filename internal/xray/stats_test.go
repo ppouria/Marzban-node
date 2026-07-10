@@ -24,6 +24,27 @@ func TestParseUserStatName(t *testing.T) {
 	}
 }
 
+func TestParseOnlineUserName(t *testing.T) {
+	tests := []struct {
+		name  string
+		email string
+		uid   string
+		ok    bool
+	}{
+		{name: "user>>>abc123.example>>>online", email: "abc123.example", uid: "abc123", ok: true},
+		{name: "abc123.example", email: "abc123.example", uid: "abc123", ok: true},
+		{name: "user>>>>>>online", ok: false},
+		{name: "", ok: false},
+	}
+
+	for _, tt := range tests {
+		email, uid, ok := parseOnlineUserName(tt.name)
+		if ok != tt.ok || email != tt.email || uid != tt.uid {
+			t.Fatalf("parseOnlineUserName(%q) = (%q, %q, %v), want (%q, %q, %v)", tt.name, email, uid, ok, tt.email, tt.uid, tt.ok)
+		}
+	}
+}
+
 func TestParseUserEmailUID(t *testing.T) {
 	uid, ok := parseUserEmailUID("42.alice")
 	if !ok || uid != "42" {

@@ -11,7 +11,9 @@ import (
 
 	statscommand "github.com/xtls/xray-core/app/stats/command"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 type OutboundStat struct {
@@ -23,6 +25,17 @@ type OutboundStat struct {
 type UserStat struct {
 	UID   string `json:"uid"`
 	Value int64  `json:"value"`
+}
+
+type OnlineIP struct {
+	IP           string `json:"ip"`
+	LastSeenUnix int64  `json:"last_seen_unix"`
+}
+
+type OnlineUserIP struct {
+	UID   string     `json:"uid"`
+	Email string     `json:"email"`
+	IPs   []OnlineIP `json:"ips"`
 }
 
 func QueryOutboundStats(apiHost string, apiPort int, timeout time.Duration, reset bool) ([]OutboundStat, error) {
@@ -120,8 +133,8 @@ func QueryOnlineUserUIDs(apiHost string, apiPort int, timeout time.Duration) ([]
 	}
 
 	seen := map[string]struct{}{}
-	for _, email := range res.GetUsers() {
-		uid, ok := parseUserEmailUID(email)
+	for _, name := range res.GetUsers() {
+		_, uid, ok := parseOnlineUserName(name)
 		if !ok {
 			continue
 		}
@@ -134,6 +147,61 @@ func QueryOnlineUserUIDs(apiHost string, apiPort int, timeout time.Duration) ([]
 	}
 	sort.Strings(uids)
 	return uids, nil
+}
+
+func QueryOnlineUserIPs(apiHost string, apiPort int, timeout time.Duration) ([]OnlineUserIP, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, err := dialAPI(ctx, apiHost, apiPort)
+	if err != nil {
+		return nil, fmt.Errorf("connect to Xray stats API: %w", err)
+	}
+	defer conn.Close()
+
+	client := statscommand.NewStatsServiceClient(conn)
+	res, err := client.GetAllOnlineUsers(ctx, &statscommand.GetAllOnlineUsersRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("query Xray online users: %w", err)
+	}
+
+	users := make([]OnlineUserIP, 0, len(res.GetUsers()))
+	for _, name := range res.GetUsers() {
+		statsName := strings.TrimSpace(name)
+		email, uid, ok := parseOnlineUserName(statsName)
+		if !ok {
+			continue
+		}
+		if !strings.Contains(statsName, ">>>") {
+			statsName = onlineUserStatsName(email)
+		}
+		ipRes, err := client.GetStatsOnlineIpList(ctx, &statscommand.GetStatsRequest{Name: statsName})
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				continue
+			}
+			return nil, fmt.Errorf("query Xray online IPs for %s: %w", email, err)
+		}
+		ips := make([]OnlineIP, 0, len(ipRes.GetIps()))
+		for ip, lastSeen := range ipRes.GetIps() {
+			ip = strings.TrimSpace(ip)
+			if ip == "" {
+				continue
+			}
+			ips = append(ips, OnlineIP{IP: ip, LastSeenUnix: lastSeen})
+		}
+		sort.Slice(ips, func(i, j int) bool {
+			return ips[i].IP < ips[j].IP
+		})
+		users = append(users, OnlineUserIP{UID: uid, Email: email, IPs: ips})
+	}
+	sort.Slice(users, func(i, j int) bool {
+		if users[i].UID == users[j].UID {
+			return users[i].Email < users[j].Email
+		}
+		return users[i].UID < users[j].UID
+	})
+	return users, nil
 }
 
 func queryStats(apiHost string, apiPort int, timeout time.Duration, pattern string, reset bool) ([]*statscommand.Stat, error) {
@@ -191,6 +259,23 @@ func parseUserStatName(name string) (string, bool) {
 		return "", false
 	}
 	return parseUserEmailUID(parts[1])
+}
+
+func parseOnlineUserName(name string) (string, string, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", "", false
+	}
+	if strings.HasPrefix(name, "user>>>") && strings.HasSuffix(name, ">>>online") {
+		name = strings.TrimSuffix(strings.TrimPrefix(name, "user>>>"), ">>>online")
+	}
+	email := strings.TrimSpace(name)
+	uid, ok := parseUserEmailUID(email)
+	return email, uid, ok
+}
+
+func onlineUserStatsName(email string) string {
+	return "user>>>" + strings.TrimSpace(email) + ">>>online"
 }
 
 func parseUserEmailUID(email string) (string, bool) {

@@ -36,6 +36,7 @@ type Server struct {
 	l2tp     *l2tpManager
 	pptp     *pptpManager
 	wg       *wgManager
+	ipBlocks *sourceIPBlocker
 	usage    *usageBuffer
 	system   *systemSampler
 
@@ -79,6 +80,7 @@ func New(settings appconfig.Settings) (*Server, error) {
 		l2tp:     newL2TPManager(settings.RebeccaDataDir, settings.InstallMode),
 		pptp:     newPPTPManager(settings.RebeccaDataDir, settings.InstallMode),
 		wg:       newWGManager(settings.RebeccaDataDir, settings.InstallMode),
+		ipBlocks: newSourceIPBlocker(settings.RebeccaDataDir, settings.InstallMode),
 		usage:    usage,
 		system:   newSystemSampler(),
 		sessions: make(map[string]time.Time),
@@ -188,6 +190,9 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 		s.snapshotRunningUsage()
 		s.core.Stop()
 	}
+	if err := s.ipBlocks.Clear(r.Context()); err != nil {
+		log.Printf("source IP block cleanup failed: %v", err)
+	}
 	s.clearConfigCache()
 	writeJSON(w, http.StatusOK, s.response(nil))
 }
@@ -287,6 +292,9 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
 		log.Printf("WireGuard runtime stop failed: %v", err)
+	}
+	if err := s.ipBlocks.Clear(r.Context()); err != nil {
+		log.Printf("source IP block cleanup failed: %v", err)
 	}
 	s.clearConfigCache()
 	writeJSON(w, http.StatusOK, s.response(nil))
@@ -599,6 +607,7 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	var stats []xray.UserStat
 	var onlineUIDs []string
+	var onlineIPs []xray.OnlineUserIP
 	if s.core.Started() {
 		var err error
 		stats, err = xray.QueryUserStats(
@@ -611,13 +620,23 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
-		onlineUIDs, err = xray.QueryOnlineUserUIDs(
+		onlineIPs, err = xray.QueryOnlineUserIPs(
 			s.settings.XrayAPIHost,
 			s.settings.XrayAPIPort,
 			5*time.Second,
 		)
 		if err != nil {
-			log.Printf("failed to query online users: %v", err)
+			log.Printf("failed to query online user IPs: %v", err)
+			onlineUIDs, err = xray.QueryOnlineUserUIDs(
+				s.settings.XrayAPIHost,
+				s.settings.XrayAPIPort,
+				5*time.Second,
+			)
+			if err != nil {
+				log.Printf("failed to query online users: %v", err)
+			}
+		} else {
+			onlineUIDs = onlineUserIPUIDs(onlineIPs)
 		}
 	}
 	if OVStats := s.ov.CollectUsage(); len(OVStats) > 0 {
@@ -634,7 +653,7 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	batchID, pending := s.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
-	writeJSON(w, http.StatusOK, map[string]any{"batch_id": batchID, "stats": pending})
+	writeJSON(w, http.StatusOK, map[string]any{"batch_id": batchID, "stats": pending, "online_ips": onlineIPs})
 }
 
 func (s *Server) handleOutboundUsageAck(w http.ResponseWriter, r *http.Request) {
