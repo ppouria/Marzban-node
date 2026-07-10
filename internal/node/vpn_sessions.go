@@ -63,6 +63,19 @@ vpn_safe() {
   printf '%%s' "$1" | tr -c 'A-Za-z0-9_.:-' '_'
 }
 
+vpn_device_key() {
+  ip=$1
+  client_ip=$2
+  session=$3
+  if [ -n "$client_ip" ]; then
+    printf 'client:%%s' "$(vpn_safe "$client_ip")"
+  elif [ -n "$ip" ]; then
+    printf 'assigned:%%s' "$(vpn_safe "$ip")"
+  else
+    printf 'session:%%s' "$(vpn_safe "$session")"
+  fi
+}
+
 vpn_notify() {
   event=$1
   uid=$2
@@ -94,8 +107,33 @@ vpn_admit() {
     flock -x 9 || exit 50
     tmp="${VPN_SESSIONS}.$$"
     awk -F '\t' -v sid="$session" '$4 != sid { print }' "$VPN_SESSIONS" > "$tmp"
-    count=$(awk -F '\t' -v uid="$uid" '$1 == uid { n++ } END { print n+0 }' "$tmp")
-    if [ "$limit" -gt 0 ] && [ "$count" -ge "$limit" ]; then
+    device_key=$(vpn_device_key "$ip" "$client_ip" "$session")
+    count=$(awk -F '\t' -v uid="$uid" '
+      function key(ip, client_ip, session) {
+        if (client_ip != "") return "client:" client_ip
+        if (ip != "") return "assigned:" ip
+        return "session:" session
+      }
+      $1 == uid {
+        client = (NF >= 7 ? $6 : "")
+        k = key($5, client, $4)
+        if (!(k in seen)) { seen[k] = 1; n++ }
+      }
+      END { print n+0 }
+    ' "$tmp")
+    exists=$(awk -F '\t' -v uid="$uid" -v want="$device_key" '
+      function key(ip, client_ip, session) {
+        if (client_ip != "") return "client:" client_ip
+        if (ip != "") return "assigned:" ip
+        return "session:" session
+      }
+      $1 == uid {
+        client = (NF >= 7 ? $6 : "")
+        if (key($5, client, $4) == want) found = 1
+      }
+      END { print found+0 }
+    ' "$tmp")
+    if [ "$limit" -gt 0 ] && [ "$count" -ge "$limit" ] && [ "$exists" -eq 0 ]; then
       rm -f "$tmp"
       exit 30
     fi
@@ -149,12 +187,25 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 		}
 		count := 0
 		uidText := strconv.FormatInt(event.UserID, 10)
+		deviceKey := vpnSessionDeviceKey(event.AssignedIP, event.ClientIP, sessionID)
+		hasDevice := false
+		devices := map[string]struct{}{}
 		for _, record := range next {
 			if len(record) >= 1 && record[0] == uidText {
-				count++
+				key := vpnRecordDeviceKey(record)
+				if key == "" {
+					continue
+				}
+				if key == deviceKey {
+					hasDevice = true
+				}
+				if _, ok := devices[key]; !ok {
+					devices[key] = struct{}{}
+					count++
+				}
 			}
 		}
-		if limit > 0 && int64(count) >= limit {
+		if limit > 0 && int64(count) >= limit && !hasDevice {
 			return
 		}
 		next = append(next, []string{
@@ -175,6 +226,34 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 		go vpnNotifySession(callback, event)
 	}
 	return admitted
+}
+
+func vpnRecordDeviceKey(record []string) string {
+	if len(record) < 4 {
+		return ""
+	}
+	assignedIP := ""
+	if len(record) >= 5 {
+		assignedIP = record[4]
+	}
+	clientIP := ""
+	if len(record) >= 7 {
+		clientIP = record[5]
+	}
+	return vpnSessionDeviceKey(assignedIP, clientIP, record[3])
+}
+
+func vpnSessionDeviceKey(assignedIP string, clientIP string, sessionID string) string {
+	if text := strings.TrimSpace(clientIP); text != "" {
+		return "client:" + safeName(text)
+	}
+	if text := strings.TrimSpace(assignedIP); text != "" {
+		return "assigned:" + safeName(text)
+	}
+	if text := strings.TrimSpace(sessionID); text != "" {
+		return "session:" + safeName(text)
+	}
+	return ""
 }
 
 func vpnReleaseGoSession(path string, callback *vpnSessionCallback, event vpnSessionEvent) {
@@ -203,9 +282,17 @@ func vpnUserCanOpenSession(path string, userID int64, limit int64) bool {
 	count := 0
 	if err := withVPNSessionLock(path, func() {
 		uidText := strconv.FormatInt(userID, 10)
+		devices := map[string]struct{}{}
 		for _, record := range vpnSessionRecordsLocked(path) {
 			if len(record) >= 1 && record[0] == uidText {
-				count++
+				key := vpnRecordDeviceKey(record)
+				if key == "" {
+					continue
+				}
+				if _, ok := devices[key]; !ok {
+					devices[key] = struct{}{}
+					count++
+				}
 			}
 		}
 	}); err != nil {
