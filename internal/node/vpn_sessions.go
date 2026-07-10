@@ -26,6 +26,7 @@ type vpnSessionEvent struct {
 	InboundTag string `json:"inbound_tag,omitempty"`
 	SessionID  string `json:"session_id"`
 	AssignedIP string `json:"assigned_ip,omitempty"`
+	ClientIP   string `json:"client_ip,omitempty"`
 	Event      string `json:"event"`
 }
 
@@ -69,10 +70,11 @@ vpn_notify() {
   tag=$4
   session=$5
   ip=$6
+  client_ip=$7
   [ -f "$VPN_CALLBACK" ] && . "$VPN_CALLBACK"
   [ -n "$CALLBACK_URL" ] && [ -n "$CALLBACK_TOKEN" ] && [ -n "$CALLBACK_NODE_ID" ] || return 0
   command -v curl >/dev/null 2>&1 || return 0
-  json=$(printf '{"node_id":%%s,"user_id":%%s,"protocol":"%%s","inbound_tag":"%%s","session_id":"%%s","assigned_ip":"%%s","event":"%%s"}' "$CALLBACK_NODE_ID" "$uid" "$(vpn_safe "$proto")" "$(vpn_safe "$tag")" "$(vpn_safe "$session")" "$(vpn_safe "$ip")" "$event")
+  json=$(printf '{"node_id":%%s,"user_id":%%s,"protocol":"%%s","inbound_tag":"%%s","session_id":"%%s","assigned_ip":"%%s","client_ip":"%%s","event":"%%s"}' "$CALLBACK_NODE_ID" "$uid" "$(vpn_safe "$proto")" "$(vpn_safe "$tag")" "$(vpn_safe "$session")" "$(vpn_safe "$ip")" "$(vpn_safe "$client_ip")" "$event")
   curl -fsS -m 3 -H "Authorization: Bearer $CALLBACK_TOKEN" -H "Content-Type: application/json" --data "$json" "$CALLBACK_URL" >/dev/null 2>&1 || true
 }
 
@@ -82,7 +84,8 @@ vpn_admit() {
   tag=$3
   session=$4
   ip=$5
-  limit=$6
+  client_ip=$6
+  limit=$7
   [ -n "$uid" ] && [ -n "$session" ] || return 1
   case "$limit" in ''|*[!0-9]*) limit=0 ;; esac
   mkdir -p "$(dirname "$VPN_SESSIONS")"
@@ -96,12 +99,12 @@ vpn_admit() {
       rm -f "$tmp"
       exit 30
     fi
-    printf '%%s\t%%s\t%%s\t%%s\t%%s\t%%s\n' "$uid" "$proto" "$tag" "$session" "$ip" "$(date +%%s)" >> "$tmp"
+    printf '%%s\t%%s\t%%s\t%%s\t%%s\t%%s\t%%s\n' "$uid" "$proto" "$tag" "$session" "$ip" "$client_ip" "$(date +%%s)" >> "$tmp"
     mv "$tmp" "$VPN_SESSIONS"
     chmod 600 "$VPN_SESSIONS"
   ) 9>"$VPN_LOCK"
   rc=$?
-  [ "$rc" -eq 0 ] && vpn_notify start "$uid" "$proto" "$tag" "$session" "$ip"
+  [ "$rc" -eq 0 ] && vpn_notify start "$uid" "$proto" "$tag" "$session" "$ip" "$client_ip"
   return "$rc"
 }
 
@@ -111,6 +114,7 @@ vpn_release() {
   tag=$3
   session=$4
   ip=$5
+  client_ip=$6
   [ -n "$uid" ] && [ -n "$session" ] || return 0
   mkdir -p "$(dirname "$VPN_SESSIONS")"
   touch "$VPN_SESSIONS"
@@ -121,7 +125,7 @@ vpn_release() {
     mv "$tmp" "$VPN_SESSIONS"
     chmod 600 "$VPN_SESSIONS"
   ) 9>"$VPN_LOCK"
-  vpn_notify stop "$uid" "$proto" "$tag" "$session" "$ip"
+  vpn_notify stop "$uid" "$proto" "$tag" "$session" "$ip" "$client_ip"
   return 0
 }
 `, callbackPath, sessionsPath)
@@ -159,6 +163,7 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 			safeName(event.InboundTag),
 			sessionID,
 			strings.TrimSpace(event.AssignedIP),
+			strings.TrimSpace(event.ClientIP),
 			strconv.FormatInt(time.Now().Unix(), 10),
 		})
 		vpnWriteSessionRecordsLocked(path, next)

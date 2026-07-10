@@ -212,6 +212,7 @@ type wgSessionState struct {
 	UserID    int64  `json:"user_id"`
 	SessionID string `json:"session_id"`
 	Address   string `json:"address,omitempty"`
+	ClientIP  string `json:"client_ip,omitempty"`
 }
 
 func (m *wgManager) syncPeerSessions(client *wgctrl.Client, iface string, inbound wgRuntimeInbound, device *wgtypes.Device, peerByKey map[string]wgRuntimePeer, callback *vpnSessionCallback) {
@@ -233,7 +234,8 @@ func (m *wgManager) syncPeerSessions(client *wgctrl.Client, iface string, inboun
 			continue
 		}
 		sessionID := "wg:" + iface + ":" + key
-		state := wgSessionState{UserID: runtimePeer.UserID, SessionID: sessionID, Address: runtimePeer.Address}
+		clientIP := wgPeerEndpointIP(devicePeer.Endpoint)
+		state := wgSessionState{UserID: runtimePeer.UserID, SessionID: sessionID, Address: runtimePeer.Address, ClientIP: clientIP}
 		if _, ok := previous[key]; !ok {
 			event := vpnSessionEvent{
 				UserID:     runtimePeer.UserID,
@@ -241,6 +243,7 @@ func (m *wgManager) syncPeerSessions(client *wgctrl.Client, iface string, inboun
 				InboundTag: inbound.Tag,
 				SessionID:  sessionID,
 				AssignedIP: wgPeerAddressHost(runtimePeer.Address),
+				ClientIP:   clientIP,
 				Event:      "start",
 			}
 			if !vpnAdmitGoSession(vpnSessionsPath(m.baseDir), callback, event, runtimePeer.DeviceLimit) {
@@ -261,6 +264,7 @@ func (m *wgManager) syncPeerSessions(client *wgctrl.Client, iface string, inboun
 			InboundTag: inbound.Tag,
 			SessionID:  state.SessionID,
 			AssignedIP: wgPeerAddressHost(state.Address),
+			ClientIP:   state.ClientIP,
 			Event:      "stop",
 		})
 	}
@@ -305,6 +309,13 @@ func wgPeerAddressHost(address string) string {
 		return strings.TrimSpace(before)
 	}
 	return host
+}
+
+func wgPeerEndpointIP(endpoint *net.UDPAddr) string {
+	if endpoint == nil || endpoint.IP == nil {
+		return ""
+	}
+	return endpoint.IP.String()
 }
 
 func (m *wgManager) activeSessionsPath(iface string) string {

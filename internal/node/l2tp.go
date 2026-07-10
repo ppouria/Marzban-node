@@ -513,7 +513,7 @@ info=$(awk -F '\t' -v u="$peer" '$2 == u { print $1 "\t" $9; exit }' "$USERS")
 uid=$(printf '%%s' "$info" | awk -F '\t' '{print $1}')
 device_limit=$(printf '%%s' "$info" | awk -F '\t' '{print $2}')
 session=$(vpn_safe "l2tp:${pid}:${ifname}:${peer}")
-if ! vpn_admit "$uid" "l2tp" %q "$session" "$remote_ip" "$device_limit"; then
+if ! vpn_admit "$uid" "l2tp" %q "$session" "$remote_ip" "" "$device_limit"; then
   [ -n "$pid" ] && kill -TERM "$pid" >/dev/null 2>&1 || true
   exit 1
 fi
@@ -552,7 +552,7 @@ if [ -n "$PEERNAME" ] && [ -f "$SESSIONS" ]; then
   chmod 600 "$SESSIONS"
 fi
 session=$(vpn_safe "l2tp:${PPPD_PID:-$$}:${IFNAME:-}:${PEERNAME:-}")
-vpn_release "$uid" "l2tp" %q "$session" "${IPREMOTE:-}"
+vpn_release "$uid" "l2tp" %q "$session" "${IPREMOTE:-}" ""
 `, usersPath, usagePath, sessionsPath, vpnSessionShell(callbackPath, vpnSessions), safeName(inboundTag))
 }
 

@@ -746,7 +746,7 @@ info=$(awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
 uid=$(printf '%%s' "$info" | awk -F '\t' '{print $1}')
 device_limit=$(printf '%%s' "$info" | awk -F '\t' '{print $2}')
 session=$(vpn_safe "ov:${trusted_ip:-unknown}:${trusted_port:-0}:${username}")
-vpn_admit "$uid" "ov" %q "$session" "" "$device_limit" || exit 1
+vpn_admit "$uid" "ov" %q "$session" "" "${trusted_ip:-}" "$device_limit" || exit 1
 `, usersPath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 
@@ -763,7 +763,7 @@ if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
   printf 'openvpn:%%s\t%%s\n' "$uid" "$total" >> "$USAGE"
 fi
 session=$(vpn_safe "ov:${trusted_ip:-unknown}:${trusted_port:-0}:${username}")
-vpn_release "$uid" "ov" %q "$session" ""
+vpn_release "$uid" "ov" %q "$session" "" "${trusted_ip:-}"
 `, usersPath, usagePath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 
