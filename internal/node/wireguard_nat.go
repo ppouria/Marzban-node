@@ -160,6 +160,8 @@ func wgApplyTProxy(ctx context.Context, baseDir string, inbound wgRuntimeInbound
 	if err != nil {
 		return fmt.Errorf("nft executable not found")
 	}
+	pool := firstString(inbound.Settings["address_pool"], inbound.Settings["ipv4_pool_cidr"], wgDefaultPool)
+	enableVPNTProxyHostNetworking(pool)
 	dir := filepath.Join(baseDir, iface)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -207,7 +209,7 @@ func wgTProxyScript(inbound wgRuntimeInbound, iface string) string {
   chain prerouting {
     type filter hook prerouting priority mangle; policy accept;
 %s
-    iifname "%s" meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
+    iifname "%s" meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
   }
 }
 `, wgTProxyTableName(iface), strings.TrimRight(rules.String(), "\n"), iface, inbound.TunnelPort)

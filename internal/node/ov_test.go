@@ -61,7 +61,7 @@ func TestOVServerConfigRequiresDCODataCiphers(t *testing.T) {
 	}
 }
 
-func TestOVServerConfigDisablesDCOByDefault(t *testing.T) {
+func TestOVServerConfigOmitsDCOByDefault(t *testing.T) {
 	config := serverConfig(ovRuntimeInbound{
 		Tag:       "ov-no-dco",
 		Port:      1194,
@@ -69,8 +69,8 @@ func TestOVServerConfigDisablesDCOByDefault(t *testing.T) {
 		Settings:  map[string]any{"transport": "udp"},
 	}, "/tmp/ov", "/tmp/ov/ccd")
 
-	if !strings.Contains(config, "disable-dco\n") {
-		t.Fatalf("server config should disable DCO unless required:\n%s", config)
+	if strings.Contains(config, "disable-dco\n") {
+		t.Fatalf("server config should remain compatible with OpenVPN 2.5:\n%s", config)
 	}
 	if strings.Contains(config, "data-ciphers "+ovDCODataCiphers+"\n") {
 		t.Fatalf("DCO-disabled config should not force DCO data ciphers:\n%s", config)

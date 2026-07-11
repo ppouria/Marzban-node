@@ -226,7 +226,9 @@ func (m *ovManager) applyInbound(inbound ovRuntimeInbound, restart bool) error {
 	name := safeName(inbound.Tag)
 	dir := filepath.Join(m.baseDir, name)
 	tproxyEnabled := inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true)
+	pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.66.0.0/16")
 	if tproxyEnabled {
+		enableVPNTProxyHostNetworking(pool)
 		nft, err := exec.LookPath("nft")
 		if err != nil {
 			return fmt.Errorf("nft executable not found")
@@ -243,7 +245,6 @@ func (m *ovManager) applyInbound(inbound ovRuntimeInbound, restart bool) error {
 		if nft, err := exec.LookPath("nft"); err == nil {
 			_ = exec.Command(nft, "delete", "table", "inet", "rebecca_openvpn_"+safeName(inbound.Tag)).Run()
 		}
-		pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.66.0.0/16")
 		if err := vpnApplyDirectNAT("openvpn-"+inbound.Tag, tunName(inbound.Tag), pool); err != nil {
 			return fmt.Errorf("apply OV direct NAT %s: %w", inbound.Tag, err)
 		}
@@ -353,6 +354,7 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	if boolValue(settings["redirect_gateway"], true) {
 		line(&b, "push \"redirect-gateway def1\"")
 	}
+	line(&b, "push \"block-ipv6\"")
 	for _, dns := range stringList(settings["dns_servers"]) {
 		line(&b, "push \"dhcp-option DNS "+dns+"\"")
 	}
@@ -361,8 +363,6 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	}
 	if boolValue(settings["require_dco"], false) {
 		line(&b, "data-ciphers "+ovDCODataCiphers)
-	} else {
-		line(&b, "disable-dco")
 	}
 	if auth := firstString(settings["auth"]); auth != "" {
 		line(&b, "auth "+auth)
@@ -410,7 +410,7 @@ func nftScript(inbound ovRuntimeInbound, iface string) string {
   chain prerouting {
     type filter hook prerouting priority mangle; policy accept;
 %s
-    iifname "%s" meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
+    iifname "%s" meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
   }
 }
 `, safeName(inbound.Tag), strings.TrimRight(rules.String(), "\n"), iface, inbound.TunnelPort)
@@ -433,6 +433,7 @@ func ensureOVPrerequisites() error {
 	}
 	if modprobe, err := exec.LookPath("modprobe"); err == nil {
 		_ = exec.Command(modprobe, "tun").Run()
+		_ = exec.Command(modprobe, "nf_tproxy_ipv4").Run()
 	}
 	if _, err := os.Stat("/dev/net/tun"); err != nil {
 		return fmt.Errorf("TUN device is unavailable: %w", err)
@@ -542,6 +543,7 @@ func applyTProxyRouting() error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
+	enableVPNTProxyHostNetworking()
 	ip, err := exec.LookPath("ip")
 	if err != nil {
 		return fmt.Errorf("ip executable not found")

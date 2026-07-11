@@ -158,8 +158,52 @@ func enableVPNForwarding() {
 	}
 	_ = os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0o644)
 	_ = os.WriteFile("/proc/sys/net/ipv6/conf/all/forwarding", []byte("1\n"), 0o644)
-	body := "net.ipv4.ip_forward=1\nnet.ipv6.conf.all.forwarding=1\n"
+	_ = os.WriteFile("/proc/sys/net/ipv4/conf/all/rp_filter", []byte("2\n"), 0o644)
+	_ = os.WriteFile("/proc/sys/net/ipv4/conf/default/rp_filter", []byte("2\n"), 0o644)
+	body := "net.ipv4.ip_forward=1\n" +
+		"net.ipv6.conf.all.forwarding=1\n" +
+		"net.ipv4.conf.all.rp_filter=2\n" +
+		"net.ipv4.conf.default.rp_filter=2\n"
 	if err := os.WriteFile("/etc/sysctl.d/99-rebecca-vpn.conf", []byte(body), 0o644); err == nil {
 		_ = exec.Command("sysctl", "--system").Run()
 	}
+}
+
+func enableVPNTProxyHostNetworking(pools ...string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	enableVPNForwarding()
+	if modprobe, err := exec.LookPath("modprobe"); err == nil {
+		for _, module := range []string{"nf_tproxy_ipv4", "nf_conntrack"} {
+			_ = exec.Command(modprobe, module).Run()
+		}
+	}
+	trustFirewallSources(pools...)
+}
+
+func trustFirewallSources(pools ...string) {
+	if !firewalldRunning() {
+		return
+	}
+	for _, pool := range pools {
+		pool = strings.TrimSpace(pool)
+		if pool == "" {
+			continue
+		}
+		out, _ := exec.Command("firewall-cmd", "--zone=trusted", "--query-source="+pool).CombinedOutput()
+		if strings.TrimSpace(string(out)) == "yes" {
+			continue
+		}
+		_ = exec.Command("firewall-cmd", "--zone=trusted", "--add-source="+pool).Run()
+		_ = exec.Command("firewall-cmd", "--permanent", "--zone=trusted", "--add-source="+pool).Run()
+	}
+}
+
+func firewalldRunning() bool {
+	if !commandExists("firewall-cmd") {
+		return false
+	}
+	out, err := exec.Command("firewall-cmd", "--state").CombinedOutput()
+	return err == nil && strings.TrimSpace(string(out)) == "running"
 }

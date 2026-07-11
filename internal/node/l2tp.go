@@ -198,7 +198,9 @@ func (m *l2tpManager) applyInbound(inbound l2tpRuntimeInbound) error {
 	}
 	beforeSystemConfig := l2tpSystemConfigSnapshot()
 	tproxyEnabled := inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true)
+	pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.67.0.0/16")
 	if tproxyEnabled {
+		enableVPNTProxyHostNetworking(pool)
 		nft, err := exec.LookPath("nft")
 		if err != nil {
 			return fmt.Errorf("nft executable not found")
@@ -215,7 +217,6 @@ func (m *l2tpManager) applyInbound(inbound l2tpRuntimeInbound) error {
 		if nft, err := exec.LookPath("nft"); err == nil {
 			_ = exec.Command(nft, "delete", "table", "inet", "rebecca_l2tp").Run()
 		}
-		pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.67.0.0/16")
 		if err := vpnApplyDirectNAT("l2tp", "ppp+", pool); err != nil {
 			return fmt.Errorf("apply L2TP direct NAT %s: %w", inbound.Tag, err)
 		}
@@ -249,20 +250,7 @@ func (m *l2tpManager) writeSystemConfig(inbound l2tpRuntimeInbound) error {
 	settings := inbound.Settings
 	psk := firstString(settings["ipsec_psk"])
 	localIP, ipRange := l2tpPoolRange(firstString(settings["ipv4_pool_cidr"], "10.67.0.0/16"))
-	ipsecBlock := fmt.Sprintf(`conn rebecca-l2tp
-  auto=add
-  keyexchange=ikev1
-  authby=secret
-  type=transport
-  left=%%any
-  leftprotoport=17/%d
-  right=%%any
-  rightprotoport=17/%%any
-  rekey=no
-  forceencaps=yes
-  ike=aes256-sha1-modp2048,aes128-sha1-modp2048!
-  esp=aes256-sha1,aes128-sha1!
-`, l2tpFixedPort)
+	ipsecBlock := l2tpIPSecConfig(l2tpFixedPort)
 	if err := updateManagedBlock("/etc/ipsec.conf", "# BEGIN REBECCA L2TP IPSEC", "# END REBECCA L2TP IPSEC", ipsecBlock); err != nil {
 		return fmt.Errorf("update /etc/ipsec.conf: %w", err)
 	}
@@ -301,6 +289,103 @@ length bit = yes
 	return os.WriteFile("/etc/ppp/ip-down.d/rebecca-l2tp-accounting", []byte(l2tpIPDownScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), vpnSessionCallbackPath(m.baseDir), vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700)
 }
 
+func l2tpIPSecConfig(l2tpPort int) string {
+	if l2tpIPSecImplementation() == "libreswan" {
+		return l2tpLibreswanConfig(l2tpPort)
+	}
+	return fmt.Sprintf(`conn rebecca-l2tp
+  auto=add
+  keyexchange=ikev1
+  authby=secret
+  type=transport
+  left=%%any
+  leftprotoport=17/%d
+  right=%%any
+  rightprotoport=17/%%any
+  rekey=no
+  forceencaps=yes
+  fragmentation=yes
+  ike=aes256-sha2_256-modp2048,aes128-sha2_256-modp2048,aes256-sha1-modp2048,aes128-sha1-modp2048,3des-sha1-modp2048!
+  esp=aes256-sha2_256,aes128-sha2_256,aes256-sha1,aes128-sha1,3des-sha1!
+`, l2tpPort)
+}
+
+func l2tpLibreswanConfig(l2tpPort int) string {
+	major, minor, ok := libreswanVersion()
+	ikev1PolicySupported := ok && (major > 4 || (major == 4 && minor >= 2))
+	keyexchangeV1 := ok && major >= 5
+	ike := "aes256-sha2;modp2048,aes128-sha2;modp2048,aes256-sha1;modp2048,aes128-sha1;modp2048,3des-sha1;modp2048," +
+		"aes256-sha2;modp1536,aes128-sha2;modp1536,aes256-sha1;modp1536,aes128-sha1;modp1536,3des-sha1;modp1536,3des-md5;modp1536," +
+		"aes256-sha2;dh20,aes256-sha2;dh19,aes128-sha2;dh19"
+	if ipsecSupportsModp1024() {
+		ike += ",aes256-sha2;modp1024,aes128-sha2;modp1024,aes256-sha1;modp1024,aes128-sha1;modp1024,3des-sha1;modp1024,3des-md5;modp1024"
+	}
+	var b strings.Builder
+	line(&b, "config setup")
+	line(&b, "  uniqueids=no")
+	if ikev1PolicySupported {
+		line(&b, "  ikev1-policy=accept")
+	}
+	line(&b, "")
+	line(&b, "conn rebecca-l2tp")
+	line(&b, "  auto=add")
+	line(&b, fmt.Sprintf("  leftprotoport=17/%d", l2tpPort))
+	line(&b, "  rightprotoport=17/%any")
+	line(&b, "  type=transport")
+	line(&b, "  authby=secret")
+	line(&b, "  pfs=no")
+	line(&b, "  rekey=no")
+	line(&b, "  dpddelay=40")
+	line(&b, "  dpdtimeout=130")
+	if keyexchangeV1 {
+		line(&b, "  keyexchange=ikev1")
+	} else {
+		line(&b, "  keyexchange=ike")
+		line(&b, "  ikev2=no")
+	}
+	line(&b, "  ike="+ike)
+	line(&b, "  phase2alg=aes256-sha2,aes128-sha2,aes256-sha1,aes128-sha1,3des-sha1,aes256-md5,aes128-md5,3des-md5")
+	line(&b, "  left=%defaultroute")
+	line(&b, "  right=%any")
+	return b.String()
+}
+
+func l2tpIPSecImplementation() string {
+	version := strings.ToLower(commandOutput("ipsec", "--version"))
+	if strings.Contains(version, "libreswan") {
+		return "libreswan"
+	}
+	return "strongswan"
+}
+
+func libreswanVersion() (int, int, bool) {
+	version := strings.ToLower(commandOutput("ipsec", "--version"))
+	if !strings.Contains(version, "libreswan") {
+		return 0, 0, false
+	}
+	for _, field := range strings.Fields(version) {
+		field = strings.Trim(field, "v,;()[]")
+		parts := strings.Split(field, ".")
+		if len(parts) < 2 {
+			continue
+		}
+		major, err1 := strconv.Atoi(parts[0])
+		minor, err2 := strconv.Atoi(parts[1])
+		if err1 == nil && err2 == nil {
+			return major, minor, true
+		}
+	}
+	return 0, 0, false
+}
+
+func ipsecSupportsModp1024() bool {
+	if l2tpIPSecImplementation() != "libreswan" {
+		return false
+	}
+	output, _ := exec.Command("ipsec", "pluto", "--selftest").CombinedOutput()
+	return strings.Contains(strings.ToUpper(string(output)), "MODP1024")
+}
+
 func l2tpPPPOptions(inbound l2tpRuntimeInbound) string {
 	inbound = normalizeL2TPRuntimeInbound(inbound)
 	var b strings.Builder
@@ -316,6 +401,8 @@ func l2tpPPPOptions(inbound l2tpRuntimeInbound) string {
 	line(&b, "asyncmap 0")
 	line(&b, "auth")
 	line(&b, "require-mschap-v2")
+	line(&b, "noccp")
+	line(&b, "noipv6")
 	line(&b, "name rebecca-l2tp")
 	if mtu := boundedInt(inbound.Settings["mtu"], 1410, 576, 1500); mtu > 0 {
 		line(&b, fmt.Sprintf("mtu %d", mtu))
@@ -418,7 +505,7 @@ func l2tpNFTScript(inbound l2tpRuntimeInbound) string {
   chain prerouting {
     type filter hook prerouting priority mangle; policy accept;
 %s
-    iifname "ppp*" meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
+    iifname "ppp*" meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
   }
 }
 `, strings.TrimRight(rules.String(), "\n"), inbound.TunnelPort)
@@ -635,11 +722,14 @@ func installL2TPPackages() error {
 		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
 			return err
 		}
+		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "libreswan", "xl2tpd", "ppp", "nftables", "iproute2", "iptables", "kmod"); err == nil {
+			return nil
+		}
 		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "strongswan", "xl2tpd", "ppp", "nftables", "iproute2", "iptables", "kmod")
 	case commandExists("dnf"):
-		return runInstallCommand(nil, "dnf", "install", "-y", "strongswan", "xl2tpd", "ppp", "nftables", "iproute", "iptables", "kmod")
+		return runInstallCommand(nil, "dnf", "install", "-y", "libreswan", "xl2tpd", "ppp", "nftables", "iproute", "iptables", "kmod")
 	case commandExists("yum"):
-		return runInstallCommand(nil, "yum", "install", "-y", "strongswan", "xl2tpd", "ppp", "nftables", "iproute", "iptables", "kmod")
+		return runInstallCommand(nil, "yum", "install", "-y", "libreswan", "xl2tpd", "ppp", "nftables", "iproute", "iptables", "kmod")
 	case commandExists("apk"):
 		return runInstallCommand(nil, "apk", "add", "strongswan", "xl2tpd", "ppp", "nftables", "iproute2", "iptables", "kmod")
 	default:
@@ -656,7 +746,9 @@ func loadL2TPKernelModules() error {
 			return fmt.Errorf("load kernel module %s: %v: %s", module, err, strings.TrimSpace(string(output)))
 		}
 	}
-	_ = exec.Command("modprobe", "pppol2tp").Run()
+	for _, module := range []string{"pppol2tp", "af_key", "nf_tproxy_ipv4"} {
+		_ = exec.Command("modprobe", module).Run()
+	}
 	return nil
 }
 
@@ -723,7 +815,8 @@ func l2tpSystemConfigSnapshot() string {
 }
 
 func l2tpServicesRunning() bool {
-	return exec.Command("pgrep", "-x", "xl2tpd").Run() == nil && exec.Command("pgrep", "-x", "charon").Run() == nil
+	ipsecRunning := exec.Command("pgrep", "-x", "charon").Run() == nil || exec.Command("pgrep", "-x", "pluto").Run() == nil
+	return exec.Command("pgrep", "-x", "xl2tpd").Run() == nil && ipsecRunning
 }
 
 func commandOutput(name string, args ...string) string {

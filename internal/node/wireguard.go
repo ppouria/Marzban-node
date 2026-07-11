@@ -923,7 +923,7 @@ func loadWGKernelModule() error {
 	// The wireguard module is built-in on modern kernels; a failed modprobe there
 	// is harmless. Only fail if wgctrl still cannot see the module afterwards.
 	_ = exec.Command("modprobe", "wireguard").Run()
-	for _, module := range []string{"nf_conntrack", "nf_nat", "iptable_nat", "iptable_filter"} {
+	for _, module := range []string{"nf_conntrack", "nf_nat", "iptable_nat", "iptable_filter", "nf_tproxy_ipv4"} {
 		_ = exec.Command("modprobe", module).Run()
 	}
 	client, err := wgctrl.New()

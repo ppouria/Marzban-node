@@ -154,7 +154,9 @@ func (m *pptpManager) applyInbound(inbound pptpRuntimeInbound) error {
 	}
 	beforeSystemConfig := pptpSystemConfigSnapshot()
 	tproxyEnabled := inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true)
+	pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.68.0.0/16")
 	if tproxyEnabled {
+		enableVPNTProxyHostNetworking(pool)
 		nft, err := exec.LookPath("nft")
 		if err != nil {
 			return fmt.Errorf("nft executable not found")
@@ -171,7 +173,6 @@ func (m *pptpManager) applyInbound(inbound pptpRuntimeInbound) error {
 		if nft, err := exec.LookPath("nft"); err == nil {
 			_ = exec.Command(nft, "delete", "table", "inet", "rebecca_pptp").Run()
 		}
-		pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.68.0.0/16")
 		if err := vpnApplyDirectNAT("pptp", "ppp+", pool); err != nil {
 			return fmt.Errorf("apply PPTP direct NAT %s: %w", inbound.Tag, err)
 		}
@@ -199,7 +200,7 @@ func (m *pptpManager) stop() {
 }
 
 func (m *pptpManager) writeSystemConfig(inbound pptpRuntimeInbound) error {
-	localIP, ipRange := l2tpPoolRange(firstString(inbound.Settings["ipv4_pool_cidr"], "10.68.0.0/16"))
+	localIP, ipRange := l2tpPoolRange(firstString(inbound.Settings["ipv4_pool_cidr"], "10.68.0.0/24"))
 	ipRange = pptpPoolRange(ipRange)
 	pptpdConf := fmt.Sprintf(`option /etc/ppp/pptpd-options
 localip %s
@@ -250,6 +251,8 @@ func pptpPPPOptions(inbound pptpRuntimeInbound) string {
 	line(&b, "refuse-pap")
 	line(&b, "refuse-chap")
 	line(&b, "refuse-mschap")
+	line(&b, "require-mppe-128")
+	line(&b, "noipv6")
 	line(&b, "proxyarp")
 	line(&b, "nodefaultroute")
 	line(&b, "lock")
@@ -322,7 +325,7 @@ func pptpNFTScript(inbound pptpRuntimeInbound) string {
   chain prerouting {
     type filter hook prerouting priority mangle; policy accept;
 %s
-    iifname "ppp*" meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
+    iifname "ppp*" meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
   }
 }
 `, strings.TrimRight(rules.String(), "\n"), inbound.TunnelPort)
@@ -463,7 +466,9 @@ func loadPPTPKernelModules() error {
 			return fmt.Errorf("load kernel module %s: %v: %s", module, err, strings.TrimSpace(string(output)))
 		}
 	}
-	_ = exec.Command("modprobe", "nf_conntrack_pptp").Run()
+	for _, module := range []string{"nf_conntrack_pptp", "ip_gre", "nf_tproxy_ipv4"} {
+		_ = exec.Command("modprobe", module).Run()
+	}
 	return nil
 }
 
