@@ -4,8 +4,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -93,65 +91,6 @@ func New(settings appconfig.Settings) (*Server, error) {
 	}
 	server.startCachedConfig()
 	return server, nil
-}
-
-func (s *Server) ListenAndServeTLS() error {
-	cert, err := tls.LoadX509KeyPair(s.settings.SSLCertFile, s.settings.SSLKeyFile)
-	if err != nil {
-		return err
-	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}
-	if strings.TrimSpace(s.settings.SSLClientCertFile) != "" && fileExists(s.settings.SSLClientCertFile) {
-		clientCAPEM, err := os.ReadFile(s.settings.SSLClientCertFile)
-		if err != nil {
-			return err
-		}
-		clientCAs := x509.NewCertPool()
-		if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
-			return errors.New("failed to load SSL_CLIENT_CERT_FILE")
-		}
-		tlsConfig.ClientCAs = clientCAs
-		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
-	}
-	server := &http.Server{
-		Addr:      fmt.Sprintf("%s:%d", s.settings.ServiceHost, s.settings.ServicePort),
-		Handler:   s.routes(),
-		TLSConfig: tlsConfig,
-	}
-	return server.ListenAndServeTLS("", "")
-}
-
-func (s *Server) routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleBase)
-	mux.HandleFunc("/connect", s.handleConnect)
-	mux.HandleFunc("/disconnect", s.handleDisconnect)
-	mux.HandleFunc("/ping", s.handlePing)
-	mux.HandleFunc("/start", s.handleStart)
-	mux.HandleFunc("/stop", s.handleStop)
-	mux.HandleFunc("/restart", s.handleRestart)
-	mux.HandleFunc("/update_core", s.handleUpdateCore)
-	mux.HandleFunc("/update_geo", s.handleUpdateGeo)
-	mux.HandleFunc("/service/restart", s.handleServiceRestart)
-	mux.HandleFunc("/service/update", s.handleServiceUpdate)
-	mux.HandleFunc("/host/reboot", s.handleHostReboot)
-	mux.HandleFunc("/usage/users", s.handleUserUsage)
-	mux.HandleFunc("/usage/users/ack", s.handleUserUsageAck)
-	mux.HandleFunc("/usage/outbounds", s.handleOutboundUsage)
-	mux.HandleFunc("/usage/outbounds/ack", s.handleOutboundUsageAck)
-	mux.HandleFunc("/inbounds/users/add", s.handleAddInboundUser)
-	mux.HandleFunc("/inbounds/users/remove", s.handleRemoveInboundUser)
-	mux.HandleFunc("/helpers/x25519", s.handleX25519)
-	mux.HandleFunc("/helpers/mldsa65", s.handleMLDSA65)
-	mux.HandleFunc("/helpers/ech", s.handleECH)
-	mux.HandleFunc("/outbounds/test", s.handleOutboundTest)
-	mux.HandleFunc("/access_logs", s.handleAccessLogs)
-	mux.HandleFunc("/logs", s.handleLogs)
-	return mux
 }
 
 func (s *Server) handleBase(w http.ResponseWriter, r *http.Request) {
