@@ -200,7 +200,7 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound, callback *vpnSessionC
 		}
 	}
 	for path, content := range map[string]string{
-		filepath.Join(dir, "auth.sh"):              authScript(usersPath, callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag),
+		filepath.Join(dir, "auth.sh"):              authScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag),
 		filepath.Join(dir, "client-disconnect.sh"): disconnectScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag),
 		filepath.Join(dir, "nftables.nft"):         nftScript(inbound, tunName(inbound.Tag)),
 		filepath.Join(dir, "server.conf"):          serverConfig(inbound, dir, ccdDir),
@@ -735,26 +735,35 @@ func ovDCOInactiveReason(logText string) string {
 	return ""
 }
 
-func authScript(usersPath string, callbackPath string, sessionsPath string, inboundTag string) string {
+func authScript(usersPath string, usagePath string, callbackPath string, sessionsPath string, inboundTag string) string {
 	return fmt.Sprintf(`#!/bin/sh
 USERS=%q
+USAGE=%q
 now=$(date +%%s)
 %s
+touch "$USAGE" 2>/dev/null || true
 info=$(awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
+  FNR == NR {
+    id=$1
+    sub(/^openvpn:/, "", id)
+    if (id != "" && $2 > 0) pending[id] += $2
+    next
+  }
   $2 == u && $3 == p && ($7 == "" || $7 == "active" || $7 == "on_hold") {
-    if ($6 != "" && $5 >= $6) exit 2
+    used = $5 + pending[$1]
+    if ($6 != "" && used >= $6) exit 2
     if ($8 != "" && now >= $8) exit 3
     print $1 "\t" $9
     found=1
     exit 0
   }
   END { exit found ? 0 : 1 }
-' "$USERS") || exit 1
+' "$USAGE" "$USERS") || exit 1
 uid=$(printf '%%s' "$info" | awk -F '\t' '{print $1}')
 device_limit=$(printf '%%s' "$info" | awk -F '\t' '{print $2}')
 session=$(vpn_safe "ov:${trusted_ip:-unknown}:${trusted_port:-0}:${username}")
 vpn_admit "$uid" "ov" %q "$session" "" "${trusted_ip:-}" "$device_limit" || exit 1
-`, usersPath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
+`, usersPath, usagePath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 
 func disconnectScript(usersPath string, usagePath string, callbackPath string, sessionsPath string, inboundTag string) string {
