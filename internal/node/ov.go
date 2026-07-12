@@ -398,6 +398,7 @@ func nftScript(inbound ovRuntimeInbound, iface string) string {
 	if inbound.TunnelPort <= 0 || !boolValue(inbound.Settings["tproxy_enabled"], true) {
 		return ""
 	}
+	pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.66.0.0/16")
 	blockedV4, blockedV6 := ovBlockedDestinations()
 	var rules strings.Builder
 	if len(blockedV4) > 0 {
@@ -412,8 +413,12 @@ func nftScript(inbound ovRuntimeInbound, iface string) string {
 %s
     iifname "%s" meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
   }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr %s oifname != "%s" meta l4proto icmp masquerade
+  }
 }
-`, safeName(inbound.Tag), strings.TrimRight(rules.String(), "\n"), iface, inbound.TunnelPort)
+`, safeName(inbound.Tag), strings.TrimRight(rules.String(), "\n"), iface, inbound.TunnelPort, pool, iface)
 }
 
 func ensureOVPrerequisites() error {

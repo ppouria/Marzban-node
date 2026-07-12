@@ -93,3 +93,24 @@ func TestOVDCOInactiveReasonDetectsFallback(t *testing.T) {
 		t.Fatal("expected inactive DCO reason")
 	}
 }
+
+func TestOVTProxyMasqueradesICMP(t *testing.T) {
+	script := nftScript(ovRuntimeInbound{
+		Tag:        "ov",
+		TunnelPort: 41940,
+		Settings: map[string]any{
+			"tproxy_enabled": true,
+			"ipv4_pool_cidr": "10.66.0.0/16",
+		},
+	}, "rbov12345678")
+
+	for _, want := range []string{
+		"meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:41940",
+		"type nat hook postrouting priority srcnat",
+		"ip saddr 10.66.0.0/16 oifname != \"rbov12345678\" meta l4proto icmp masquerade",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("nft script missing %q:\n%s", want, script)
+		}
+	}
+}
