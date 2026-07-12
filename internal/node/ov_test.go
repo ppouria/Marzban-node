@@ -79,6 +79,19 @@ func TestOVServerConfigOmitsDCOByDefault(t *testing.T) {
 	}
 }
 
+func TestOVServerConfigAllowsSharedClientCertificate(t *testing.T) {
+	config := serverConfig(ovRuntimeInbound{
+		Tag:       "ov",
+		Port:      1194,
+		Transport: "udp",
+		Settings:  map[string]any{"transport": "udp"},
+	}, "/tmp/ov", "/tmp/ov/ccd")
+
+	if !strings.Contains(config, "duplicate-cn\n") {
+		t.Fatalf("server config should allow shared client certs:\n%s", config)
+	}
+}
+
 func TestOVDCORejectsLegacyCipher(t *testing.T) {
 	err := validateOVDCOSettings(ovRuntimeInbound{
 		Tag:      "ov",

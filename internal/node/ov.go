@@ -540,6 +540,7 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	line(&b, "client-config-dir "+ccdDir)
 	line(&b, "verify-client-cert none")
 	line(&b, "username-as-common-name")
+	line(&b, "duplicate-cn")
 	line(&b, "script-security 3")
 	line(&b, "auth-user-pass-verify "+filepath.Join(dir, "auth.sh")+" via-env")
 	line(&b, "client-disconnect "+filepath.Join(dir, "client-disconnect.sh"))
