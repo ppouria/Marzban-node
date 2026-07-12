@@ -1,6 +1,8 @@
 package node
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -125,6 +127,45 @@ func TestOVAuthCountsPendingUsage(t *testing.T) {
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("auth script missing %q:\n%s", want, script)
+		}
+	}
+}
+
+func TestOVCollectUsageReadsStatusDeltas(t *testing.T) {
+	dir := t.TempDir()
+	inboundDir := filepath.Join(dir, "openvpn", "edge")
+	if err := os.MkdirAll(inboundDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inboundDir, "users.tsv"), []byte("42\talice\tpass\t10.66.0.2\t100\t1000\tactive\t\t0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status := "CLIENT_LIST,alice,198.51.100.10:5555,10.66.0.2,200,300,now,0,UNDEF,1,0\n"
+	if err := os.WriteFile(filepath.Join(inboundDir, "status.log"), []byte(status), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := newOVManager(dir, "binary")
+
+	stats := manager.CollectUsage()
+	if len(stats) != 1 || stats[0].UID != "openvpn:42" || stats[0].Value != 500 {
+		t.Fatalf("unexpected first stats: %#v", stats)
+	}
+	stats = manager.CollectUsage()
+	if len(stats) != 0 {
+		t.Fatalf("second collect should have no duplicate delta: %#v", stats)
+	}
+}
+
+func TestOVDisconnectSubtractsAccountedUsage(t *testing.T) {
+	script := disconnectScript("/tmp/users.tsv", "/tmp/usage.tsv", "/tmp/accounting.tsv", "/tmp/callback.env", "/tmp/sessions.tsv", "edge")
+	for _, want := range []string{
+		"previous=$(awk",
+		"delta=$((total - previous))",
+		"printf 'openvpn:%s\\t%s\\n' \"$uid\" \"$delta\"",
+		"awk -F '\\t' -v sid=\"$session\" '$1 != sid { print }'",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("disconnect script missing %q:\n%s", want, script)
 		}
 	}
 }

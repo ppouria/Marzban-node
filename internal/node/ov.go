@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha1"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -58,6 +59,28 @@ type ovManager struct {
 }
 
 const ovDCODataCiphers = "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"
+
+type ovUserSnapshot struct {
+	UserID      string
+	Username    string
+	UsedTraffic int64
+	DataLimit   int64
+}
+
+type ovLiveSession struct {
+	SessionID string
+	Username  string
+	UserID    string
+	Total     int64
+	Base      int64
+	Limit     int64
+}
+
+type ovAccountingRecord struct {
+	UserID string
+	Total  int64
+	Base   int64
+}
 
 func newOVManager(dataDir string, installMode string) *ovManager {
 	return &ovManager{
@@ -134,27 +157,27 @@ func (m *ovManager) CollectUsage() []xray.UserStat {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	stats := map[string]int64{}
 	path := filepath.Join(m.baseDir, "usage.tsv")
 	file, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer file.Close()
-	stats := map[string]int64{}
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parts := strings.Split(scanner.Text(), "\t")
-		if len(parts) < 2 {
-			continue
+	if err == nil {
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			parts := strings.Split(scanner.Text(), "\t")
+			if len(parts) < 2 {
+				continue
+			}
+			uid := strings.TrimSpace(parts[0])
+			value, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+			if uid == "" || value <= 0 {
+				continue
+			}
+			stats[uid] += value
 		}
-		uid := strings.TrimSpace(parts[0])
-		value, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
-		if uid == "" || value <= 0 {
-			continue
-		}
-		stats[uid] += value
+		_ = os.WriteFile(path, nil, 0o600)
 	}
-	_ = os.WriteFile(path, nil, 0o600)
+	m.collectLiveUsageLocked(stats)
 	out := make([]xray.UserStat, 0, len(stats))
 	for uid, value := range stats {
 		out = append(out, xray.UserStat{UID: uid, Value: value})
@@ -201,7 +224,7 @@ func (m *ovManager) writeInbound(inbound ovRuntimeInbound, callback *vpnSessionC
 	}
 	for path, content := range map[string]string{
 		filepath.Join(dir, "auth.sh"):              authScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag),
-		filepath.Join(dir, "client-disconnect.sh"): disconnectScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag),
+		filepath.Join(dir, "client-disconnect.sh"): disconnectScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "accounting.tsv"), callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag),
 		filepath.Join(dir, "nftables.nft"):         nftScript(inbound, tunName(inbound.Tag)),
 		filepath.Join(dir, "server.conf"):          serverConfig(inbound, dir, ccdDir),
 	} {
@@ -258,6 +281,7 @@ func (m *ovManager) applyInbound(inbound ovRuntimeInbound, restart bool) error {
 	}
 	pidPath := filepath.Join(dir, "openvpn.pid")
 	_ = os.Remove(filepath.Join(dir, "openvpn.log"))
+	_ = os.Remove(filepath.Join(dir, "management.sock"))
 	cmd := exec.Command(openvpn, "--config", filepath.Join(dir, "server.conf"), "--daemon", "rebecca-openvpn-"+name, "--writepid", pidPath)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("start OV %s: %v: %s", inbound.Tag, err, startOVErrorDetail(output, filepath.Join(dir, "openvpn.log")))
@@ -315,6 +339,180 @@ func (m *ovManager) stopInboundName(name string) {
 		_ = exec.Command(nft, "delete", "table", "inet", "rebecca_openvpn_"+safeName(name)).Run()
 	}
 	_ = vpnRemoveDirectNAT("openvpn-" + name)
+}
+
+func (m *ovManager) collectLiveUsageLocked(stats map[string]int64) {
+	accountingPath := filepath.Join(m.baseDir, "accounting.tsv")
+	_ = withVPNFileLock(accountingPath+".lock", func() {
+		records := readOVAccounting(accountingPath)
+		if entries, err := os.ReadDir(m.baseDir); err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				dir := filepath.Join(m.baseDir, entry.Name())
+				users := readOVUsers(filepath.Join(dir, "users.tsv"))
+				for _, session := range readOVStatus(filepath.Join(dir, "status.log"), users) {
+					record := records[session.SessionID]
+					if record.UserID == "" {
+						record.UserID = session.UserID
+					}
+					if record.Base <= 0 {
+						record.Base = session.Base
+					}
+					if session.Total > record.Total {
+						stats["openvpn:"+session.UserID] += session.Total - record.Total
+					}
+					record.Total = session.Total
+					records[session.SessionID] = record
+					if session.Limit > 0 && record.Base+session.Total >= session.Limit {
+						killOVClient(dir, session.Username)
+					}
+				}
+			}
+		}
+		writeOVAccounting(accountingPath, records)
+	})
+}
+
+func readOVUsers(path string) map[string]ovUserSnapshot {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	users := map[string]ovUserSnapshot{}
+	for _, lineText := range strings.Split(string(raw), "\n") {
+		parts := strings.Split(strings.TrimSpace(lineText), "\t")
+		if len(parts) < 6 {
+			continue
+		}
+		used, _ := strconv.ParseInt(parts[4], 10, 64)
+		limit, _ := strconv.ParseInt(parts[5], 10, 64)
+		if parts[1] == "" || parts[0] == "" {
+			continue
+		}
+		users[parts[1]] = ovUserSnapshot{
+			UserID:      parts[0],
+			Username:    parts[1],
+			UsedTraffic: used,
+			DataLimit:   limit,
+		}
+	}
+	return users
+}
+
+func readOVStatus(path string, users map[string]ovUserSnapshot) []ovLiveSession {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	reader := csv.NewReader(file)
+	reader.FieldsPerRecord = -1
+	var sessions []ovLiveSession
+	for {
+		record, err := reader.Read()
+		if err != nil {
+			break
+		}
+		if len(record) < 6 || record[0] != "CLIENT_LIST" {
+			continue
+		}
+		user, ok := users[strings.TrimSpace(record[1])]
+		if !ok {
+			continue
+		}
+		rx, _ := strconv.ParseInt(strings.TrimSpace(record[4]), 10, 64)
+		tx, _ := strconv.ParseInt(strings.TrimSpace(record[5]), 10, 64)
+		total := rx + tx
+		if total <= 0 {
+			continue
+		}
+		sessionID := safeName("ov:" + strings.TrimSpace(record[2]) + ":" + user.Username)
+		sessions = append(sessions, ovLiveSession{
+			SessionID: sessionID,
+			Username:  user.Username,
+			UserID:    user.UserID,
+			Total:     total,
+			Base:      user.UsedTraffic,
+			Limit:     user.DataLimit,
+		})
+	}
+	return sessions
+}
+
+func readOVAccounting(path string) map[string]ovAccountingRecord {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]ovAccountingRecord{}
+	}
+	records := map[string]ovAccountingRecord{}
+	for _, lineText := range strings.Split(string(raw), "\n") {
+		parts := strings.Split(strings.TrimSpace(lineText), "\t")
+		if len(parts) < 3 || parts[0] == "" || parts[1] == "" {
+			continue
+		}
+		total, _ := strconv.ParseInt(parts[2], 10, 64)
+		base := int64(0)
+		if len(parts) >= 4 {
+			base, _ = strconv.ParseInt(parts[3], 10, 64)
+		}
+		records[parts[0]] = ovAccountingRecord{UserID: parts[1], Total: total, Base: base}
+	}
+	return records
+}
+
+func writeOVAccounting(path string, records map[string]ovAccountingRecord) {
+	var b strings.Builder
+	for session, record := range records {
+		if session == "" || record.UserID == "" {
+			continue
+		}
+		b.WriteString(session)
+		b.WriteByte('\t')
+		b.WriteString(record.UserID)
+		b.WriteByte('\t')
+		b.WriteString(strconv.FormatInt(record.Total, 10))
+		b.WriteByte('\t')
+		b.WriteString(strconv.FormatInt(record.Base, 10))
+		b.WriteByte('\n')
+	}
+	_ = os.WriteFile(path, []byte(b.String()), 0o600)
+}
+
+func killOVClient(dir string, username string) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return
+	}
+	username = strings.NewReplacer("\r", "", "\n", "").Replace(username)
+	conn, err := net.DialTimeout("unix", filepath.Join(dir, "management.sock"), 2*time.Second)
+	if err != nil {
+		if port := ovManagementPort(filepath.Join(dir, "server.conf")); port > 0 {
+			conn, err = net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(port), 2*time.Second)
+		}
+		if err != nil {
+			return
+		}
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	_, _ = fmt.Fprintf(conn, "kill %s\nquit\n", username)
+}
+
+func ovManagementPort(configPath string) int {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return 0
+	}
+	for _, lineText := range strings.Split(string(raw), "\n") {
+		fields := strings.Fields(lineText)
+		if len(fields) >= 3 && fields[0] == "management" && fields[1] == "127.0.0.1" {
+			port, _ := strconv.Atoi(fields[2])
+			return port
+		}
+	}
+	return 0
 }
 
 func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
@@ -390,6 +588,8 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	}
 	if managementPort := intValue(settings["management_port"]); managementPort > 0 {
 		line(&b, "management 127.0.0.1 "+strconv.Itoa(managementPort))
+	} else {
+		line(&b, "management "+filepath.Join(dir, "management.sock")+" unix")
 	}
 	return b.String()
 }
@@ -766,21 +966,37 @@ vpn_admit "$uid" "ov" %q "$session" "" "${trusted_ip:-}" "$device_limit" || exit
 `, usersPath, usagePath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 
-func disconnectScript(usersPath string, usagePath string, callbackPath string, sessionsPath string, inboundTag string) string {
+func disconnectScript(usersPath string, usagePath string, accountingPath string, callbackPath string, sessionsPath string, inboundTag string) string {
 	return fmt.Sprintf(`#!/bin/sh
 USERS=%q
 USAGE=%q
+ACCOUNTING=%q
+ACCOUNTING_LOCK="${ACCOUNTING}.lock"
 %s
 uid=$(awk -F '\t' -v u="$username" '$2 == u { print $1; exit }' "$USERS")
 rx=${bytes_received:-0}
 tx=${bytes_sent:-0}
 total=$((rx + tx))
-if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
-  printf 'openvpn:%%s\t%%s\n' "$uid" "$total" >> "$USAGE"
-fi
 session=$(vpn_safe "ov:${trusted_ip:-unknown}:${trusted_port:-0}:${username}")
+if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
+  mkdir -p "$(dirname "$ACCOUNTING")"
+  touch "$ACCOUNTING"
+  (
+    flock -x 9 || exit 0
+    previous=$(awk -F '\t' -v sid="$session" '$1 == sid { print $3; found=1; exit } END { if (!found) print 0 }' "$ACCOUNTING")
+    case "$previous" in ''|*[!0-9]*) previous=0 ;; esac
+    delta=$((total - previous))
+    if [ "$delta" -gt 0 ]; then
+      printf 'openvpn:%%s\t%%s\n' "$uid" "$delta" >> "$USAGE"
+    fi
+    tmp="${ACCOUNTING}.$$"
+    awk -F '\t' -v sid="$session" '$1 != sid { print }' "$ACCOUNTING" > "$tmp"
+    mv "$tmp" "$ACCOUNTING"
+    chmod 600 "$ACCOUNTING"
+  ) 9>"$ACCOUNTING_LOCK"
+fi
 vpn_release "$uid" "ov" %q "$session" "" "${trusted_ip:-}"
-`, usersPath, usagePath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
+`, usersPath, usagePath, accountingPath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 
 func usersTSV(users []ovRuntimeUser) string {
