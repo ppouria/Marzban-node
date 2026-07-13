@@ -87,3 +87,27 @@ func TestVPNSessionLedgerCountsClientIPOnce(t *testing.T) {
 		t.Fatal("expected different client IP to be rejected")
 	}
 }
+
+func TestVPNSessionLedgerRejectsAssignedIPConflict(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpn-sessions.tsv")
+	if !vpnAdmitGoSession(path, nil, vpnSessionEvent{
+		UserID:     42,
+		Protocol:   "ov",
+		InboundTag: "ov-main",
+		SessionID:  "ov:one",
+		AssignedIP: "10.66.0.2",
+		Event:      "start",
+	}, 0) {
+		t.Fatal("expected first OpenVPN session to be admitted")
+	}
+	if vpnAdmitGoSession(path, nil, vpnSessionEvent{
+		UserID:     43,
+		Protocol:   "ov",
+		InboundTag: "ov-main",
+		SessionID:  "ov:two",
+		AssignedIP: "10.66.0.2",
+		Event:      "start",
+	}, 0) {
+		t.Fatal("expected duplicate assigned IP to be rejected")
+	}
+}

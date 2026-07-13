@@ -547,7 +547,7 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	line(&b, "keepalive 10 300")
 	line(&b, "persist-key")
 	line(&b, "persist-tun")
-	line(&b, "status "+filepath.Join(dir, "status.log")+" 60")
+	line(&b, "status "+filepath.Join(dir, "status.log")+" 5")
 	line(&b, "log-append "+filepath.Join(dir, "openvpn.log"))
 	line(&b, "verb 3")
 	if boolValue(settings["redirect_gateway"], true) {
@@ -954,16 +954,17 @@ info=$(awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
     used = $5 + pending[$1]
     if ($6 != "" && used >= $6) exit 2
     if ($8 != "" && now >= $8) exit 3
-    print $1 "\t" $9
+    print $1 "\t" $4 "\t" $9
     found=1
     exit 0
   }
   END { exit found ? 0 : 1 }
 ' "$USAGE" "$USERS") || exit 1
 uid=$(printf '%%s' "$info" | awk -F '\t' '{print $1}')
-device_limit=$(printf '%%s' "$info" | awk -F '\t' '{print $2}')
+assigned_ip=$(printf '%%s' "$info" | awk -F '\t' '{print $2}')
+device_limit=$(printf '%%s' "$info" | awk -F '\t' '{print $3}')
 session=$(vpn_safe "ov:${trusted_ip:-unknown}:${trusted_port:-0}:${username}")
-vpn_admit "$uid" "ov" %q "$session" "" "${trusted_ip:-}" "$device_limit" || exit 1
+vpn_admit "$uid" "ov" %q "$session" "$assigned_ip" "${trusted_ip:-}" "$device_limit" || exit 1
 `, usersPath, usagePath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 
@@ -974,7 +975,9 @@ USAGE=%q
 ACCOUNTING=%q
 ACCOUNTING_LOCK="${ACCOUNTING}.lock"
 %s
-uid=$(awk -F '\t' -v u="$username" '$2 == u { print $1; exit }' "$USERS")
+info=$(awk -F '\t' -v u="$username" '$2 == u { print $1 "\t" $4; exit }' "$USERS")
+uid=$(printf '%%s' "$info" | awk -F '\t' '{print $1}')
+assigned_ip=$(printf '%%s' "$info" | awk -F '\t' '{print $2}')
 rx=${bytes_received:-0}
 tx=${bytes_sent:-0}
 total=$((rx + tx))
@@ -996,7 +999,7 @@ if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
     chmod 600 "$ACCOUNTING"
   ) 9>"$ACCOUNTING_LOCK"
 fi
-vpn_release "$uid" "ov" %q "$session" "" "${trusted_ip:-}"
+vpn_release "$uid" "ov" %q "$session" "$assigned_ip" "${trusted_ip:-}"
 `, usersPath, usagePath, accountingPath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 

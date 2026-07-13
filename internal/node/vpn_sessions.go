@@ -133,6 +133,14 @@ vpn_admit() {
       }
       END { print found+0 }
     ' "$tmp")
+    ip_conflict=$(awk -F '\t' -v proto="$proto" -v tag="$tag" -v ip="$ip" '
+      ip != "" && $2 == proto && $3 == tag && $5 == ip { found = 1 }
+      END { print found+0 }
+    ' "$tmp")
+    if [ "$ip_conflict" -eq 1 ]; then
+      rm -f "$tmp"
+      exit 31
+    fi
     if [ "$limit" -gt 0 ] && [ "$count" -ge "$limit" ] && [ "$exists" -eq 0 ]; then
       rm -f "$tmp"
       exit 30
@@ -189,8 +197,16 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 		uidText := strconv.FormatInt(event.UserID, 10)
 		deviceKey := vpnSessionDeviceKey(event.AssignedIP, event.ClientIP, sessionID)
 		hasDevice := false
+		assignedIPInUse := false
 		devices := map[string]struct{}{}
 		for _, record := range next {
+			if len(record) >= 5 &&
+				record[1] == normalizedVPNProtocol(event.Protocol) &&
+				record[2] == safeName(event.InboundTag) &&
+				record[4] != "" &&
+				record[4] == strings.TrimSpace(event.AssignedIP) {
+				assignedIPInUse = true
+			}
 			if len(record) >= 1 && record[0] == uidText {
 				key := vpnRecordDeviceKey(record)
 				if key == "" {
@@ -204,6 +220,9 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 					count++
 				}
 			}
+		}
+		if assignedIPInUse {
+			return
 		}
 		if limit > 0 && int64(count) >= limit && !hasDevice {
 			return

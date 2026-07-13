@@ -90,6 +90,9 @@ func TestOVServerConfigAllowsSharedClientCertificate(t *testing.T) {
 	if !strings.Contains(config, "duplicate-cn\n") {
 		t.Fatalf("server config should allow shared client certs:\n%s", config)
 	}
+	if !strings.Contains(config, "status ") || !strings.Contains(config, "status.log 5\n") {
+		t.Fatalf("server config should refresh status quickly:\n%s", config)
+	}
 }
 
 func TestOVDCORejectsLegacyCipher(t *testing.T) {
@@ -137,6 +140,8 @@ func TestOVAuthCountsPendingUsage(t *testing.T) {
 		"FILENAME == ARGV[1]",
 		"pending[id] += $2",
 		"used = $5 + pending[$1]",
+		"assigned_ip=$(printf '%s' \"$info\"",
+		"vpn_admit \"$uid\" \"ov\" \"ov\" \"$session\" \"$assigned_ip\"",
 		"\"$USAGE\" \"$USERS\"",
 	} {
 		if !strings.Contains(script, want) {
@@ -176,6 +181,7 @@ func TestOVDisconnectSubtractsAccountedUsage(t *testing.T) {
 		"previous=$(awk",
 		"delta=$((total - previous))",
 		"printf 'openvpn:%s\\t%s\\n' \"$uid\" \"$delta\"",
+		"vpn_release \"$uid\" \"ov\" \"edge\" \"$session\" \"$assigned_ip\"",
 		"awk -F '\\t' -v sid=\"$session\" '$1 != sid { print }'",
 	} {
 		if !strings.Contains(script, want) {
