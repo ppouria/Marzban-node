@@ -123,6 +123,8 @@ func TestWGTProxyScriptRoutesToTunnelPort(t *testing.T) {
 		`iifname "rbwg12345678"`,
 		"tproxy ip to 127.0.0.1:17020",
 		"meta mark set 1 accept",
+		"type nat hook postrouting priority srcnat",
+		`oifname != "rbwg12345678" meta l4proto icmp masquerade`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("script missing %q:\n%s", want, script)

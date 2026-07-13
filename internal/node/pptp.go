@@ -40,6 +40,7 @@ type pptpRuntimeUser struct {
 	UsedTraffic int64  `json:"used_traffic"`
 	DataLimit   *int64 `json:"data_limit,omitempty"`
 	Expire      *int64 `json:"expire,omitempty"`
+	DeviceLimit int64  `json:"device_limit,omitempty"`
 }
 
 type pptpManager struct {
@@ -100,27 +101,27 @@ func (m *pptpManager) CollectUsage() []xray.UserStat {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	stats := map[string]int64{}
 	path := filepath.Join(m.baseDir, "usage.tsv")
 	file, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer file.Close()
-	stats := map[string]int64{}
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parts := strings.Split(scanner.Text(), "\t")
-		if len(parts) < 2 {
-			continue
+	if err == nil {
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			parts := strings.Split(scanner.Text(), "\t")
+			if len(parts) < 2 {
+				continue
+			}
+			uid := strings.TrimSpace(parts[0])
+			value, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+			if uid == "" || value <= 0 {
+				continue
+			}
+			stats[uid] += value
 		}
-		uid := strings.TrimSpace(parts[0])
-		value, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
-		if uid == "" || value <= 0 {
-			continue
-		}
-		stats[uid] += value
+		_ = os.WriteFile(path, nil, 0o600)
 	}
-	_ = os.WriteFile(path, nil, 0o600)
+	collectPPPLiveUsage(m.baseDir, "pptp", stats)
 	out := make([]xray.UserStat, 0, len(stats))
 	for uid, value := range stats {
 		out = append(out, xray.UserStat{UID: uid, Value: value})
@@ -215,13 +216,13 @@ remoteip %s
 	if err := os.MkdirAll("/etc/ppp/ip-up.d", 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-pptp-sessions", []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), vpnSessionCallbackPath(m.baseDir), vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700); err != nil {
+	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-pptp-sessions", []byte(strings.ReplaceAll(l2tpIPUpScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), vpnSessionCallbackPath(m.baseDir), vpnSessionsPath(m.baseDir), inbound.Tag), "l2tp", "pptp")), 0o700); err != nil {
 		return fmt.Errorf("write /etc/ppp/ip-up.d/rebecca-pptp-sessions: %w", err)
 	}
 	if err := os.MkdirAll("/etc/ppp/ip-down.d", 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile("/etc/ppp/ip-down.d/rebecca-pptp-accounting", []byte(pptpIPDownScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "sessions.tsv"))), 0o700); err != nil {
+	if err := os.WriteFile("/etc/ppp/ip-down.d/rebecca-pptp-accounting", []byte(pptpIPDownScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "accounting.tsv"), filepath.Join(m.baseDir, "sessions.tsv"))), 0o700); err != nil {
 		return fmt.Errorf("write /etc/ppp/ip-down.d/rebecca-pptp-accounting: %w", err)
 	}
 	return updateManagedBlock("/etc/ppp/pptpd-options", "# BEGIN REBECCA PPTP OPTIONS", "# END REBECCA PPTP OPTIONS", pptpPPPOptions(inbound))
@@ -302,6 +303,7 @@ func pptpUsersTSV(users []pptpRuntimeUser) string {
 			limit,
 			user.Status,
 			expire,
+			strconv.FormatInt(user.DeviceLimit, 10),
 		}
 		b.WriteString(strings.Join(fields, "\t"))
 		b.WriteByte('\n')
@@ -313,6 +315,7 @@ func pptpNFTScript(inbound pptpRuntimeInbound) string {
 	if inbound.TunnelPort <= 0 || !boolValue(inbound.Settings["tproxy_enabled"], true) {
 		return ""
 	}
+	pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.68.0.0/16")
 	blockedV4, blockedV6 := ovBlockedDestinations()
 	var rules strings.Builder
 	if len(blockedV4) > 0 {
@@ -327,8 +330,12 @@ func pptpNFTScript(inbound pptpRuntimeInbound) string {
 %s
     iifname "ppp*" meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
   }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr %s meta l4proto icmp masquerade
+  }
 }
-`, strings.TrimRight(rules.String(), "\n"), inbound.TunnelPort)
+`, strings.TrimRight(rules.String(), "\n"), inbound.TunnelPort, pool)
 }
 
 func (m *pptpManager) disconnectStaleSessions(users []pptpRuntimeUser) {
@@ -368,8 +375,8 @@ func (m *pptpManager) disconnectStaleSessions(users []pptpRuntimeUser) {
 	_ = os.WriteFile(sessionsPath, []byte(kept.String()), 0o600)
 }
 
-func pptpIPDownScript(usersPath string, usagePath string, sessionsPath string) string {
-	return strings.ReplaceAll(l2tpIPDownScript(usersPath, usagePath, sessionsPath, vpnSessionCallbackPath(filepath.Dir(usersPath)), vpnSessionsPath(filepath.Dir(usersPath)), "pptp"), "l2tp", "pptp")
+func pptpIPDownScript(usersPath string, usagePath string, accountingPath string, sessionsPath string) string {
+	return strings.ReplaceAll(l2tpIPDownScript(usersPath, usagePath, accountingPath, sessionsPath, vpnSessionCallbackPath(filepath.Dir(usersPath)), vpnSessionsPath(filepath.Dir(usersPath)), "pptp"), "l2tp", "pptp")
 }
 
 func ensurePPTPPrerequisites() error {

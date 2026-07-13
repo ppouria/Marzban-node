@@ -132,27 +132,27 @@ func (m *l2tpManager) CollectUsage() []xray.UserStat {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	stats := map[string]int64{}
 	path := filepath.Join(m.baseDir, "usage.tsv")
 	file, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer file.Close()
-	stats := map[string]int64{}
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parts := strings.Split(scanner.Text(), "\t")
-		if len(parts) < 2 {
-			continue
+	if err == nil {
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			parts := strings.Split(scanner.Text(), "\t")
+			if len(parts) < 2 {
+				continue
+			}
+			uid := strings.TrimSpace(parts[0])
+			value, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+			if uid == "" || value <= 0 {
+				continue
+			}
+			stats[uid] += value
 		}
-		uid := strings.TrimSpace(parts[0])
-		value, _ := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
-		if uid == "" || value <= 0 {
-			continue
-		}
-		stats[uid] += value
+		_ = os.WriteFile(path, nil, 0o600)
 	}
-	_ = os.WriteFile(path, nil, 0o600)
+	collectPPPLiveUsage(m.baseDir, "l2tp", stats)
 	out := make([]xray.UserStat, 0, len(stats))
 	for uid, value := range stats {
 		out = append(out, xray.UserStat{UID: uid, Value: value})
@@ -176,10 +176,10 @@ func (m *l2tpManager) writeInbound(inbound l2tpRuntimeInbound, callback *vpnSess
 	if err := os.WriteFile(filepath.Join(m.baseDir, "nftables.nft"), []byte(l2tpNFTScript(inbound)), 0o600); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(m.baseDir, "ip-down.sh"), []byte(l2tpIPDownScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(m.baseDir, "ip-down.sh"), []byte(l2tpIPDownScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "accounting.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(m.baseDir, "ip-up.sh"), []byte(l2tpIPUpScript(usersPath, filepath.Join(m.baseDir, "sessions.tsv"), callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(m.baseDir, "ip-up.sh"), []byte(l2tpIPUpScript(usersPath, filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), callbackPath, vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700); err != nil {
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(m.baseDir, "options.xl2tpd"), []byte(l2tpPPPOptions(inbound)), 0o600); err != nil {
@@ -280,13 +280,13 @@ length bit = yes
 	if err := os.MkdirAll("/etc/ppp/ip-up.d", 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-l2tp-sessions", []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), vpnSessionCallbackPath(m.baseDir), vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700); err != nil {
+	if err := os.WriteFile("/etc/ppp/ip-up.d/rebecca-l2tp-sessions", []byte(l2tpIPUpScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), vpnSessionCallbackPath(m.baseDir), vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700); err != nil {
 		return fmt.Errorf("write /etc/ppp/ip-up.d/rebecca-l2tp-sessions: %w", err)
 	}
 	if err := os.MkdirAll("/etc/ppp/ip-down.d", 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile("/etc/ppp/ip-down.d/rebecca-l2tp-accounting", []byte(l2tpIPDownScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), vpnSessionCallbackPath(m.baseDir), vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700)
+	return os.WriteFile("/etc/ppp/ip-down.d/rebecca-l2tp-accounting", []byte(l2tpIPDownScript(filepath.Join(m.baseDir, "users.tsv"), filepath.Join(m.baseDir, "usage.tsv"), filepath.Join(m.baseDir, "accounting.tsv"), filepath.Join(m.baseDir, "sessions.tsv"), vpnSessionCallbackPath(m.baseDir), vpnSessionsPath(m.baseDir), inbound.Tag)), 0o700)
 }
 
 func l2tpIPSecConfig(l2tpPort int) string {
@@ -483,6 +483,8 @@ func l2tpUsersFingerprint(users []l2tpRuntimeUser) string {
 		if user.Expire != nil {
 			b.WriteString(strconv.FormatInt(*user.Expire, 10))
 		}
+		b.WriteByte('\t')
+		b.WriteString(strconv.FormatInt(user.DeviceLimit, 10))
 		b.WriteByte('\n')
 	}
 	return b.String()
@@ -493,6 +495,7 @@ func l2tpNFTScript(inbound l2tpRuntimeInbound) string {
 	if inbound.TunnelPort <= 0 || !boolValue(inbound.Settings["tproxy_enabled"], true) {
 		return ""
 	}
+	pool := firstString(inbound.Settings["ipv4_pool_cidr"], "10.67.0.0/16")
 	blockedV4, blockedV6 := ovBlockedDestinations()
 	var rules strings.Builder
 	if len(blockedV4) > 0 {
@@ -507,8 +510,12 @@ func l2tpNFTScript(inbound l2tpRuntimeInbound) string {
 %s
     iifname "ppp*" meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
   }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr %s meta l4proto icmp masquerade
+  }
 }
-`, strings.TrimRight(rules.String(), "\n"), inbound.TunnelPort)
+`, strings.TrimRight(rules.String(), "\n"), inbound.TunnelPort, pool)
 }
 
 func normalizeL2TPRuntimeInbound(inbound l2tpRuntimeInbound) l2tpRuntimeInbound {
@@ -586,17 +593,179 @@ func deleteL2TPInterface(ifname string) {
 	}
 }
 
-func l2tpIPUpScript(usersPath string, sessionsPath string, callbackPath string, vpnSessions string, inboundTag string) string {
+var pppNetStatRoot = "/sys/class/net"
+
+type pppUserSnapshot struct {
+	UserID      string
+	Username    string
+	UsedTraffic int64
+	DataLimit   int64
+}
+
+type pppSessionSnapshot struct {
+	Username string
+	IFName   string
+	PID      string
+}
+
+func collectPPPLiveUsage(baseDir string, protocol string, stats map[string]int64) {
+	users := readPPPUsers(filepath.Join(baseDir, "users.tsv"))
+	if len(users) == 0 {
+		return
+	}
+	sessions := readPPPSessions(filepath.Join(baseDir, "sessions.tsv"))
+	if len(sessions) == 0 {
+		return
+	}
+	accountingPath := filepath.Join(baseDir, "accounting.tsv")
+	_ = withVPNFileLock(accountingPath+".lock", func() {
+		records := readOVAccounting(accountingPath)
+		active := map[string]struct{}{}
+		for _, session := range sessions {
+			user, ok := users[session.Username]
+			if !ok {
+				continue
+			}
+			total, ok := pppInterfaceBytes(session.IFName)
+			if !ok || total <= 0 {
+				continue
+			}
+			sessionID := pppSessionID(protocol, session.PID, session.IFName, session.Username)
+			active[sessionID] = struct{}{}
+			record := records[sessionID]
+			if record.UserID == "" {
+				record.UserID = user.UserID
+			}
+			if record.Base <= 0 {
+				record.Base = user.UsedTraffic
+			}
+			if total > record.Total {
+				stats[protocol+":"+user.UserID] += total - record.Total
+			}
+			record.Total = total
+			records[sessionID] = record
+			if user.DataLimit > 0 && record.Base+total >= user.DataLimit {
+				killL2TPProcess(session.PID)
+				deleteL2TPInterface(session.IFName)
+			}
+		}
+		for sessionID := range records {
+			if strings.HasPrefix(sessionID, protocol+":") {
+				if _, ok := active[sessionID]; !ok {
+					delete(records, sessionID)
+				}
+			}
+		}
+		writeOVAccounting(accountingPath, records)
+	})
+}
+
+func readPPPUsers(path string) map[string]pppUserSnapshot {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	users := map[string]pppUserSnapshot{}
+	for _, lineText := range strings.Split(string(raw), "\n") {
+		parts := strings.Split(strings.TrimSpace(lineText), "\t")
+		if len(parts) < 6 || parts[0] == "" || parts[1] == "" {
+			continue
+		}
+		used, _ := strconv.ParseInt(parts[4], 10, 64)
+		limit, _ := strconv.ParseInt(parts[5], 10, 64)
+		users[parts[1]] = pppUserSnapshot{
+			UserID:      parts[0],
+			Username:    parts[1],
+			UsedTraffic: used,
+			DataLimit:   limit,
+		}
+	}
+	return users
+}
+
+func readPPPSessions(path string) []pppSessionSnapshot {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var sessions []pppSessionSnapshot
+	for _, lineText := range strings.Split(string(raw), "\n") {
+		parts := strings.Split(strings.TrimSpace(lineText), "\t")
+		if len(parts) < 3 || parts[0] == "" || parts[1] == "" {
+			continue
+		}
+		sessions = append(sessions, pppSessionSnapshot{Username: parts[0], IFName: parts[1], PID: parts[2]})
+	}
+	return sessions
+}
+
+func pppInterfaceBytes(ifname string) (int64, bool) {
+	if ifname == "" || strings.ContainsAny(ifname, "/ \t\r\n") {
+		return 0, false
+	}
+	rx, ok1 := readInt64File(filepath.Join(pppNetStatRoot, ifname, "statistics", "rx_bytes"))
+	tx, ok2 := readInt64File(filepath.Join(pppNetStatRoot, ifname, "statistics", "tx_bytes"))
+	return rx + tx, ok1 || ok2
+}
+
+func readInt64File(path string) (int64, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	return value, err == nil
+}
+
+func pppSessionID(protocol string, pid string, ifname string, username string) string {
+	return pppSafe(protocol + ":" + strings.TrimSpace(pid) + ":" + strings.TrimSpace(ifname) + ":" + strings.TrimSpace(username))
+}
+
+func pppSafe(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '.' || r == ':' || r == '-' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return b.String()
+}
+
+func l2tpIPUpScript(usersPath string, usagePath string, sessionsPath string, callbackPath string, vpnSessions string, inboundTag string) string {
 	return fmt.Sprintf(`#!/bin/sh
 USERS=%q
+USAGE=%q
 SESSIONS=%q
+now=$(date +%%s)
 %s
+touch "$USAGE" 2>/dev/null || true
 peer=${PEERNAME:-}
 ifname=${IFNAME:-}
 pid=${PPPD_PID:-}
 [ -n "$pid" ] || pid=$$
 remote_ip=${IPREMOTE:-}
-info=$(awk -F '\t' -v u="$peer" '$2 == u { print $1 "\t" $9; exit }' "$USERS")
+info=$(awk -F '\t' -v u="$peer" -v now="$now" '
+  FILENAME == ARGV[1] {
+    id=$1
+    sub(/^l2tp:/, "", id)
+    if (id != "" && $2 > 0) pending[id] += $2
+    next
+  }
+  $2 == u && ($7 == "" || $7 == "active" || $7 == "on_hold") {
+    if ($8 != "" && now >= $8) exit 3
+    used = $5 + pending[$1]
+    if ($6 != "" && used >= $6) exit 2
+    print $1 "\t" $9
+    found=1
+    exit 0
+  }
+  END { exit found ? 0 : 1 }
+' "$USAGE" "$USERS") || {
+  [ -n "$pid" ] && kill -TERM "$pid" >/dev/null 2>&1 || true
+  exit 1
+}
 uid=$(printf '%%s' "$info" | awk -F '\t' '{print $1}')
 device_limit=$(printf '%%s' "$info" | awk -F '\t' '{print $2}')
 session=$(vpn_safe "l2tp:${pid}:${ifname}:${peer}")
@@ -616,13 +785,15 @@ if [ -n "$peer" ] && [ -n "$ifname" ]; then
   mv "$tmp" "$SESSIONS"
   chmod 600 "$SESSIONS"
 fi
-`, usersPath, sessionsPath, vpnSessionShell(callbackPath, vpnSessions), safeName(inboundTag))
+`, usersPath, usagePath, sessionsPath, vpnSessionShell(callbackPath, vpnSessions), safeName(inboundTag))
 }
 
-func l2tpIPDownScript(usersPath string, usagePath string, sessionsPath string, callbackPath string, vpnSessions string, inboundTag string) string {
+func l2tpIPDownScript(usersPath string, usagePath string, accountingPath string, sessionsPath string, callbackPath string, vpnSessions string, inboundTag string) string {
 	return fmt.Sprintf(`#!/bin/sh
 USERS=%q
 USAGE=%q
+ACCOUNTING=%q
+ACCOUNTING_LOCK="${ACCOUNTING}.lock"
 SESSIONS=%q
 %s
 uid=$(awk -F '\t' -v u="$PEERNAME" '$2 == u { print $1; exit }' "$USERS")
@@ -630,7 +801,22 @@ rx=${BYTES_RCVD:-0}
 tx=${BYTES_SENT:-0}
 total=$((rx + tx))
 if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
-  printf 'l2tp:%%s\t%%s\n' "$uid" "$total" >> "$USAGE"
+  mkdir -p "$(dirname "$ACCOUNTING")"
+  touch "$ACCOUNTING"
+  session=$(vpn_safe "l2tp:${PPPD_PID:-$$}:${IFNAME:-}:${PEERNAME:-}")
+  (
+    flock -x 9 || exit 0
+    previous=$(awk -F '\t' -v sid="$session" '$1 == sid { print $3; found=1; exit } END { if (!found) print 0 }' "$ACCOUNTING")
+    case "$previous" in ''|*[!0-9]*) previous=0 ;; esac
+    delta=$((total - previous))
+    if [ "$delta" -gt 0 ]; then
+      printf 'l2tp:%%s\t%%s\n' "$uid" "$delta" >> "$USAGE"
+    fi
+    tmp="${ACCOUNTING}.$$"
+    awk -F '\t' -v sid="$session" '$1 != sid { print }' "$ACCOUNTING" > "$tmp"
+    mv "$tmp" "$ACCOUNTING"
+    chmod 600 "$ACCOUNTING"
+  ) 9>"$ACCOUNTING_LOCK"
 fi
 if [ -n "$PEERNAME" ] && [ -f "$SESSIONS" ]; then
   tmp="${SESSIONS}.$$"
@@ -640,7 +826,7 @@ if [ -n "$PEERNAME" ] && [ -f "$SESSIONS" ]; then
 fi
 session=$(vpn_safe "l2tp:${PPPD_PID:-$$}:${IFNAME:-}:${PEERNAME:-}")
 vpn_release "$uid" "l2tp" %q "$session" "${IPREMOTE:-}" ""
-`, usersPath, usagePath, sessionsPath, vpnSessionShell(callbackPath, vpnSessions), safeName(inboundTag))
+`, usersPath, usagePath, accountingPath, sessionsPath, vpnSessionShell(callbackPath, vpnSessions), safeName(inboundTag))
 }
 
 func l2tpPoolRange(pool string) (string, string) {

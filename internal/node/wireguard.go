@@ -178,7 +178,9 @@ func (m *wgManager) CollectUsage() []xray.UserStat {
 		}
 		m.syncPeerSessions(client, iface, inbound, device, peerByKey, callback)
 		baselines := m.loadBaselines(iface)
+		usageBases := m.loadUsageBases(iface)
 		next := map[string]int64{}
+		nextUsageBases := map[string]int64{}
 		for _, peer := range device.Peers {
 			key := peer.PublicKey.String()
 			current := peer.ReceiveBytes + peer.TransmitBytes
@@ -187,6 +189,12 @@ func (m *wgManager) CollectUsage() []xray.UserStat {
 			if !ok {
 				continue
 			}
+			runtimePeer := peerByKey[key]
+			usageBase, seenUsageBase := usageBases[key]
+			if !seenUsageBase {
+				usageBase = runtimePeer.UsedTraffic
+			}
+			nextUsageBases[key] = usageBase
 			previous, seen := baselines[key]
 			delta := current
 			if seen && current >= previous {
@@ -195,8 +203,15 @@ func (m *wgManager) CollectUsage() []xray.UserStat {
 			if delta > 0 {
 				totals[wgUsageUID(userID)] += delta
 			}
+			if runtimePeer.DataLimit != nil && *runtimePeer.DataLimit > 0 && usageBase+current >= *runtimePeer.DataLimit {
+				m.removePeer(client, iface, peer.PublicKey)
+				m.markPeerLimited(inbound.Tag, key, *runtimePeer.DataLimit)
+				delete(next, key)
+				delete(nextUsageBases, key)
+			}
 		}
 		m.saveBaselines(iface, next)
+		m.saveUsageBases(iface, nextUsageBases)
 	}
 
 	out := make([]xray.UserStat, 0, len(totals))
@@ -206,6 +221,37 @@ func (m *wgManager) CollectUsage() []xray.UserStat {
 		}
 	}
 	return out
+}
+
+func (m *wgManager) markPeerLimited(inboundTag string, publicKey string, limit int64) {
+	if m == nil || limit <= 0 {
+		return
+	}
+	runtimeConfig := m.currentRuntime()
+	if runtimeConfig == nil {
+		return
+	}
+	changed := false
+	for i := range runtimeConfig.Inbounds {
+		if runtimeConfig.Inbounds[i].Tag != inboundTag {
+			continue
+		}
+		for j := range runtimeConfig.Inbounds[i].Peers {
+			peer := &runtimeConfig.Inbounds[i].Peers[j]
+			if strings.TrimSpace(peer.PublicKey) == publicKey && peer.UsedTraffic < limit {
+				peer.UsedTraffic = limit
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return
+	}
+	raw, err := json.MarshalIndent(runtimeConfig, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(m.baseDir, "runtime.json"), raw, 0o600)
 }
 
 type wgSessionState struct {
@@ -534,6 +580,10 @@ func (m *wgManager) baselinePath(iface string) string {
 	return filepath.Join(m.baseDir, iface, "baselines.json")
 }
 
+func (m *wgManager) usageBasePath(iface string) string {
+	return filepath.Join(m.baseDir, iface, "usage-bases.json")
+}
+
 func (m *wgManager) loadBaselines(iface string) map[string]int64 {
 	raw, err := os.ReadFile(m.baselinePath(iface))
 	if err != nil {
@@ -556,6 +606,30 @@ func (m *wgManager) saveBaselines(iface string, baselines map[string]int64) {
 		return
 	}
 	_ = os.WriteFile(m.baselinePath(iface), raw, 0o600)
+}
+
+func (m *wgManager) loadUsageBases(iface string) map[string]int64 {
+	raw, err := os.ReadFile(m.usageBasePath(iface))
+	if err != nil {
+		return map[string]int64{}
+	}
+	out := map[string]int64{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return map[string]int64{}
+	}
+	return out
+}
+
+func (m *wgManager) saveUsageBases(iface string, baselines map[string]int64) {
+	dir := filepath.Join(m.baseDir, iface)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	raw, err := json.Marshal(baselines)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(m.usageBasePath(iface), raw, 0o600)
 }
 
 func (m *wgManager) pruneBaselines(iface string, desiredKeys map[string]struct{}) {

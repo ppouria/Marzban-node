@@ -197,6 +197,7 @@ func wgTProxyTableName(iface string) string {
 }
 
 func wgTProxyScript(inbound wgRuntimeInbound, iface string) string {
+	pool := firstString(inbound.Settings["address_pool"], inbound.Settings["ipv4_pool_cidr"], wgDefaultPool)
 	blockedV4, blockedV6 := ovBlockedDestinations()
 	var rules strings.Builder
 	if len(blockedV4) > 0 {
@@ -211,6 +212,10 @@ func wgTProxyScript(inbound wgRuntimeInbound, iface string) string {
 %s
     iifname "%s" meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
   }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr %s oifname != "%s" meta l4proto icmp masquerade
+  }
 }
-`, wgTProxyTableName(iface), strings.TrimRight(rules.String(), "\n"), iface, inbound.TunnelPort)
+`, wgTProxyTableName(iface), strings.TrimRight(rules.String(), "\n"), iface, inbound.TunnelPort, pool, iface)
 }

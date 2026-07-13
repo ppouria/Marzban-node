@@ -944,7 +944,7 @@ now=$(date +%%s)
 %s
 touch "$USAGE" 2>/dev/null || true
 info=$(awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
-  FNR == NR {
+  FILENAME == ARGV[1] {
     id=$1
     sub(/^openvpn:/, "", id)
     if (id != "" && $2 > 0) pending[id] += $2

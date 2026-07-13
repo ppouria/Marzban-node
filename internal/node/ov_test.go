@@ -134,6 +134,7 @@ func TestOVAuthCountsPendingUsage(t *testing.T) {
 	script := authScript("/tmp/users.tsv", "/tmp/usage.tsv", "/tmp/callback.env", "/tmp/sessions.tsv", "ov")
 	for _, want := range []string{
 		"USAGE=\"/tmp/usage.tsv\"",
+		"FILENAME == ARGV[1]",
 		"pending[id] += $2",
 		"used = $5 + pending[$1]",
 		"\"$USAGE\" \"$USERS\"",
