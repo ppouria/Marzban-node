@@ -422,8 +422,7 @@ func readOVStatus(path string, users map[string]ovUserSnapshot) []ovLiveSession 
 		if !ok {
 			continue
 		}
-		rx, _ := strconv.ParseInt(strings.TrimSpace(record[4]), 10, 64)
-		tx, _ := strconv.ParseInt(strings.TrimSpace(record[5]), 10, 64)
+		rx, tx := ovStatusBytes(record)
 		total := rx + tx
 		if total <= 0 {
 			continue
@@ -439,6 +438,19 @@ func readOVStatus(path string, users map[string]ovUserSnapshot) []ovLiveSession 
 		})
 	}
 	return sessions
+}
+
+func ovStatusBytes(record []string) (int64, int64) {
+	if len(record) >= 7 {
+		rx, rxErr := strconv.ParseInt(strings.TrimSpace(record[5]), 10, 64)
+		tx, txErr := strconv.ParseInt(strings.TrimSpace(record[6]), 10, 64)
+		if rxErr == nil && txErr == nil {
+			return rx, tx
+		}
+	}
+	rx, _ := strconv.ParseInt(strings.TrimSpace(record[4]), 10, 64)
+	tx, _ := strconv.ParseInt(strings.TrimSpace(record[5]), 10, 64)
+	return rx, tx
 }
 
 func readOVAccounting(path string) map[string]ovAccountingRecord {
@@ -547,6 +559,7 @@ func serverConfig(inbound ovRuntimeInbound, dir string, ccdDir string) string {
 	line(&b, "keepalive 10 300")
 	line(&b, "persist-key")
 	line(&b, "persist-tun")
+	line(&b, "status-version 2")
 	line(&b, "status "+filepath.Join(dir, "status.log")+" 5")
 	line(&b, "log-append "+filepath.Join(dir, "openvpn.log"))
 	line(&b, "verb 3")
@@ -963,8 +976,10 @@ info=$(awk -F '\t' -v u="$username" -v p="$password" -v now="$now" '
 uid=$(printf '%%s' "$info" | awk -F '\t' '{print $1}')
 assigned_ip=$(printf '%%s' "$info" | awk -F '\t' '{print $2}')
 device_limit=$(printf '%%s' "$info" | awk -F '\t' '{print $3}')
-session=$(vpn_safe "ov:${trusted_ip:-unknown}:${trusted_port:-0}:${username}")
-vpn_admit "$uid" "ov" %q "$session" "$assigned_ip" "${trusted_ip:-}" "$device_limit" || exit 1
+remote_ip=${trusted_ip:-${untrusted_ip:-unknown}}
+remote_port=${trusted_port:-${untrusted_port:-0}}
+session=$(vpn_safe "ov:${remote_ip}:${remote_port}:${username}")
+vpn_admit "$uid" "ov" %q "$session" "$assigned_ip" "$remote_ip" "$device_limit" || exit 1
 `, usersPath, usagePath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 
@@ -981,7 +996,9 @@ assigned_ip=$(printf '%%s' "$info" | awk -F '\t' '{print $2}')
 rx=${bytes_received:-0}
 tx=${bytes_sent:-0}
 total=$((rx + tx))
-session=$(vpn_safe "ov:${trusted_ip:-unknown}:${trusted_port:-0}:${username}")
+remote_ip=${trusted_ip:-${untrusted_ip:-unknown}}
+remote_port=${trusted_port:-${untrusted_port:-0}}
+session=$(vpn_safe "ov:${remote_ip}:${remote_port}:${username}")
 if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
   mkdir -p "$(dirname "$ACCOUNTING")"
   touch "$ACCOUNTING"
@@ -999,7 +1016,7 @@ if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
     chmod 600 "$ACCOUNTING"
   ) 9>"$ACCOUNTING_LOCK"
 fi
-vpn_release "$uid" "ov" %q "$session" "$assigned_ip" "${trusted_ip:-}"
+vpn_release "$uid" "ov" %q "$session" "$assigned_ip" "$remote_ip"
 `, usersPath, usagePath, accountingPath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 

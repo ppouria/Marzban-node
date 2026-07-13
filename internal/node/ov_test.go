@@ -93,6 +93,9 @@ func TestOVServerConfigAllowsSharedClientCertificate(t *testing.T) {
 	if !strings.Contains(config, "status ") || !strings.Contains(config, "status.log 5\n") {
 		t.Fatalf("server config should refresh status quickly:\n%s", config)
 	}
+	if !strings.Contains(config, "status-version 2\n") {
+		t.Fatalf("server config should emit machine-readable status:\n%s", config)
+	}
 }
 
 func TestOVDCORejectsLegacyCipher(t *testing.T) {
@@ -141,6 +144,7 @@ func TestOVAuthCountsPendingUsage(t *testing.T) {
 		"pending[id] += $2",
 		"used = $5 + pending[$1]",
 		"assigned_ip=$(printf '%s' \"$info\"",
+		"remote_ip=${trusted_ip:-${untrusted_ip:-unknown}}",
 		"vpn_admit \"$uid\" \"ov\" \"ov\" \"$session\" \"$assigned_ip\"",
 		"\"$USAGE\" \"$USERS\"",
 	} {
@@ -175,12 +179,34 @@ func TestOVCollectUsageReadsStatusDeltas(t *testing.T) {
 	}
 }
 
+func TestOVCollectUsageReadsStatusVersion2Deltas(t *testing.T) {
+	dir := t.TempDir()
+	inboundDir := filepath.Join(dir, "openvpn", "edge")
+	if err := os.MkdirAll(inboundDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inboundDir, "users.tsv"), []byte("42\talice\tpass\t10.66.0.2\t100\t1000\tactive\t\t0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status := "CLIENT_LIST,alice,198.51.100.10:5555,10.66.0.2,,102024,4985,2026-07-13 13:09:59,1783948199,alice,4,0,AES-256-GCM\n"
+	if err := os.WriteFile(filepath.Join(inboundDir, "status.log"), []byte(status), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := newOVManager(dir, "binary")
+
+	stats := manager.CollectUsage()
+	if len(stats) != 1 || stats[0].UID != "openvpn:42" || stats[0].Value != 107009 {
+		t.Fatalf("unexpected stats: %#v", stats)
+	}
+}
+
 func TestOVDisconnectSubtractsAccountedUsage(t *testing.T) {
 	script := disconnectScript("/tmp/users.tsv", "/tmp/usage.tsv", "/tmp/accounting.tsv", "/tmp/callback.env", "/tmp/sessions.tsv", "edge")
 	for _, want := range []string{
 		"previous=$(awk",
 		"delta=$((total - previous))",
 		"printf 'openvpn:%s\\t%s\\n' \"$uid\" \"$delta\"",
+		"remote_ip=${trusted_ip:-${untrusted_ip:-unknown}}",
 		"vpn_release \"$uid\" \"ov\" \"edge\" \"$session\" \"$assigned_ip\"",
 		"awk -F '\\t' -v sid=\"$session\" '$1 != sid { print }'",
 	} {
