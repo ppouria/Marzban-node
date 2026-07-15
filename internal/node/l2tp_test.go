@@ -1,6 +1,9 @@
 package node
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestL2TPPoolRangeUsesCIDRCapacity(t *testing.T) {
 	local, pool := l2tpPoolRange("10.67.0.0/16")
@@ -46,5 +49,19 @@ func TestNormalizeL2TPRuntimeInboundLocksPorts(t *testing.T) {
 	}
 	if _, ok := inbound.Settings["tproxy_port"]; ok {
 		t.Fatalf("legacy tproxy_port should be removed")
+	}
+}
+
+func TestL2TPLibreswanConfigSupportsNATClients(t *testing.T) {
+	config := l2tpLibreswanConfig(l2tpFixedPort)
+	for _, expected := range []string{
+		"conn rebecca-l2tp-nat",
+		"rightsubnet=vhost:%no,%priv",
+		"also=rebecca-l2tp",
+		"encapsulation=yes",
+	} {
+		if !strings.Contains(config, expected) {
+			t.Fatalf("Libreswan config is missing %q:\n%s", expected, config)
+		}
 	}
 }
