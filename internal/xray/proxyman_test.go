@@ -30,10 +30,11 @@ func TestBuildProtocolUserAccounts(t *testing.T) {
 		{
 			name: "vless vision",
 			user: InboundUser{
-				Protocol: "vless",
-				Email:    "1.test",
-				ID:       "22222222-2222-2222-2222-222222222222",
-				Flow:     "xtls-rprx-vision",
+				Protocol:   "vless",
+				Email:      "1.test",
+				ID:         "22222222-2222-2222-2222-222222222222",
+				Flow:       "xtls-rprx-vision",
+				ReverseTag: "reverse-out",
 			},
 			expected: &vless.Account{},
 		},
@@ -88,6 +89,9 @@ func TestBuildProtocolUserAccounts(t *testing.T) {
 				vlessAccount, ok := account.(*vless.Account)
 				if !ok || vlessAccount.Flow != tt.user.Flow {
 					t.Fatalf("unexpected vless flow: %#v", account)
+				}
+				if vlessAccount.Reverse == nil || vlessAccount.Reverse.Tag != tt.user.ReverseTag {
+					t.Fatalf("unexpected vless reverse config: %#v", account)
 				}
 			}
 			if tt.user.Method == "aes-256-gcm" {

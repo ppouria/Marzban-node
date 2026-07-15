@@ -101,6 +101,19 @@ func TestConfigUserDiffAddsUpdatesAndRemovesUsers(t *testing.T) {
 	}
 }
 
+func TestConfigUserDiffKeepsVLESSReverseTag(t *testing.T) {
+	cached := `{"inbounds":[{"tag":"vless-ws","protocol":"vless","settings":{"clients":[]}}]}`
+	incoming := `{"inbounds":[{"tag":"vless-ws","protocol":"vless","settings":{"clients":[{"email":"reverse.tunnel","id":"11111111-1111-4111-8111-111111111111","reverse":{"tag":"reverse-out"}}]}}]}`
+
+	diff, err := configUserDiff(cached, incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diff.add) != 1 || diff.add[0].user.ReverseTag != "reverse-out" {
+		t.Fatalf("reverse tag was not added to the runtime diff: %#v", diff.add)
+	}
+}
+
 func cacheTestClients(t *testing.T, raw string) []map[string]any {
 	t.Helper()
 	var config struct {

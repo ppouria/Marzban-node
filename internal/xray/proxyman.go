@@ -25,6 +25,7 @@ type InboundUser struct {
 	Password   string `json:"password"`
 	Auth       string `json:"auth"`
 	Flow       string `json:"flow"`
+	ReverseTag string `json:"reverse_tag"`
 	Method     string `json:"method"`
 	CipherType int32  `json:"cipher_type"`
 	IVCheck    bool   `json:"iv_check"`
@@ -122,7 +123,11 @@ func buildAccountMessage(user InboundUser) (proto.Message, error) {
 		if id == "" {
 			return nil, fmt.Errorf("id is required for vless")
 		}
-		return &vless.Account{Id: id, Flow: strings.TrimSpace(user.Flow)}, nil
+		account := &vless.Account{Id: id, Flow: strings.TrimSpace(user.Flow)}
+		if tag := strings.TrimSpace(user.ReverseTag); tag != "" {
+			account.Reverse = &vless.Reverse{Tag: tag}
+		}
+		return account, nil
 	case "trojan":
 		password := strings.TrimSpace(user.Password)
 		if password == "" {

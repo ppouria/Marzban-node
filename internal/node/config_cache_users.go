@@ -152,6 +152,9 @@ func inboundUserClientMap(user xray.InboundUser) map[string]any {
 	if value := strings.TrimSpace(user.Flow); value != "" {
 		client["flow"] = value
 	}
+	if value := strings.TrimSpace(user.ReverseTag); value != "" {
+		client["reverse"] = map[string]any{"tag": value}
+	}
 	if value := strings.TrimSpace(user.Method); value != "" {
 		client["method"] = value
 	}
@@ -306,6 +309,10 @@ func inboundUserFromClient(protocol string, client map[string]any) (xray.Inbound
 	if auth == "" {
 		auth = strings.TrimSpace(asString(client["password"]))
 	}
+	reverseTag := ""
+	if reverse, ok := client["reverse"].(map[string]any); ok {
+		reverseTag = strings.TrimSpace(asString(reverse["tag"]))
+	}
 	return xray.InboundUser{
 		Protocol:   protocol,
 		Email:      strings.TrimSpace(asString(client["email"])),
@@ -314,6 +321,7 @@ func inboundUserFromClient(protocol string, client map[string]any) (xray.Inbound
 		Password:   strings.TrimSpace(asString(client["password"])),
 		Auth:       auth,
 		Flow:       strings.TrimSpace(asString(client["flow"])),
+		ReverseTag: reverseTag,
 		Method:     strings.TrimSpace(asString(client["method"])),
 		CipherType: cipherType,
 		IVCheck:    ivCheck,
