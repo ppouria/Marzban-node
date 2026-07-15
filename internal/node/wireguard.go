@@ -28,6 +28,7 @@ const (
 	wgListenPortLo         = 51820
 	wgListenPortHi         = 51920
 	wgSessionTimeout       = 3 * time.Minute
+	wgAdmissionRetryDelay  = 30 * time.Second
 	wgIfacePrefix          = "rbwg"
 	wgCommandTimeout       = 15 * time.Second
 	wgUsagePrefix          = "wg"
@@ -67,12 +68,14 @@ type wgManager struct {
 	baseDir     string
 	installMode string
 	mu          sync.Mutex
+	deniedUntil map[string]time.Time
 }
 
 func newWGManager(dataDir string, installMode string) *wgManager {
 	return &wgManager{
 		baseDir:     filepath.Join(dataDir, "wireguard"),
 		installMode: strings.ToLower(strings.TrimSpace(installMode)),
+		deniedUntil: map[string]time.Time{},
 	}
 }
 
@@ -294,6 +297,7 @@ func (m *wgManager) syncPeerSessions(client *wgctrl.Client, iface string, inboun
 			}
 			if !vpnAdmitGoSession(vpnSessionsPath(m.baseDir), callback, event, runtimePeer.DeviceLimit) {
 				m.removePeer(client, iface, devicePeer.PublicKey)
+				m.deniedUntil[key] = now.Add(wgAdmissionRetryDelay)
 				delete(present, key)
 				continue
 			}
@@ -338,6 +342,10 @@ func (m *wgManager) restoreAvailablePeers(client *wgctrl.Client, iface string, i
 		if _, ok := present[key]; ok {
 			continue
 		}
+		if until := m.deniedUntil[key]; until.After(time.Now()) {
+			continue
+		}
+		delete(m.deniedUntil, key)
 		if !vpnUserCanOpenSession(sessionsPath, peer.UserID, peer.DeviceLimit) {
 			continue
 		}

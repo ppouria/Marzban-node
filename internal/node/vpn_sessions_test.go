@@ -1,9 +1,34 @@
 package node
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 )
+
+func TestVPNSessionLedgerHonorsMasterAdmission(t *testing.T) {
+	status := http.StatusConflict
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	}))
+	defer server.Close()
+
+	path := filepath.Join(t.TempDir(), "vpn-sessions.tsv")
+	callback := &vpnSessionCallback{URL: server.URL, Token: "token", NodeID: 7}
+	event := vpnSessionEvent{UserID: 42, Protocol: "ov", InboundTag: "ov-main", SessionID: "ov:one", ClientIP: "198.51.100.10", Event: "start"}
+	if vpnAdmitGoSession(path, callback, event, 1) {
+		t.Fatal("expected master to reject the session")
+	}
+	if records := vpnSessionRecordsLocked(path); len(records) != 0 {
+		t.Fatalf("rejected session was persisted: %#v", records)
+	}
+
+	status = http.StatusOK
+	if !vpnAdmitGoSession(path, callback, event, 1) {
+		t.Fatal("expected master-approved session to be admitted")
+	}
+}
 
 func TestVPNSessionLedgerSharesLimitAcrossProtocols(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vpn-sessions.tsv")
