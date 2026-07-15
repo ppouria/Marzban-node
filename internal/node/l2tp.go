@@ -234,9 +234,10 @@ func (m *l2tpManager) stop() {
 	if runtime.GOOS == "windows" {
 		return
 	}
-	_ = runOptional("ipsec", "stop")
-	_ = runOptional("systemctl", "stop", "strongswan-starter")
-	_ = runOptional("systemctl", "stop", "strongswan")
+	_ = updateManagedBlock("/etc/ipsec.conf", "# BEGIN REBECCA L2TP IPSEC", "# END REBECCA L2TP IPSEC", "")
+	_ = updateManagedBlock("/etc/ipsec.secrets", "# BEGIN REBECCA L2TP IPSEC", "# END REBECCA L2TP IPSEC", "")
+	_ = runOptional("ipsec", "rereadsecrets")
+	_ = runOptional("ipsec", "reload")
 	_ = runOptional("systemctl", "stop", "xl2tpd")
 	if nft, err := exec.LookPath("nft"); err == nil {
 		_ = exec.Command(nft, "delete", "table", "inet", "rebecca_l2tp").Run()
@@ -913,6 +914,9 @@ func installL2TPPackages() error {
 		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
 			return err
 		}
+		if strings.Contains(strings.ToLower(commandOutput("ipsec", "--version")), "strongswan") {
+			return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "strongswan", "xl2tpd", "ppp", "nftables", "iproute2", "iptables", "kmod")
+		}
 		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "libreswan", "xl2tpd", "ppp", "nftables", "iproute2", "iptables", "kmod"); err == nil {
 			return nil
 		}
@@ -977,8 +981,17 @@ func installL2TPKernelModulePackages() error {
 }
 
 func restartL2TPServices() error {
-	if err := runOptional("ipsec", "restart"); err != nil {
-		return err
+	if exec.Command("pgrep", "-x", "charon").Run() != nil && exec.Command("pgrep", "-x", "pluto").Run() != nil {
+		if err := runOptional("ipsec", "start"); err != nil {
+			return err
+		}
+	} else {
+		if err := runOptional("ipsec", "rereadsecrets"); err != nil {
+			return err
+		}
+		if err := runOptional("ipsec", "reload"); err != nil {
+			return err
+		}
 	}
 	if commandExists("systemctl") {
 		if err := runOptional("systemctl", "restart", "xl2tpd"); err == nil {

@@ -28,15 +28,16 @@ import (
 )
 
 type Server struct {
-	settings appconfig.Settings
-	core     *xray.Core
-	ov       *ovManager
-	l2tp     *l2tpManager
-	pptp     *pptpManager
-	wg       *wgManager
-	ipBlocks *sourceIPBlocker
-	usage    *usageBuffer
-	system   *systemSampler
+	settings     appconfig.Settings
+	core         *xray.Core
+	ov           *ovManager
+	l2tp         *l2tpManager
+	pptp         *pptpManager
+	wg           *wgManager
+	remoteAccess *remoteAccessManager
+	ipBlocks     *sourceIPBlocker
+	usage        *usageBuffer
+	system       *systemSampler
 
 	mu         sync.Mutex
 	connected  bool
@@ -72,16 +73,17 @@ func New(settings appconfig.Settings) (*Server, error) {
 		usage = newUsageBuffer()
 	}
 	server := &Server{
-		settings: settings,
-		core:     core,
-		ov:       newOVManager(settings.RebeccaDataDir, settings.InstallMode),
-		l2tp:     newL2TPManager(settings.RebeccaDataDir, settings.InstallMode),
-		pptp:     newPPTPManager(settings.RebeccaDataDir, settings.InstallMode),
-		wg:       newWGManager(settings.RebeccaDataDir, settings.InstallMode),
-		ipBlocks: newSourceIPBlocker(settings.RebeccaDataDir, settings.InstallMode),
-		usage:    usage,
-		system:   newSystemSampler(),
-		sessions: make(map[string]time.Time),
+		settings:     settings,
+		core:         core,
+		ov:           newOVManager(settings.RebeccaDataDir, settings.InstallMode),
+		l2tp:         newL2TPManager(settings.RebeccaDataDir, settings.InstallMode),
+		pptp:         newPPTPManager(settings.RebeccaDataDir, settings.InstallMode),
+		wg:           newWGManager(settings.RebeccaDataDir, settings.InstallMode),
+		remoteAccess: newRemoteAccessManager(settings.RebeccaDataDir, settings.InstallMode),
+		ipBlocks:     newSourceIPBlocker(settings.RebeccaDataDir, settings.InstallMode),
+		usage:        usage,
+		system:       newSystemSampler(),
+		sessions:     make(map[string]time.Time),
 	}
 	// Rebuild WireGuard interfaces from disk first, independently of Xray: kernel
 	// WG state does not survive a reboot, and its ingress should come back even if
@@ -513,6 +515,12 @@ func (s *Server) snapshotRunningUsage() {
 	if stats := s.wg.CollectUsage(); len(stats) > 0 {
 		s.usage.addUsers(stats)
 	}
+	if stats := s.remoteAccess.CollectUsage("ikev2"); len(stats) > 0 {
+		s.usage.addUsers(stats)
+	}
+	if stats := s.remoteAccess.CollectUsage("anyconnect"); len(stats) > 0 {
+		s.usage.addUsers(stats)
+	}
 	if !s.core.Started() {
 		return
 	}
@@ -589,6 +597,12 @@ func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	if wgStats := s.wg.CollectUsage(); len(wgStats) > 0 {
 		stats = append(stats, wgStats...)
+	}
+	if ikev2Stats := s.remoteAccess.CollectUsage("ikev2"); len(ikev2Stats) > 0 {
+		stats = append(stats, ikev2Stats...)
+	}
+	if anyConnectStats := s.remoteAccess.CollectUsage("anyconnect"); len(anyConnectStats) > 0 {
+		stats = append(stats, anyConnectStats...)
 	}
 	batchID, pending := s.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
@@ -781,23 +795,32 @@ type configPayload struct {
 }
 
 type cachedConfigPayload struct {
-	Config      string       `json:"config"`
-	PeerIP      string       `json:"peer_ip"`
-	OVRuntime   *ovRuntime   `json:"ov_runtime,omitempty"`
-	L2TPRuntime *l2tpRuntime `json:"l2tp_runtime,omitempty"`
-	PPTPRuntime *pptpRuntime `json:"pptp_runtime,omitempty"`
-	WGRuntime   *wgRuntime   `json:"wg_runtime,omitempty"`
+	Config            string               `json:"config"`
+	PeerIP            string               `json:"peer_ip"`
+	OVRuntime         *ovRuntime           `json:"ov_runtime,omitempty"`
+	L2TPRuntime       *l2tpRuntime         `json:"l2tp_runtime,omitempty"`
+	PPTPRuntime       *pptpRuntime         `json:"pptp_runtime,omitempty"`
+	WGRuntime         *wgRuntime           `json:"wg_runtime,omitempty"`
+	IKEv2Runtime      *remoteAccessRuntime `json:"ikev2_runtime,omitempty"`
+	AnyConnectRuntime *remoteAccessRuntime `json:"anyconnect_runtime,omitempty"`
 }
 
 func (s *Server) configCachePath() string {
 	return filepath.Join(s.settings.RebeccaDataDir, "xray-config-cache.json")
 }
 
-func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime, pptpRuntimeConfig *pptpRuntime, wgRuntimeConfig *wgRuntime) {
+func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime, pptpRuntimeConfig *pptpRuntime, wgRuntimeConfig *wgRuntime, remoteRuntimes ...*remoteAccessRuntime) {
 	if strings.TrimSpace(rawConfig) == "" {
 		return
 	}
-	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig, WGRuntime: wgRuntimeConfig})
+	var ikev2Runtime, anyConnectRuntime *remoteAccessRuntime
+	if len(remoteRuntimes) > 0 {
+		ikev2Runtime = remoteRuntimes[0]
+	}
+	if len(remoteRuntimes) > 1 {
+		anyConnectRuntime = remoteRuntimes[1]
+	}
+	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig, WGRuntime: wgRuntimeConfig, IKEv2Runtime: ikev2Runtime, AnyConnectRuntime: anyConnectRuntime})
 	if err != nil {
 		return
 	}
@@ -861,6 +884,22 @@ func (s *Server) cachedWGRuntime() *wgRuntime {
 	return payload.WGRuntime
 }
 
+func (s *Server) cachedIKEv2Runtime() *remoteAccessRuntime {
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return nil
+	}
+	return payload.IKEv2Runtime
+}
+
+func (s *Server) cachedAnyConnectRuntime() *remoteAccessRuntime {
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return nil
+	}
+	return payload.AnyConnectRuntime
+}
+
 func (s *Server) applyL2TPRuntime(runtimeConfig *l2tpRuntime) string {
 	if err := s.l2tp.Apply(runtimeConfig); err != nil {
 		warning := "L2TP runtime apply failed: " + err.Error()
@@ -882,6 +921,36 @@ func (s *Server) applyPPTPRuntime(runtimeConfig *pptpRuntime) string {
 func (s *Server) applyWGRuntime(runtimeConfig *wgRuntime) string {
 	if err := s.wg.Apply(runtimeConfig); err != nil {
 		warning := "WireGuard runtime apply failed: " + err.Error()
+		log.Print(warning)
+		return warning
+	}
+	return ""
+}
+
+func (s *Server) applyIKEv2Runtime(runtimeConfig *remoteAccessRuntime) string {
+	if err := s.remoteAccess.ApplyIKEv2(runtimeConfig); err != nil {
+		warning := "IKEv2 runtime apply failed: " + err.Error()
+		log.Print(warning)
+		return warning
+	}
+	return ""
+}
+
+func (s *Server) prepareIKEv2Runtime(runtimeConfig *remoteAccessRuntime) string {
+	if runtimeConfig == nil || len(runtimeConfig.Inbounds) == 0 {
+		return ""
+	}
+	if err := ensureIKEv2Prerequisites(); err != nil {
+		warning := "IKEv2 prerequisite preparation failed: " + err.Error()
+		log.Print(warning)
+		return warning
+	}
+	return ""
+}
+
+func (s *Server) applyAnyConnectRuntime(runtimeConfig *remoteAccessRuntime) string {
+	if err := s.remoteAccess.ApplyAnyConnect(runtimeConfig); err != nil {
+		warning := "AnyConnect runtime apply failed: " + err.Error()
 		log.Print(warning)
 		return warning
 	}
@@ -933,6 +1002,12 @@ func (s *Server) startCachedConfig() {
 	}
 	if err := s.wg.Apply(payload.WGRuntime); err != nil {
 		log.Printf("failed to apply cached WireGuard runtime: %v", err)
+	}
+	if err := s.remoteAccess.ApplyIKEv2(payload.IKEv2Runtime); err != nil {
+		log.Printf("failed to apply cached IKEv2 runtime: %v", err)
+	}
+	if err := s.remoteAccess.ApplyAnyConnect(payload.AnyConnectRuntime); err != nil {
+		log.Printf("failed to apply cached AnyConnect runtime: %v", err)
 	}
 }
 

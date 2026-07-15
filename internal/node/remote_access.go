@@ -1,0 +1,913 @@
+package node
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"net/netip"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/rebeccapanel/rebecca-node/internal/xray"
+)
+
+type remoteAccessRuntime struct {
+	GeneratedAt     string                       `json:"generated_at"`
+	Target          string                       `json:"target,omitempty"`
+	SessionCallback *vpnSessionCallback          `json:"session_callback,omitempty"`
+	Inbounds        []remoteAccessRuntimeInbound `json:"inbounds"`
+}
+
+type remoteAccessRuntimeInbound struct {
+	Tag        string                    `json:"tag"`
+	TunnelTag  string                    `json:"tunnel_tag"`
+	Port       int                       `json:"port"`
+	TunnelPort int                       `json:"tunnel_port"`
+	Settings   map[string]any            `json:"settings"`
+	Users      []remoteAccessRuntimeUser `json:"users"`
+}
+
+type remoteAccessRuntimeUser struct {
+	UserID      int64  `json:"user_id"`
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	IPv4Address string `json:"ipv4_address"`
+	Status      string `json:"status"`
+	UsedTraffic int64  `json:"used_traffic"`
+	DataLimit   *int64 `json:"data_limit,omitempty"`
+	Expire      *int64 `json:"expire,omitempty"`
+	DeviceLimit int64  `json:"device_limit,omitempty"`
+}
+
+type remoteAccessManager struct {
+	baseDir     string
+	installMode string
+	mu          sync.Mutex
+}
+
+func (m *remoteAccessManager) sessionsPath() string {
+	return filepath.Join(filepath.Dir(m.baseDir), "vpn-sessions.tsv")
+}
+
+func newRemoteAccessManager(dataDir, installMode string) *remoteAccessManager {
+	return &remoteAccessManager{baseDir: filepath.Join(dataDir, "remote-access"), installMode: strings.ToLower(strings.TrimSpace(installMode))}
+}
+
+func (m *remoteAccessManager) ApplyIKEv2(config *remoteAccessRuntime) error {
+	return m.apply("ikev2", config)
+}
+
+func (m *remoteAccessManager) ApplyAnyConnect(config *remoteAccessRuntime) error {
+	return m.apply("anyconnect", config)
+}
+
+func (m *remoteAccessManager) apply(protocol string, config *remoteAccessRuntime) error {
+	if m == nil || config == nil {
+		return nil
+	}
+	if len(config.Inbounds) > 0 && m.installMode != "binary" {
+		return fmt.Errorf("%s is supported only on binary Rebecca-node installs", protocol)
+	}
+	if protocol == "ikev2" && len(config.Inbounds) > 1 {
+		return fmt.Errorf("only one IKEv2 inbound is supported per node because UDP 500/4500 are node-wide")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dir := filepath.Join(m.baseDir, protocol)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeFileIfChanged(filepath.Join(dir, "runtime.json"), raw, 0o600); err != nil {
+		return err
+	}
+	if len(config.Inbounds) == 0 {
+		return m.stop(protocol)
+	}
+	if protocol == "ikev2" {
+		return m.applyIKEv2(config.Inbounds[0], config.SessionCallback)
+	}
+	return m.applyAnyConnect(config.Inbounds, config.SessionCallback)
+}
+
+func (m *remoteAccessManager) applyIKEv2(inbound remoteAccessRuntimeInbound, callback *vpnSessionCallback) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if err := ensureIKEv2Prerequisites(); err != nil {
+		return err
+	}
+	dir := filepath.Join(m.baseDir, "ikev2")
+	if err := writeRemoteAccessFiles(dir, inbound, callback); err != nil {
+		return err
+	}
+	poolConfigChanged, err := configureIKEv2Pool(dir, inbound.Users)
+	if err != nil {
+		return err
+	}
+	certPath := filepath.Join(dir, "server.crt")
+	keyPath := filepath.Join(dir, "server.key")
+	caPath := filepath.Join(dir, "ca.crt")
+	if err := writePEMSetting(certPath, inbound.Settings, "server_certificate"); err != nil {
+		return err
+	}
+	if err := writePEMSetting(keyPath, inbound.Settings, "server_key"); err != nil {
+		return err
+	}
+	if err := writePEMSetting(caPath, inbound.Settings, "ca_certificate"); err != nil {
+		return err
+	}
+	if err := updateManagedBlock("/etc/ipsec.conf", "# BEGIN REBECCA IKEV2", "# END REBECCA IKEV2", ikev2IPSecConfig(inbound, certPath, caPath)); err != nil {
+		return err
+	}
+	if err := updateManagedBlock("/etc/ipsec.secrets", "# BEGIN REBECCA IKEV2", "# END REBECCA IKEV2", ikev2Secrets(inbound, keyPath)); err != nil {
+		return err
+	}
+	if err := applyRemoteAccessNetworking("ikev2", "", inbound); err != nil {
+		return err
+	}
+	if poolConfigChanged {
+		if output, restartErr := exec.Command("ipsec", "restart").CombinedOutput(); restartErr != nil {
+			return fmt.Errorf("restart IKEv2 after enabling static address pools: %v: %s", restartErr, strings.TrimSpace(string(output)))
+		}
+		return nil
+	}
+	if output, err := exec.Command("ipsec", "rereadsecrets").CombinedOutput(); err != nil {
+		return fmt.Errorf("reload IKEv2 secrets: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	if output, err := exec.Command("ipsec", "reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("reload IKEv2 config: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (m *remoteAccessManager) applyAnyConnect(inbounds []remoteAccessRuntimeInbound, callback *vpnSessionCallback) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if err := ensureAnyConnectPrerequisites(); err != nil {
+		return err
+	}
+	for i := range inbounds {
+		left, err := netip.ParsePrefix(firstString(inbounds[i].Settings["ipv4_pool_cidr"]))
+		if err != nil || !left.Addr().Is4() {
+			return fmt.Errorf("AnyConnect inbound %s has an invalid IPv4 pool", inbounds[i].Tag)
+		}
+		for j := 0; j < i; j++ {
+			right, _ := netip.ParsePrefix(firstString(inbounds[j].Settings["ipv4_pool_cidr"]))
+			if left.Contains(right.Addr()) || right.Contains(left.Addr()) {
+				return fmt.Errorf("AnyConnect inbounds %s and %s have overlapping IPv4 pools", inbounds[j].Tag, inbounds[i].Tag)
+			}
+		}
+	}
+	base := filepath.Join(m.baseDir, "anyconnect")
+	desired := map[string]struct{}{}
+	for _, inbound := range inbounds {
+		name := safeName(inbound.Tag)
+		desired[name] = struct{}{}
+		dir := filepath.Join(base, name)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+		if err := writeRemoteAccessFiles(dir, inbound, callback); err != nil {
+			return err
+		}
+		for path, key := range map[string]string{filepath.Join(dir, "server.crt"): "server_certificate", filepath.Join(dir, "server.key"): "server_key"} {
+			if err := writePEMSetting(path, inbound.Settings, key); err != nil {
+				return err
+			}
+		}
+		if ca := firstString(inbound.Settings["ca_certificate"]); ca != "" {
+			if err := writeFileIfChanged(filepath.Join(dir, "ca.crt"), []byte(ca+"\n"), 0o600); err != nil {
+				return err
+			}
+		}
+		if err := writeAnyConnectPAM(dir, name); err != nil {
+			return err
+		}
+		if err := writeAnyConnectUserConfigs(dir, inbound.Users); err != nil {
+			return err
+		}
+		conf := filepath.Join(dir, "ocserv.conf")
+		oldConf, _ := os.ReadFile(conf)
+		newConf := []byte(anyConnectConfig(inbound, dir, name))
+		if err := writeFileIfChanged(conf, newConf, 0o600); err != nil {
+			return err
+		}
+		if output, err := exec.Command("ocserv", "-t", "-c", conf).CombinedOutput(); err != nil {
+			return fmt.Errorf("validate AnyConnect inbound %s: %v: %s", inbound.Tag, err, strings.TrimSpace(string(output)))
+		}
+		if err := applyRemoteAccessNetworking("anyconnect-"+name, anyConnectDevicePrefix(inbound.Port)+"*", inbound); err != nil {
+			return err
+		}
+		if string(oldConf) != string(newConf) || !anyConnectRunning(dir) {
+			if err := restartAnyConnect(name, conf, dir); err != nil {
+				return err
+			}
+		}
+		if err := terminateInvalidAnyConnectUsers(dir, inbound.Users); err != nil {
+			return err
+		}
+	}
+	if entries, err := os.ReadDir(base); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				if _, ok := desired[entry.Name()]; !ok {
+					stopAnyConnect(entry.Name(), filepath.Join(base, entry.Name()))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func writeRemoteAccessFiles(dir string, inbound remoteAccessRuntimeInbound, callback *vpnSessionCallback) error {
+	if err := writeFileIfChanged(filepath.Join(dir, "users.tsv"), []byte(remoteAccessUsersTSV(inbound.Users)), 0o600); err != nil {
+		return err
+	}
+	return writeVPNSessionCallback(vpnSessionCallbackPath(dir), callback)
+}
+
+func writePEMSetting(path string, settings map[string]any, key string) error {
+	value := firstString(settings[key])
+	if value == "" {
+		return fmt.Errorf("%s is required", key)
+	}
+	return writeFileIfChanged(path, []byte(value+"\n"), 0o600)
+}
+
+func remoteAccessUsersTSV(users []remoteAccessRuntimeUser) string {
+	var b strings.Builder
+	for _, user := range users {
+		limit, expire := "", ""
+		if user.DataLimit != nil {
+			limit = strconv.FormatInt(*user.DataLimit, 10)
+		}
+		if user.Expire != nil {
+			expire = strconv.FormatInt(*user.Expire, 10)
+		}
+		line(&b, strings.Join([]string{strconv.FormatInt(user.UserID, 10), user.Username, user.Password, user.IPv4Address, strconv.FormatInt(user.UsedTraffic, 10), limit, user.Status, expire, strconv.FormatInt(user.DeviceLimit, 10)}, "\t"))
+	}
+	return b.String()
+}
+
+func ikev2IPSecConfig(inbound remoteAccessRuntimeInbound, certPath, caPath string) string {
+	s := inbound.Settings
+	auth := firstString(s["auth_mode"], "password")
+	rightAuth, rightAuth2 := "eap-mschapv2", ""
+	if auth == "certificate" {
+		rightAuth = "pubkey"
+	} else if auth == "password+certificate" {
+		rightAuth, rightAuth2 = "pubkey", "eap-mschapv2"
+	}
+	var b strings.Builder
+	line(&b, "conn rebecca-ikev2")
+	line(&b, "  auto=add")
+	line(&b, "  keyexchange=ikev2")
+	line(&b, "  type=tunnel")
+	line(&b, "  left=%any")
+	line(&b, "  leftid="+firstString(s["server_identity"]))
+	line(&b, "  leftcert="+certPath)
+	line(&b, "  leftca="+caPath)
+	leftSubnets := stringList(s["routes"])
+	if boolValue(s["redirect_gateway"], true) || len(leftSubnets) == 0 {
+		leftSubnets = []string{"0.0.0.0/0"}
+	}
+	line(&b, "  leftsubnet="+strings.Join(leftSubnets, ","))
+	line(&b, "  leftsendcert="+map[bool]string{true: "always", false: "never"}[boolValue(s["send_cert"], true)])
+	line(&b, "  right=%any")
+	line(&b, "  rightauth="+rightAuth)
+	if rightAuth2 != "" {
+		line(&b, "  rightauth2="+rightAuth2)
+	}
+	line(&b, "  rightsourceip=%rebecca-ikev2")
+	if dns := stringList(s["dns_servers"]); len(dns) > 0 {
+		line(&b, "  rightdns="+strings.Join(dns, ","))
+	}
+	line(&b, "  eap_identity=%identity")
+	line(&b, "  fragmentation="+firstString(s["fragmentation"], "yes"))
+	line(&b, fmt.Sprintf("  mobike=%s", yesNo(boolValue(s["mobike"], true))))
+	line(&b, fmt.Sprintf("  reauth=%s", yesNo(boolValue(s["reauth"], false))))
+	line(&b, "  dpdaction=clear")
+	line(&b, fmt.Sprintf("  dpddelay=%ds", boundedInt(s["dpd_delay"], 30, 0, 86400)))
+	line(&b, fmt.Sprintf("  ikelifetime=%ds", boundedInt(s["ike_lifetime"], 10800, 60, 2592000)))
+	line(&b, fmt.Sprintf("  lifetime=%ds", boundedInt(s["child_lifetime"], 3600, 60, 2592000)))
+	line(&b, fmt.Sprintf("  rekeytime=%ds", boundedInt(s["rekey_time"], 3000, 0, 2592000)))
+	line(&b, "  ike="+firstString(s["ike_proposals"]))
+	line(&b, "  esp="+firstString(s["esp_proposals"]))
+	return b.String()
+}
+
+func ikev2Secrets(inbound remoteAccessRuntimeInbound, keyPath string) string {
+	var b strings.Builder
+	line(&b, ": RSA "+keyPath)
+	if firstString(inbound.Settings["auth_mode"], "password") != "certificate" {
+		for _, user := range inbound.Users {
+			if user.Username != "" && user.Password != "" {
+				line(&b, fmt.Sprintf("%q : EAP %q", user.Username, user.Password))
+			}
+		}
+	}
+	return b.String()
+}
+
+func anyConnectConfig(inbound remoteAccessRuntimeInbound, dir, name string) string {
+	s := inbound.Settings
+	auth := firstString(s["auth_mode"], "password")
+	var b strings.Builder
+	if auth != "certificate" {
+		line(&b, `auth = "pam[service=rebecca-ocserv-`+name+`]"`)
+	}
+	if auth != "password" {
+		line(&b, `auth = "certificate"`)
+		line(&b, "ca-cert = "+filepath.Join(dir, "ca.crt"))
+		line(&b, "cert-user-oid = 2.5.4.3")
+	}
+	line(&b, "tcp-port = "+strconv.Itoa(inbound.Port))
+	if boolValue(s["udp_enabled"], true) {
+		line(&b, "udp-port = "+strconv.Itoa(inbound.Port))
+	} else {
+		line(&b, "udp-port = 0")
+	}
+	line(&b, "server-cert = "+filepath.Join(dir, "server.crt"))
+	line(&b, "server-key = "+filepath.Join(dir, "server.key"))
+	line(&b, "socket-file = "+filepath.Join(dir, "ocserv.sock"))
+	line(&b, "pid-file = "+filepath.Join(dir, "ocserv.pid"))
+	line(&b, "config-per-user = "+filepath.Join(dir, "users.d"))
+	line(&b, "connect-script = "+filepath.Join(dir, "connect.sh"))
+	line(&b, "device = "+anyConnectDevicePrefix(inbound.Port))
+	line(&b, "ipv4-network = "+firstString(s["ipv4_pool_cidr"], "10.71.0.0/16"))
+	for _, dns := range stringList(s["dns_servers"]) {
+		line(&b, "dns = "+dns)
+	}
+	for _, route := range stringList(s["routes"]) {
+		line(&b, "route = "+route)
+	}
+	for _, route := range stringList(s["no_routes"]) {
+		line(&b, "no-route = "+route)
+	}
+	if boolValue(s["redirect_gateway"], true) && len(stringList(s["routes"])) == 0 {
+		line(&b, "route = default")
+	}
+	for _, item := range [][2]string{{"max_clients", "max-clients"}, {"max_same_clients", "max-same-clients"}, {"cookie_timeout", "cookie-timeout"}, {"idle_timeout", "idle-timeout"}, {"mobile_idle_timeout", "mobile-idle-timeout"}, {"session_timeout", "session-timeout"}, {"keepalive", "keepalive"}, {"dpd", "dpd"}, {"mobile_dpd", "mobile-dpd"}, {"mtu", "mtu"}} {
+		line(&b, fmt.Sprintf("%s = %d", item[1], intValue(s[item[0]])))
+	}
+	for _, item := range [][2]string{{"compression", "compression"}, {"cisco_client_compat", "cisco-client-compat"}, {"deny_roaming", "deny-roaming"}, {"tunnel_all_dns", "tunnel-all-dns"}, {"restrict_user_to_routes", "restrict-user-to-routes"}} {
+		line(&b, fmt.Sprintf("%s = %s", item[1], yesNo(boolValue(s[item[0]], false))))
+	}
+	if value := firstString(s["banner"]); value != "" {
+		line(&b, "banner = "+strconv.Quote(value))
+	}
+	if value := firstString(s["default_domain"]); value != "" {
+		line(&b, "default-domain = "+value)
+	}
+	line(&b, "isolate-workers = true")
+	line(&b, "predictable-ips = true")
+	line(&b, "use-occtl = true")
+	return b.String()
+}
+
+func anyConnectDevicePrefix(port int) string {
+	return "rac" + strconv.Itoa(port)
+}
+
+func writeAnyConnectPAM(dir, name string) error {
+	script := filepath.Join(dir, "auth.sh")
+	body := fmt.Sprintf("#!/bin/sh\nIFS= read -r password\ntab=$(printf '\\t')\nwhile IFS=\"$tab\" read -r uid username stored ip used limit status rest; do\n  if [ \"$username\" = \"$PAM_USER\" ] && [ \"$stored\" = \"$password\" ] && { [ \"$status\" = active ] || [ \"$status\" = on_hold ]; }; then exit 0; fi\ndone < %q\nexit 1\n", filepath.Join(dir, "users.tsv"))
+	if err := writeFileIfChanged(script, []byte(body), 0o700); err != nil {
+		return err
+	}
+	access := fmt.Sprintf("#!/bin/sh\ntab=$(printf '\\t')\nwhile IFS=\"$tab\" read -r uid username password ip used limit status rest; do\n  if [ \"$username\" = \"$USERNAME\" ] && { [ \"$status\" = active ] || [ \"$status\" = on_hold ]; }; then exit 0; fi\ndone < %q\nexit 1\n", filepath.Join(dir, "users.tsv"))
+	if err := writeFileIfChanged(filepath.Join(dir, "connect.sh"), []byte(access), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile("/etc/pam.d/rebecca-ocserv-"+name, []byte("auth required pam_exec.so expose_authtok quiet "+script+"\naccount required pam_permit.so\n"), 0o600)
+}
+
+func writeAnyConnectUserConfigs(dir string, users []remoteAccessRuntimeUser) error {
+	usersDir := filepath.Join(dir, "users.d")
+	if err := os.MkdirAll(usersDir, 0o700); err != nil {
+		return err
+	}
+	desired := map[string]struct{}{}
+	for _, user := range users {
+		name := safeName(user.Username)
+		desired[name] = struct{}{}
+		if err := writeFileIfChanged(filepath.Join(usersDir, name), []byte("explicit-ipv4 = "+user.IPv4Address+"\n"), 0o600); err != nil {
+			return err
+		}
+	}
+	if entries, err := os.ReadDir(usersDir); err == nil {
+		for _, entry := range entries {
+			if _, ok := desired[entry.Name()]; !ok {
+				_ = os.Remove(filepath.Join(usersDir, entry.Name()))
+			}
+		}
+	}
+	return nil
+}
+
+func applyRemoteAccessNetworking(name, iface string, inbound remoteAccessRuntimeInbound) error {
+	pool := firstString(inbound.Settings["ipv4_pool_cidr"])
+	if inbound.TunnelPort > 0 && boolValue(inbound.Settings["tproxy_enabled"], true) {
+		enableVPNTProxyHostNetworking(pool)
+		table := "rebecca_" + safeName(name)
+		match := "ip saddr " + pool
+		if iface != "" {
+			match = `iifname "` + iface + `"`
+		}
+		rules := fmt.Sprintf("table inet %s { chain prerouting { type filter hook prerouting priority mangle; policy accept; %s meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept } }\n", table, match, inbound.TunnelPort)
+		_ = exec.Command("nft", "delete", "table", "inet", table).Run()
+		cmd := exec.Command("nft", "-f", "-")
+		cmd.Stdin = strings.NewReader(rules)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("apply %s nftables: %v: %s", name, err, strings.TrimSpace(string(output)))
+		}
+		if err := applyTProxyRouting(); err != nil {
+			return err
+		}
+		return vpnRemoveDirectNAT(name)
+	}
+	return vpnApplyDirectNAT(name, iface, pool)
+}
+
+func (m *remoteAccessManager) stop(protocol string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if protocol == "ikev2" {
+		_ = updateManagedBlock("/etc/ipsec.conf", "# BEGIN REBECCA IKEV2", "# END REBECCA IKEV2", "")
+		_ = updateManagedBlock("/etc/ipsec.secrets", "# BEGIN REBECCA IKEV2", "# END REBECCA IKEV2", "")
+		_ = runOptional("ipsec", "reload")
+		return nil
+	}
+	base := filepath.Join(m.baseDir, "anyconnect")
+	entries, _ := os.ReadDir(base)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			stopAnyConnect(entry.Name(), filepath.Join(base, entry.Name()))
+		}
+	}
+	return nil
+}
+
+func ensureIKEv2Prerequisites() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if strings.Contains(strings.ToLower(commandOutput("ipsec", "--version")), "strongswan") && commandExists("swanctl") && commandExists("sqlite3") {
+		return nil
+	}
+	if os.Geteuid() != 0 || !commandExists("apt-get") {
+		return fmt.Errorf("IKEv2 requires strongSwan and automatic migration is supported on apt-based binary nodes")
+	}
+	_ = runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "remove", "-y", "libreswan")
+	if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
+		return err
+	}
+	return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "strongswan", "strongswan-starter", "strongswan-swanctl", "libcharon-extra-plugins", "libstrongswan-extra-plugins", "sqlite3", "nftables", "iptables")
+}
+
+func configureIKEv2Pool(dir string, users []remoteAccessRuntimeUser) (bool, error) {
+	database := filepath.Join(dir, "leases.db")
+	config := fmt.Sprintf("charon {\n  plugins {\n    attr-sql {\n      database = sqlite://%s\n      lease_history = yes\n    }\n  }\n}\npool {\n  database = sqlite://%s\n  load = sqlite\n}\n", database, database)
+	before, _ := os.ReadFile("/etc/strongswan.conf")
+	if err := updateManagedBlock("/etc/strongswan.conf", "# BEGIN REBECCA IKEV2 POOL", "# END REBECCA IKEV2 POOL", config); err != nil {
+		return false, err
+	}
+	after, _ := os.ReadFile("/etc/strongswan.conf")
+	configChanged := string(before) != string(after)
+	databaseCreated := false
+	if _, err := os.Stat(database); os.IsNotExist(err) {
+		databaseCreated = true
+		schema := ""
+		for _, candidate := range []string{"/usr/share/strongswan/templates/database/sqlite.sql", "/usr/share/strongswan/templates/database/sqlite.sql.gz", "/usr/share/doc/strongswan/examples/sqlite.sql"} {
+			if _, statErr := os.Stat(candidate); statErr == nil {
+				schema = candidate
+				break
+			}
+		}
+		if schema == "" || strings.HasSuffix(schema, ".gz") {
+			return false, fmt.Errorf("strongSwan SQLite pool schema was not installed")
+		}
+		cmd := exec.Command("sqlite3", database)
+		raw, readErr := os.ReadFile(schema)
+		if readErr != nil {
+			return false, readErr
+		}
+		cmd.Stdin = strings.NewReader(string(raw))
+		if output, runErr := cmd.CombinedOutput(); runErr != nil {
+			return false, fmt.Errorf("initialize IKEv2 address pool: %v: %s", runErr, strings.TrimSpace(string(output)))
+		}
+		_ = os.Chmod(database, 0o600)
+	}
+	var leases strings.Builder
+	for _, user := range users {
+		if user.Username != "" && user.IPv4Address != "" && !strings.ContainsAny(user.Username, "\r\n=") {
+			line(&leases, user.IPv4Address+"="+user.Username)
+		}
+	}
+	addresses := filepath.Join(dir, "addresses.txt")
+	old, _ := os.ReadFile(addresses)
+	if !databaseCreated && string(old) == leases.String() {
+		return configChanged, nil
+	}
+	if err := writeFileIfChanged(addresses, []byte(leases.String()), 0o600); err != nil {
+		return false, err
+	}
+	args := []string{"pool", "--replace", "rebecca-ikev2", "--addresses", addresses, "--timeout", "0"}
+	if output, err := exec.Command("ipsec", args...).CombinedOutput(); err != nil {
+		args[1] = "--add"
+		if retry, retryErr := exec.Command("ipsec", args...).CombinedOutput(); retryErr != nil {
+			return false, fmt.Errorf("configure IKEv2 address pool: %v: %s; add: %v: %s", err, strings.TrimSpace(string(output)), retryErr, strings.TrimSpace(string(retry)))
+		}
+	}
+	return configChanged, nil
+}
+
+func ensureAnyConnectPrerequisites() error {
+	if runtime.GOOS != "linux" || commandExists("ocserv") {
+		return nil
+	}
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("AnyConnect prerequisites are missing and automatic install requires root")
+	}
+	switch {
+	case commandExists("apt-get"):
+		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
+			return err
+		}
+		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "ocserv", "libpam-modules", "nftables", "iptables")
+	case commandExists("dnf"):
+		return runInstallCommand(nil, "dnf", "install", "-y", "ocserv", "nftables", "iptables")
+	case commandExists("yum"):
+		return runInstallCommand(nil, "yum", "install", "-y", "ocserv", "nftables", "iptables")
+	default:
+		return fmt.Errorf("AnyConnect prerequisites are missing and no supported package manager was found")
+	}
+}
+
+func restartAnyConnect(name, conf, dir string) error {
+	stopAnyConnect(name, dir)
+	cmd := exec.Command("ocserv", "-c", conf)
+	logPath := filepath.Join(dir, "ocserv.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	cmd.Stdout, cmd.Stderr = logFile, logFile
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return err
+	}
+	_ = logFile.Close()
+	return cmd.Process.Release()
+}
+
+func anyConnectRunning(dir string) bool {
+	raw, err := os.ReadFile(filepath.Join(dir, "ocserv.pid"))
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	return err == nil && pid > 1 && exec.Command("kill", "-0", strconv.Itoa(pid)).Run() == nil
+}
+
+func terminateInvalidAnyConnectUsers(dir string, users []remoteAccessRuntimeUser) error {
+	allowed := make(map[string]struct{}, len(users))
+	for _, user := range users {
+		allowed[user.Username] = struct{}{}
+	}
+	output, err := exec.Command("occtl", "--json", "--socket-file", filepath.Join(dir, "ocserv.sock"), "show", "users").Output()
+	if err != nil {
+		return nil
+	}
+	var sessions []map[string]any
+	if json.Unmarshal(output, &sessions) != nil {
+		return nil
+	}
+	for _, session := range sessions {
+		username := firstString(session["Username"], session["username"])
+		if username == "" {
+			continue
+		}
+		if _, ok := allowed[username]; ok {
+			continue
+		}
+		_ = exec.Command("occtl", "--socket-file", filepath.Join(dir, "ocserv.sock"), "terminate", "user", username).Run()
+	}
+	return nil
+}
+
+func stopAnyConnect(name, dir string) {
+	if raw, err := os.ReadFile(filepath.Join(dir, "ocserv.pid")); err == nil {
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 1 {
+			_ = exec.Command("kill", strconv.Itoa(pid)).Run()
+		}
+	}
+	_ = exec.Command("nft", "delete", "table", "inet", "rebecca_anyconnect_"+safeName(name)).Run()
+	_ = vpnRemoveDirectNAT("anyconnect-" + name)
+}
+
+func yesNo(value bool) string {
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
+func (m *remoteAccessManager) CollectUsage(protocol string) []xray.UserStat {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stats := map[string]int64{}
+	base := filepath.Join(m.baseDir, protocol)
+	entries := []string{base}
+	if protocol == "anyconnect" {
+		entries = nil
+		if dirs, err := os.ReadDir(base); err == nil {
+			for _, dir := range dirs {
+				if dir.IsDir() {
+					entries = append(entries, filepath.Join(base, dir.Name()))
+				}
+			}
+		}
+	}
+	for _, dir := range entries {
+		if protocol == "anyconnect" {
+			m.collectAnyConnectLive(dir, stats)
+		} else if protocol == "ikev2" {
+			m.collectIKEv2Live(dir, stats)
+		}
+		file, err := os.Open(filepath.Join(dir, "usage.tsv"))
+		if err != nil {
+			continue
+		}
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			parts := strings.Split(scanner.Text(), "\t")
+			if len(parts) >= 2 {
+				value, _ := strconv.ParseInt(parts[1], 10, 64)
+				stats[protocol+":"+parts[0]] += value
+			}
+		}
+		_ = file.Close()
+		_ = os.WriteFile(filepath.Join(dir, "usage.tsv"), nil, 0o600)
+	}
+	result := make([]xray.UserStat, 0, len(stats))
+	for uid, value := range stats {
+		if value > 0 {
+			result = append(result, xray.UserStat{UID: uid, Value: value})
+		}
+	}
+	return result
+}
+
+type ikev2Session struct {
+	ID, Username, ClientIP, AssignedIP string
+	Bytes                              int64
+}
+
+var ikev2SARx = regexp.MustCompile(`(?s)(?:^|[\s{])[^\s{}]+\s+\{uniqueid=([0-9]+).*?remote-id=([^\s}]+).*?remote-host=([^\s}]+).*?bytes-in=([0-9]+).*?bytes-out=([0-9]+).*?remote-ts=\[([0-9a-fA-F:.]+)/[0-9]+\]`)
+
+func parseIKEv2SAs(raw string) []ikev2Session {
+	matches := ikev2SARx.FindAllStringSubmatch(raw, -1)
+	result := make([]ikev2Session, 0, len(matches))
+	for _, match := range matches {
+		rx, _ := strconv.ParseInt(match[4], 10, 64)
+		tx, _ := strconv.ParseInt(match[5], 10, 64)
+		result = append(result, ikev2Session{ID: match[1], Username: strings.Trim(match[2], "'\""), ClientIP: match[3], AssignedIP: match[6], Bytes: rx + tx})
+	}
+	return result
+}
+
+func (m *remoteAccessManager) collectIKEv2Live(dir string, stats map[string]int64) {
+	users := readRemoteAccessUsers(filepath.Join(dir, "users.tsv"))
+	if len(users) == 0 || !commandExists("swanctl") {
+		return
+	}
+	output, err := exec.Command("swanctl", "--list-sas", "--ike", "rebecca-ikev2", "--raw", "--noblock").Output()
+	if err != nil {
+		return
+	}
+	accountingPath := filepath.Join(dir, "accounting.tsv")
+	records := readOVAccounting(accountingPath)
+	active := map[string]struct{}{}
+	runtimeConfig := m.runtimeConfig("ikev2")
+	callback, inboundTag, accounting := (*vpnSessionCallback)(nil), "ikev2", true
+	if runtimeConfig != nil {
+		callback = runtimeConfig.SessionCallback
+		if len(runtimeConfig.Inbounds) > 0 {
+			inboundTag = runtimeConfig.Inbounds[0].Tag
+			accounting = boolValue(runtimeConfig.Inbounds[0].Settings["accounting_enabled"], true)
+		}
+	}
+	for _, session := range parseIKEv2SAs(string(output)) {
+		user, ok := users[session.Username]
+		if !ok {
+			_ = exec.Command("swanctl", "--terminate", "--ike-id", session.ID).Run()
+			continue
+		}
+		record, existed := records[session.ID]
+		if record.UserID == "" {
+			record.UserID, record.Base = strconv.FormatInt(user.UserID, 10), user.Used
+		}
+		if accounting && session.Bytes > record.Total {
+			stats["ikev2:"+record.UserID] += session.Bytes - record.Total
+		}
+		record.Total = session.Bytes
+		records[session.ID], active[session.ID] = record, struct{}{}
+		if !existed {
+			event := vpnSessionEvent{UserID: user.UserID, Protocol: "ikev2", InboundTag: inboundTag, SessionID: session.ID, AssignedIP: session.AssignedIP, ClientIP: session.ClientIP, Event: "start"}
+			if !vpnAdmitGoSession(m.sessionsPath(), callback, event, user.DeviceLimit) {
+				_ = exec.Command("swanctl", "--terminate", "--ike-id", session.ID).Run()
+				continue
+			}
+		}
+		if accounting && user.Limit > 0 && record.Base+record.Total >= user.Limit {
+			_ = exec.Command("swanctl", "--terminate", "--ike-id", session.ID).Run()
+		}
+	}
+	for sessionID, record := range records {
+		if _, ok := active[sessionID]; ok {
+			continue
+		}
+		uid, _ := strconv.ParseInt(record.UserID, 10, 64)
+		vpnReleaseGoSession(m.sessionsPath(), callback, vpnSessionEvent{UserID: uid, Protocol: "ikev2", InboundTag: inboundTag, SessionID: sessionID, Event: "stop"})
+		delete(records, sessionID)
+	}
+	writeOVAccounting(accountingPath, records)
+}
+
+func (m *remoteAccessManager) runtimeConfig(protocol string) *remoteAccessRuntime {
+	var runtimeConfig remoteAccessRuntime
+	raw, err := os.ReadFile(filepath.Join(m.baseDir, protocol, "runtime.json"))
+	if err != nil || json.Unmarshal(raw, &runtimeConfig) != nil {
+		return nil
+	}
+	return &runtimeConfig
+}
+
+type remoteAccessUserSnapshot struct {
+	UserID      int64
+	Used        int64
+	Limit       int64
+	DeviceLimit int64
+	AssignedIP  string
+}
+
+func readRemoteAccessUsers(path string) map[string]remoteAccessUserSnapshot {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	result := map[string]remoteAccessUserSnapshot{}
+	for _, row := range strings.Split(string(raw), "\n") {
+		parts := strings.Split(row, "\t")
+		if len(parts) < 9 || parts[0] == "" || parts[1] == "" {
+			continue
+		}
+		uid, _ := strconv.ParseInt(parts[0], 10, 64)
+		used, _ := strconv.ParseInt(parts[4], 10, 64)
+		limit, _ := strconv.ParseInt(parts[5], 10, 64)
+		deviceLimit, _ := strconv.ParseInt(parts[8], 10, 64)
+		result[parts[1]] = remoteAccessUserSnapshot{UserID: uid, Used: used, Limit: limit, DeviceLimit: deviceLimit, AssignedIP: parts[3]}
+	}
+	return result
+}
+
+func (m *remoteAccessManager) collectAnyConnectLive(dir string, stats map[string]int64) {
+	users := readRemoteAccessUsers(filepath.Join(dir, "users.tsv"))
+	if len(users) == 0 {
+		return
+	}
+	output, err := exec.Command("occtl", "--json", "--socket-file", filepath.Join(dir, "ocserv.sock"), "show", "users").Output()
+	if err != nil {
+		return
+	}
+	var sessions []map[string]any
+	if json.Unmarshal(output, &sessions) != nil {
+		return
+	}
+	links := interfaceByteTotals()
+	accountingPath := filepath.Join(dir, "accounting.tsv")
+	records := readOVAccounting(accountingPath)
+	active := map[string]struct{}{}
+	runtimeConfig := m.runtimeConfig("anyconnect")
+	callback, accounting := (*vpnSessionCallback)(nil), true
+	if runtimeConfig != nil {
+		callback = runtimeConfig.SessionCallback
+		for _, inbound := range runtimeConfig.Inbounds {
+			if safeName(inbound.Tag) == filepath.Base(dir) {
+				accounting = boolValue(inbound.Settings["accounting_enabled"], true)
+				break
+			}
+		}
+	}
+	for _, session := range sessions {
+		username := firstString(session["Username"], session["username"])
+		user, ok := users[username]
+		if !ok {
+			continue
+		}
+		sessionID := firstString(session["Full session"], session["Session"], session["ID"])
+		if sessionID == "" {
+			continue
+		}
+		device := firstString(session["Device"], session["device"])
+		total := links[device]
+		if total == 0 {
+			total = parseHumanBytes(firstString(session["RX"])) + parseHumanBytes(firstString(session["TX"]))
+		}
+		record, existed := records[sessionID]
+		if record.UserID == "" {
+			record.UserID = strconv.FormatInt(user.UserID, 10)
+			record.Base = user.Used
+		}
+		if accounting && total > record.Total {
+			stats["anyconnect:"+record.UserID] += total - record.Total
+		}
+		record.Total = total
+		records[sessionID], active[sessionID] = record, struct{}{}
+		assignedIP := firstString(session["IPv4"], session["IP"], user.AssignedIP)
+		clientIP := firstString(session["Remote IP"])
+		if !existed {
+			event := vpnSessionEvent{UserID: user.UserID, Protocol: "anyconnect", InboundTag: filepath.Base(dir), SessionID: sessionID, AssignedIP: assignedIP, ClientIP: clientIP, Event: "start"}
+			if !vpnAdmitGoSession(m.sessionsPath(), callback, event, user.DeviceLimit) {
+				_ = exec.Command("occtl", "--socket-file", filepath.Join(dir, "ocserv.sock"), "terminate", "user", username).Run()
+				continue
+			}
+		}
+		if accounting && user.Limit > 0 && record.Base+record.Total >= user.Limit {
+			_ = exec.Command("occtl", "--socket-file", filepath.Join(dir, "ocserv.sock"), "terminate", "user", username).Run()
+		}
+	}
+	for sessionID, record := range records {
+		if _, ok := active[sessionID]; ok {
+			continue
+		}
+		uid, _ := strconv.ParseInt(record.UserID, 10, 64)
+		vpnReleaseGoSession(m.sessionsPath(), callback, vpnSessionEvent{UserID: uid, Protocol: "anyconnect", InboundTag: filepath.Base(dir), SessionID: sessionID, Event: "stop"})
+		delete(records, sessionID)
+	}
+	writeOVAccounting(accountingPath, records)
+}
+
+func interfaceByteTotals() map[string]int64 {
+	output, err := exec.Command("ip", "-s", "-j", "link", "show").Output()
+	if err != nil {
+		return nil
+	}
+	var links []struct {
+		Name  string `json:"ifname"`
+		Stats struct {
+			RX struct {
+				Bytes int64 `json:"bytes"`
+			} `json:"rx"`
+			TX struct {
+				Bytes int64 `json:"bytes"`
+			} `json:"tx"`
+		} `json:"stats64"`
+	}
+	if json.Unmarshal(output, &links) != nil {
+		return nil
+	}
+	result := make(map[string]int64, len(links))
+	for _, link := range links {
+		result[link.Name] = link.Stats.RX.Bytes + link.Stats.TX.Bytes
+	}
+	return result
+}
+
+func parseHumanBytes(value string) int64 {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) == 0 {
+		return 0
+	}
+	number, _ := strconv.ParseFloat(fields[0], 64)
+	multiplier := float64(1)
+	if len(fields) > 1 {
+		switch strings.ToUpper(strings.TrimSpace(fields[1])) {
+		case "KB", "KIB":
+			multiplier = 1024
+		case "MB", "MIB":
+			multiplier = 1024 * 1024
+		case "GB", "GIB":
+			multiplier = 1024 * 1024 * 1024
+		case "TB", "TIB":
+			multiplier = 1024 * 1024 * 1024 * 1024
+		}
+	}
+	return int64(number * multiplier)
+}

@@ -163,6 +163,12 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 	if err := api.server.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
 		log.Printf("WireGuard runtime stop failed: %v", err)
 	}
+	if err := api.server.remoteAccess.ApplyIKEv2(&remoteAccessRuntime{Inbounds: []remoteAccessRuntimeInbound{}}); err != nil {
+		log.Printf("IKEv2 runtime stop failed: %v", err)
+	}
+	if err := api.server.remoteAccess.ApplyAnyConnect(&remoteAccessRuntime{Inbounds: []remoteAccessRuntimeInbound{}}); err != nil {
+		log.Printf("AnyConnect runtime stop failed: %v", err)
+	}
 	if err := api.server.ipBlocks.Clear(ctx); err != nil {
 		log.Printf("source IP block cleanup failed: %v", err)
 	}
@@ -375,6 +381,12 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 	if wgStats := api.server.wg.CollectUsage(); len(wgStats) > 0 {
 		stats = append(stats, wgStats...)
 	}
+	if ikev2Stats := api.server.remoteAccess.CollectUsage("ikev2"); len(ikev2Stats) > 0 {
+		stats = append(stats, ikev2Stats...)
+	}
+	if anyConnectStats := api.server.remoteAccess.CollectUsage("anyconnect"); len(anyConnectStats) > 0 {
+		stats = append(stats, anyConnectStats...)
+	}
 	batchID, pending := api.server.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
 	res := &nodev1.UserUsageBatch{BatchId: batchID, OnlineIps: protoOnlineUserIPs(onlineIPs)}
@@ -451,7 +463,7 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if err != nil {
 		return nil, err
 	}
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -479,18 +491,29 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if cacheWGRuntime == nil {
 		cacheWGRuntime = s.cachedWGRuntime()
 	}
+	cacheIKEv2Runtime := ikev2RuntimeConfig
+	if cacheIKEv2Runtime == nil {
+		cacheIKEv2Runtime = s.cachedIKEv2Runtime()
+	}
+	cacheAnyConnectRuntime := anyConnectRuntimeConfig
+	if cacheAnyConnectRuntime == nil {
+		cacheAnyConnectRuntime = s.cachedAnyConnectRuntime()
+	}
 	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
+	ikev2PrepareWarning := s.prepareIKEv2Runtime(cacheIKEv2Runtime)
 	l2tpWarning := s.applyL2TPRuntime(cacheL2TPRuntime)
 	pptpWarning := s.applyPPTPRuntime(cachePPTPRuntime)
 	wgWarning := s.applyWGRuntime(cacheWGRuntime)
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime)
+	ikev2Warning := s.applyIKEv2Runtime(cacheIKEv2Runtime)
+	anyConnectWarning := s.applyAnyConnectRuntime(cacheAnyConnectRuntime)
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
 	message := "runtime started"
 	if sync {
 		message = "runtime config synced"
 	}
-	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
+	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
@@ -501,7 +524,7 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if err != nil {
 		return nil, err
 	}
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -529,21 +552,32 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if cacheWGRuntime == nil {
 		cacheWGRuntime = s.cachedWGRuntime()
 	}
+	cacheIKEv2Runtime := ikev2RuntimeConfig
+	if cacheIKEv2Runtime == nil {
+		cacheIKEv2Runtime = s.cachedIKEv2Runtime()
+	}
+	cacheAnyConnectRuntime := anyConnectRuntimeConfig
+	if cacheAnyConnectRuntime == nil {
+		cacheAnyConnectRuntime = s.cachedAnyConnectRuntime()
+	}
 	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
+	ikev2PrepareWarning := s.prepareIKEv2Runtime(cacheIKEv2Runtime)
 	l2tpWarning := s.applyL2TPRuntime(cacheL2TPRuntime)
 	pptpWarning := s.applyPPTPRuntime(cachePPTPRuntime)
 	wgWarning := s.applyWGRuntime(cacheWGRuntime)
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime)
-	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
+	ikev2Warning := s.applyIKEv2Runtime(cacheIKEv2Runtime)
+	anyConnectWarning := s.applyAnyConnectRuntime(cacheAnyConnectRuntime)
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
+	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
 }
 
 func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeConfigRequest, message string) (*nodev1.RuntimeActionResponse, error) {
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -566,14 +600,25 @@ func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeCo
 	if cacheWGRuntime == nil {
 		cacheWGRuntime = s.cachedWGRuntime()
 	}
+	cacheIKEv2Runtime := ikev2RuntimeConfig
+	if cacheIKEv2Runtime == nil {
+		cacheIKEv2Runtime = s.cachedIKEv2Runtime()
+	}
+	cacheAnyConnectRuntime := anyConnectRuntimeConfig
+	if cacheAnyConnectRuntime == nil {
+		cacheAnyConnectRuntime = s.cachedAnyConnectRuntime()
+	}
 	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
+	ikev2PrepareWarning := s.prepareIKEv2Runtime(cacheIKEv2Runtime)
 	l2tpWarning := s.applyL2TPRuntime(cacheL2TPRuntime)
 	pptpWarning := s.applyPPTPRuntime(cachePPTPRuntime)
 	wgWarning := s.applyWGRuntime(cacheWGRuntime)
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime)
-	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
+	ikev2Warning := s.applyIKEv2Runtime(cacheIKEv2Runtime)
+	anyConnectWarning := s.applyAnyConnectRuntime(cacheAnyConnectRuntime)
+	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
+	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
@@ -673,25 +718,29 @@ func (s *Server) grpcConfig(ctx context.Context, req *nodev1.RuntimeConfigReques
 	return cfg, nil
 }
 
-func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, *pptpRuntime, *wgRuntime, error) {
+func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, *pptpRuntime, *wgRuntime, *remoteAccessRuntime, *remoteAccessRuntime, error) {
 	raw := strings.TrimSpace(req.GetOvRuntimeJson())
 	if raw == "" {
-		return nil, nil, nil, nil, nil
+		return nil, nil, nil, nil, nil, nil, nil
 	}
 	var envelope struct {
-		GeneratedAt     string               `json:"generated_at"`
-		Target          string               `json:"target,omitempty"`
-		SessionCallback *vpnSessionCallback  `json:"session_callback,omitempty"`
-		Inbounds        []ovRuntimeInbound   `json:"inbounds"`
-		L2TPInbounds    []l2tpRuntimeInbound `json:"l2tp_inbounds"`
-		L2TPGenerated   string               `json:"l2tp_generated,omitempty"`
-		PPTPInbounds    []pptpRuntimeInbound `json:"pptp_inbounds"`
-		PPTPGenerated   string               `json:"pptp_generated,omitempty"`
-		WGInbounds      []wgRuntimeInbound   `json:"wg_inbounds"`
-		WGGenerated     string               `json:"wg_generated,omitempty"`
+		GeneratedAt         string                       `json:"generated_at"`
+		Target              string                       `json:"target,omitempty"`
+		SessionCallback     *vpnSessionCallback          `json:"session_callback,omitempty"`
+		Inbounds            []ovRuntimeInbound           `json:"inbounds"`
+		L2TPInbounds        []l2tpRuntimeInbound         `json:"l2tp_inbounds"`
+		L2TPGenerated       string                       `json:"l2tp_generated,omitempty"`
+		PPTPInbounds        []pptpRuntimeInbound         `json:"pptp_inbounds"`
+		PPTPGenerated       string                       `json:"pptp_generated,omitempty"`
+		WGInbounds          []wgRuntimeInbound           `json:"wg_inbounds"`
+		WGGenerated         string                       `json:"wg_generated,omitempty"`
+		IKEv2Inbounds       []remoteAccessRuntimeInbound `json:"ikev2_inbounds"`
+		IKEv2Generated      string                       `json:"ikev2_generated,omitempty"`
+		AnyConnectInbounds  []remoteAccessRuntimeInbound `json:"anyconnect_inbounds"`
+		AnyConnectGenerated string                       `json:"anyconnect_generated,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
-		return nil, nil, nil, nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
+		return nil, nil, nil, nil, nil, nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
 	}
 	ovRuntimeConfig := &ovRuntime{GeneratedAt: envelope.GeneratedAt, Target: envelope.Target, SessionCallback: envelope.SessionCallback, Inbounds: envelope.Inbounds}
 	if ovRuntimeConfig.Inbounds == nil {
@@ -709,7 +758,15 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 	if wgRuntimeConfig.Inbounds == nil {
 		wgRuntimeConfig.Inbounds = []wgRuntimeInbound{}
 	}
-	return ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, nil
+	ikev2RuntimeConfig := &remoteAccessRuntime{GeneratedAt: envelope.IKEv2Generated, Target: envelope.Target, SessionCallback: envelope.SessionCallback, Inbounds: envelope.IKEv2Inbounds}
+	if ikev2RuntimeConfig.Inbounds == nil {
+		ikev2RuntimeConfig.Inbounds = []remoteAccessRuntimeInbound{}
+	}
+	anyConnectRuntimeConfig := &remoteAccessRuntime{GeneratedAt: envelope.AnyConnectGenerated, Target: envelope.Target, SessionCallback: envelope.SessionCallback, Inbounds: envelope.AnyConnectInbounds}
+	if anyConnectRuntimeConfig.Inbounds == nil {
+		anyConnectRuntimeConfig.Inbounds = []remoteAccessRuntimeInbound{}
+	}
+	return ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, nil
 }
 
 func (s *Server) grpcAddUser(req *nodev1.InboundUserRequest, message string) (*nodev1.RuntimeActionResponse, error) {
