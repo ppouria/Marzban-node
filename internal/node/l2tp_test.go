@@ -3,6 +3,7 @@ package node
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestL2TPPoolRangeUsesCIDRCapacity(t *testing.T) {
@@ -63,5 +64,20 @@ func TestL2TPLibreswanConfigSupportsNATClients(t *testing.T) {
 		if !strings.Contains(config, expected) {
 			t.Fatalf("Libreswan config is missing %q:\n%s", expected, config)
 		}
+	}
+}
+
+func TestL2TPChapSecretsExcludeExpiredAndLimitedUsers(t *testing.T) {
+	limit, expired := int64(100), time.Now().Unix()-1
+	secrets := l2tpChapSecrets([]l2tpRuntimeUser{
+		{VPNUsername: "allowed", Password: "secret", Status: "active", UsedTraffic: 99, DataLimit: &limit, IPv4Address: "10.67.0.10"},
+		{VPNUsername: "limited", Password: "secret", Status: "active", UsedTraffic: 100, DataLimit: &limit, IPv4Address: "10.67.0.11"},
+		{VPNUsername: "expired", Password: "secret", Status: "active", Expire: &expired, IPv4Address: "10.67.0.12"},
+	})
+	if !strings.Contains(secrets, `"allowed" rebecca-l2tp "secret" 10.67.0.10`) {
+		t.Fatalf("eligible user missing from chap-secrets:\n%s", secrets)
+	}
+	if strings.Contains(secrets, "limited") || strings.Contains(secrets, "expired") {
+		t.Fatalf("ineligible users remained in chap-secrets:\n%s", secrets)
 	}
 }

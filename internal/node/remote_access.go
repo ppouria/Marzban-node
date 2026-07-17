@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rebeccapanel/rebecca-node/internal/xray"
 )
@@ -311,8 +312,9 @@ func ikev2Secrets(inbound remoteAccessRuntimeInbound, keyPath string) string {
 	var b strings.Builder
 	line(&b, ": RSA "+keyPath)
 	if firstString(inbound.Settings["auth_mode"], "password") != "certificate" {
+		now := time.Now().Unix()
 		for _, user := range inbound.Users {
-			if user.Username != "" && user.Password != "" {
+			if user.Username != "" && user.Password != "" && remoteAccessRuntimeUserAvailable(user, now) {
 				line(&b, fmt.Sprintf("%q : EAP %q", user.Username, user.Password))
 			}
 		}
@@ -382,15 +384,45 @@ func anyConnectDevicePrefix(port int) string {
 
 func writeAnyConnectPAM(dir, name string) error {
 	script := filepath.Join(dir, "auth.sh")
-	body := fmt.Sprintf("#!/bin/sh\nIFS= read -r password\ntab=$(printf '\\t')\nwhile IFS=\"$tab\" read -r uid username stored ip used limit status rest; do\n  if [ \"$username\" = \"$PAM_USER\" ] && [ \"$stored\" = \"$password\" ] && { [ \"$status\" = active ] || [ \"$status\" = on_hold ]; }; then exit 0; fi\ndone < %q\nexit 1\n", filepath.Join(dir, "users.tsv"))
-	if err := writeFileIfChanged(script, []byte(body), 0o700); err != nil {
+	usersPath := filepath.Join(dir, "users.tsv")
+	if err := writeFileIfChanged(script, []byte(anyConnectAuthScript(usersPath)), 0o700); err != nil {
 		return err
 	}
-	access := fmt.Sprintf("#!/bin/sh\ntab=$(printf '\\t')\nwhile IFS=\"$tab\" read -r uid username password ip used limit status rest; do\n  if [ \"$username\" = \"$USERNAME\" ] && { [ \"$status\" = active ] || [ \"$status\" = on_hold ]; }; then exit 0; fi\ndone < %q\nexit 1\n", filepath.Join(dir, "users.tsv"))
-	if err := writeFileIfChanged(filepath.Join(dir, "connect.sh"), []byte(access), 0o700); err != nil {
+	if err := writeFileIfChanged(filepath.Join(dir, "connect.sh"), []byte(anyConnectConnectScript(usersPath)), 0o700); err != nil {
 		return err
 	}
 	return os.WriteFile("/etc/pam.d/rebecca-ocserv-"+name, []byte("auth required pam_exec.so expose_authtok quiet "+script+"\naccount required pam_permit.so\n"), 0o600)
+}
+
+func anyConnectAuthScript(usersPath string) string {
+	return fmt.Sprintf(`#!/bin/sh
+IFS= read -r password
+now=$(date +%%s)
+awk -F '\t' -v u="$PAM_USER" -v p="$password" -v now="$now" '
+  $2 == u && $3 == p && ($7 == "" || $7 == "active" || $7 == "on_hold") {
+    if ($6 != "" && $5 >= $6) exit 2
+    if ($8 != "" && now >= $8) exit 3
+    found=1
+    exit 0
+  }
+  END { exit found ? 0 : 1 }
+' %q
+`, usersPath)
+}
+
+func anyConnectConnectScript(usersPath string) string {
+	return fmt.Sprintf(`#!/bin/sh
+now=$(date +%%s)
+awk -F '\t' -v u="$USERNAME" -v now="$now" '
+  $2 == u && ($7 == "" || $7 == "active" || $7 == "on_hold") {
+    if ($6 != "" && $5 >= $6) exit 2
+    if ($8 != "" && now >= $8) exit 3
+    found=1
+    exit 0
+  }
+  END { exit found ? 0 : 1 }
+' %q
+`, usersPath)
 }
 
 func writeAnyConnectUserConfigs(dir string, users []remoteAccessRuntimeUser) error {
@@ -425,7 +457,7 @@ func applyRemoteAccessNetworking(name, iface string, inbound remoteAccessRuntime
 		if iface != "" {
 			match = `iifname "` + iface + `"`
 		}
-		rules := fmt.Sprintf("table inet %s { chain prerouting { type filter hook prerouting priority mangle; policy accept; %s meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept } }\n", table, match, inbound.TunnelPort)
+		rules := remoteAccessTProxyScript(table, match, pool, inbound.TunnelPort)
 		_ = exec.Command("nft", "delete", "table", "inet", table).Run()
 		cmd := exec.Command("nft", "-f", "-")
 		cmd.Stdin = strings.NewReader(rules)
@@ -438,6 +470,20 @@ func applyRemoteAccessNetworking(name, iface string, inbound remoteAccessRuntime
 		return vpnRemoveDirectNAT(name)
 	}
 	return vpnApplyDirectNAT(name, iface, pool)
+}
+
+func remoteAccessTProxyScript(table, match, pool string, tunnelPort int) string {
+	return fmt.Sprintf(`table inet %s {
+  chain prerouting {
+    type filter hook prerouting priority mangle; policy accept;
+    %s meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr %s meta l4proto icmp masquerade
+  }
+}
+`, table, match, tunnelPort, pool)
 }
 
 func (m *remoteAccessManager) stop(protocol string) error {
@@ -584,8 +630,11 @@ func anyConnectRunning(dir string) bool {
 
 func terminateInvalidAnyConnectUsers(dir string, users []remoteAccessRuntimeUser) error {
 	allowed := make(map[string]struct{}, len(users))
+	now := time.Now().Unix()
 	for _, user := range users {
-		allowed[user.Username] = struct{}{}
+		if remoteAccessRuntimeUserAvailable(user, now) {
+			allowed[user.Username] = struct{}{}
+		}
 	}
 	output, err := exec.Command("occtl", "--json", "--socket-file", filepath.Join(dir, "ocserv.sock"), "show", "users").Output()
 	if err != nil {
@@ -606,6 +655,18 @@ func terminateInvalidAnyConnectUsers(dir string, users []remoteAccessRuntimeUser
 		_ = exec.Command("occtl", "--socket-file", filepath.Join(dir, "ocserv.sock"), "terminate", "user", username).Run()
 	}
 	return nil
+}
+
+func disconnectAnyConnectSession(dir string, session map[string]any) {
+	socketArgs := []string{"--socket-file", filepath.Join(dir, "ocserv.sock")}
+	if id := firstString(session["ID"]); id != "" {
+		if exec.Command("occtl", append(socketArgs, "disconnect", "id", id)...).Run() == nil {
+			return
+		}
+	}
+	if username := firstString(session["Username"], session["username"]); username != "" {
+		_ = exec.Command("occtl", append(socketArgs, "terminate", "user", username)...).Run()
+	}
 }
 
 func stopAnyConnect(name, dir string) {
@@ -713,6 +774,7 @@ func (m *remoteAccessManager) collectIKEv2Live(dir string, stats map[string]int6
 			accounting = boolValue(runtimeConfig.Inbounds[0].Settings["accounting_enabled"], true)
 		}
 	}
+	now := time.Now().Unix()
 	for _, session := range parseIKEv2SAs(string(output)) {
 		user, ok := users[session.Username]
 		if !ok {
@@ -728,6 +790,10 @@ func (m *remoteAccessManager) collectIKEv2Live(dir string, stats map[string]int6
 		}
 		record.Total = session.Bytes
 		records[session.ID], active[session.ID] = record, struct{}{}
+		if !remoteAccessSnapshotAvailable(user, now) {
+			_ = exec.Command("swanctl", "--terminate", "--ike-id", session.ID).Run()
+			continue
+		}
 		if !existed {
 			event := vpnSessionEvent{UserID: user.UserID, Protocol: "ikev2", InboundTag: inboundTag, SessionID: session.ID, AssignedIP: session.AssignedIP, ClientIP: session.ClientIP, Event: "start"}
 			if !vpnAdmitGoSession(m.sessionsPath(), callback, event, user.DeviceLimit) {
@@ -735,7 +801,7 @@ func (m *remoteAccessManager) collectIKEv2Live(dir string, stats map[string]int6
 				continue
 			}
 		}
-		if accounting && user.Limit > 0 && record.Base+record.Total >= user.Limit {
+		if user.Limit > 0 && record.Base+record.Total >= user.Limit {
 			_ = exec.Command("swanctl", "--terminate", "--ike-id", session.ID).Run()
 		}
 	}
@@ -765,6 +831,8 @@ type remoteAccessUserSnapshot struct {
 	Limit       int64
 	DeviceLimit int64
 	AssignedIP  string
+	Status      string
+	Expire      int64
 }
 
 func readRemoteAccessUsers(path string) map[string]remoteAccessUserSnapshot {
@@ -781,10 +849,41 @@ func readRemoteAccessUsers(path string) map[string]remoteAccessUserSnapshot {
 		uid, _ := strconv.ParseInt(parts[0], 10, 64)
 		used, _ := strconv.ParseInt(parts[4], 10, 64)
 		limit, _ := strconv.ParseInt(parts[5], 10, 64)
+		expire, _ := strconv.ParseInt(parts[7], 10, 64)
 		deviceLimit, _ := strconv.ParseInt(parts[8], 10, 64)
-		result[parts[1]] = remoteAccessUserSnapshot{UserID: uid, Used: used, Limit: limit, DeviceLimit: deviceLimit, AssignedIP: parts[3]}
+		result[parts[1]] = remoteAccessUserSnapshot{UserID: uid, Used: used, Limit: limit, DeviceLimit: deviceLimit, AssignedIP: parts[3], Status: parts[6], Expire: expire}
 	}
 	return result
+}
+
+func remoteAccessRuntimeUserAvailable(user remoteAccessRuntimeUser, now int64) bool {
+	return runtimeUserAvailable(user.Status, user.UsedTraffic, user.DataLimit, user.Expire, now)
+}
+
+func runtimeUserAvailable(status string, used int64, dataLimit, expiresAt *int64, now int64) bool {
+	limit, expire := int64(0), int64(0)
+	if dataLimit != nil {
+		limit = *dataLimit
+	}
+	if expiresAt != nil {
+		expire = *expiresAt
+	}
+	return remoteAccessUserAvailable(status, used, limit, expire, now)
+}
+
+func remoteAccessSnapshotAvailable(user remoteAccessUserSnapshot, now int64) bool {
+	return remoteAccessUserAvailable(user.Status, user.Used, user.Limit, user.Expire, now)
+}
+
+func remoteAccessUserAvailable(status string, used, limit, expire, now int64) bool {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status != "" && status != "active" && status != "on_hold" {
+		return false
+	}
+	if limit > 0 && used >= limit {
+		return false
+	}
+	return expire <= 0 || now < expire
 }
 
 func (m *remoteAccessManager) collectAnyConnectLive(dir string, stats map[string]int64) {
@@ -815,6 +914,7 @@ func (m *remoteAccessManager) collectAnyConnectLive(dir string, stats map[string
 			}
 		}
 	}
+	now := time.Now().Unix()
 	for _, session := range sessions {
 		username := firstString(session["Username"], session["username"])
 		user, ok := users[username]
@@ -842,14 +942,18 @@ func (m *remoteAccessManager) collectAnyConnectLive(dir string, stats map[string
 		records[sessionID], active[sessionID] = record, struct{}{}
 		assignedIP := firstString(session["IPv4"], session["IP"], user.AssignedIP)
 		clientIP := firstString(session["Remote IP"])
+		if !remoteAccessSnapshotAvailable(user, now) {
+			disconnectAnyConnectSession(dir, session)
+			continue
+		}
 		if !existed {
 			event := vpnSessionEvent{UserID: user.UserID, Protocol: "anyconnect", InboundTag: filepath.Base(dir), SessionID: sessionID, AssignedIP: assignedIP, ClientIP: clientIP, Event: "start"}
 			if !vpnAdmitGoSession(m.sessionsPath(), callback, event, user.DeviceLimit) {
-				_ = exec.Command("occtl", "--socket-file", filepath.Join(dir, "ocserv.sock"), "terminate", "user", username).Run()
+				disconnectAnyConnectSession(dir, session)
 				continue
 			}
 		}
-		if accounting && user.Limit > 0 && record.Base+record.Total >= user.Limit {
+		if user.Limit > 0 && record.Base+record.Total >= user.Limit {
 			_ = exec.Command("occtl", "--socket-file", filepath.Join(dir, "ocserv.sock"), "terminate", "user", username).Run()
 		}
 	}

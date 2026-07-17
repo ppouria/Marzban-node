@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRemoteAccessUsesNodeWideSessionLedger(t *testing.T) {
@@ -67,5 +68,49 @@ func TestAnyConnectConfigIsStable(t *testing.T) {
 func TestParseHumanBytes(t *testing.T) {
 	if got := parseHumanBytes("1.5 MB"); got != 1572864 {
 		t.Fatalf("got %d", got)
+	}
+}
+
+func TestRemoteAccessTProxyScriptMasqueradesPing(t *testing.T) {
+	script := remoteAccessTProxyScript("rebecca_ikev2", "ip saddr 10.70.0.0/24", "10.70.0.0/24", 17020)
+	for _, expected := range []string{
+		"tproxy ip to 127.0.0.1:17020",
+		"meta l4proto { tcp, udp }",
+		"type nat hook postrouting priority srcnat",
+		"ip saddr 10.70.0.0/24 meta l4proto icmp masquerade",
+	} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("missing %q in:\n%s", expected, script)
+		}
+	}
+}
+
+func TestRemoteAccessRejectsExpiredAndLimitedUsers(t *testing.T) {
+	now := time.Now().Unix()
+	limit, expired := int64(100), now-1
+	users := []remoteAccessRuntimeUser{
+		{Username: "allowed", Password: "secret", Status: "active", UsedTraffic: 99, DataLimit: &limit},
+		{Username: "limited", Password: "secret", Status: "active", UsedTraffic: 100, DataLimit: &limit},
+		{Username: "expired", Password: "secret", Status: "active", Expire: &expired},
+		{Username: "disabled", Password: "secret", Status: "disabled"},
+	}
+	secrets := ikev2Secrets(remoteAccessRuntimeInbound{Settings: map[string]any{"auth_mode": "password"}, Users: users}, "/server.key")
+	if !strings.Contains(secrets, `"allowed" : EAP "secret"`) {
+		t.Fatalf("eligible user missing from IKEv2 secrets:\n%s", secrets)
+	}
+	for _, username := range []string{"limited", "expired", "disabled"} {
+		if strings.Contains(secrets, `"`+username+`"`) {
+			t.Fatalf("ineligible user %s remained in IKEv2 secrets:\n%s", username, secrets)
+		}
+	}
+}
+
+func TestAnyConnectScriptsEnforceExpiryAndQuota(t *testing.T) {
+	for _, script := range []string{anyConnectAuthScript("/tmp/users.tsv"), anyConnectConnectScript("/tmp/users.tsv")} {
+		for _, expected := range []string{`$5 >= $6`, `now >= $8`, `active`, `on_hold`} {
+			if !strings.Contains(script, expected) {
+				t.Fatalf("script does not enforce %q:\n%s", expected, script)
+			}
+		}
 	}
 }

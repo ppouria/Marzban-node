@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rebeccapanel/rebecca-node/internal/xray"
 )
@@ -432,8 +433,9 @@ func boundedInt(value any, fallback int, min int, max int) int {
 
 func l2tpChapSecrets(users []l2tpRuntimeUser) string {
 	var b strings.Builder
+	now := time.Now().Unix()
 	for _, user := range users {
-		if strings.TrimSpace(user.VPNUsername) == "" || strings.TrimSpace(user.Password) == "" {
+		if strings.TrimSpace(user.VPNUsername) == "" || strings.TrimSpace(user.Password) == "" || !runtimeUserAvailable(user.Status, user.UsedTraffic, user.DataLimit, user.Expire, now) {
 			continue
 		}
 		line(&b, fmt.Sprintf("%q rebecca-l2tp %q %s", user.VPNUsername, user.Password, firstString(user.IPv4Address, "*")))
@@ -545,9 +547,10 @@ func (m *l2tpManager) disconnectStaleSessions(users []l2tpRuntimeUser) {
 		return
 	}
 	allowed := map[string]struct{}{}
+	now := time.Now().Unix()
 	for _, user := range users {
 		username := strings.TrimSpace(user.VPNUsername)
-		if username != "" {
+		if username != "" && runtimeUserAvailable(user.Status, user.UsedTraffic, user.DataLimit, user.Expire, now) {
 			allowed[username] = struct{}{}
 		}
 	}
