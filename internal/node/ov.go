@@ -953,6 +953,7 @@ func authScript(usersPath string, usagePath string, callbackPath string, session
 	return fmt.Sprintf(`#!/bin/sh
 USERS=%q
 USAGE=%q
+MANAGEMENT="$(dirname "$USERS")/management.sock"
 now=$(date +%%s)
 %s
 touch "$USAGE" 2>/dev/null || true
@@ -979,8 +980,17 @@ device_limit=$(printf '%%s' "$info" | awk -F '\t' '{print $3}')
 remote_ip=${trusted_ip:-${untrusted_ip:-unknown}}
 remote_port=${trusted_port:-${untrusted_port:-0}}
 session=$(vpn_safe "ov:${remote_ip}:${remote_port}:${username}")
-vpn_admit "$uid" "ov" %q "$session" "$assigned_ip" "$remote_ip" "$device_limit" || exit 1
-`, usersPath, usagePath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
+old_endpoint=$(awk -F '\t' -v uid="$uid" -v tag=%q -v sid="$session" -v ip="$assigned_ip" '
+  $1 == uid && $2 == "ov" && $3 == tag && $4 != sid && $5 == ip && $8 ~ /^[0-9]+$/ {
+    if (index($6, ":")) print "[" $6 "]:" $8; else print $6 ":" $8
+    exit
+  }
+' "$VPN_SESSIONS" 2>/dev/null)
+vpn_admit "$uid" "ov" %q "$session" "$assigned_ip" "$remote_ip" "$device_limit" "$remote_port" || exit 1
+if [ -n "$old_endpoint" ] && [ -S "$MANAGEMENT" ] && command -v curl >/dev/null 2>&1; then
+  (printf 'kill %%s\nquit\n' "$old_endpoint" | curl -sS -N --max-time 5 --unix-socket "$MANAGEMENT" -T - telnet://localhost >/dev/null 2>&1 || true) &
+fi
+`, usersPath, usagePath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag), safeName(inboundTag))
 }
 
 func disconnectScript(usersPath string, usagePath string, accountingPath string, callbackPath string, sessionsPath string, inboundTag string) string {

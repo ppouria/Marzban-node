@@ -96,6 +96,7 @@ vpn_admit() {
   ip=$5
   client_ip=$6
   limit=$7
+  remote_port=$8
   [ -n "$uid" ] && [ -n "$session" ] || return 1
   case "$limit" in ''|*[!0-9]*) limit=0 ;; esac
   mkdir -p "$(dirname "$VPN_SESSIONS")"
@@ -103,7 +104,12 @@ vpn_admit() {
   (
     flock -x 9 || exit 50
     tmp="${VPN_SESSIONS}.$$"
-    awk -F '\t' -v sid="$session" '$4 != sid && ($5 != "" || $6 != "") { print }' "$VPN_SESSIONS" > "$tmp"
+    awk -F '\t' -v uid="$uid" -v proto="$proto" -v tag="$tag" -v sid="$session" -v ip="$ip" '
+      {
+        ov_reconnect = proto == "ov" && ip != "" && $1 == uid && $2 == proto && $3 == tag && $5 == ip
+        if ($4 != sid && !ov_reconnect && ($5 != "" || $6 != "")) print
+      }
+    ' "$VPN_SESSIONS" > "$tmp"
     device_key=$(vpn_device_key "$ip" "$client_ip" "$session")
     if [ "$limit" -gt 0 ] && [ -z "$device_key" ]; then
       rm -f "$tmp"
@@ -150,7 +156,7 @@ vpn_admit() {
       rm -f "$tmp"
       exit 32
     fi
-    printf '%%s\t%%s\t%%s\t%%s\t%%s\t%%s\t%%s\n' "$uid" "$proto" "$tag" "$session" "$ip" "$client_ip" "$(date +%%s)" >> "$tmp"
+    printf '%%s\t%%s\t%%s\t%%s\t%%s\t%%s\t%%s\t%%s\n' "$uid" "$proto" "$tag" "$session" "$ip" "$client_ip" "$(date +%%s)" "$remote_port" >> "$tmp"
     mv "$tmp" "$VPN_SESSIONS"
     chmod 600 "$VPN_SESSIONS"
   ) 9>"$VPN_LOCK"
@@ -193,6 +199,10 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 	if err := withVPNSessionLock(path, func() {
 		records := vpnSessionRecordsLocked(path)
 		next := records[:0]
+		uidText := strconv.FormatInt(event.UserID, 10)
+		protocol := normalizedVPNProtocol(event.Protocol)
+		inboundTag := safeName(event.InboundTag)
+		assignedIP := strings.TrimSpace(event.AssignedIP)
 		for _, record := range records {
 			if vpnRecordDeviceKey(record) == "" {
 				continue
@@ -200,10 +210,13 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 			if len(record) >= 4 && record[3] == sessionID {
 				continue
 			}
+			if protocol == "ov" && assignedIP != "" && len(record) >= 5 &&
+				record[0] == uidText && record[1] == protocol && record[2] == inboundTag && record[4] == assignedIP {
+				continue
+			}
 			next = append(next, record)
 		}
 		count := 0
-		uidText := strconv.FormatInt(event.UserID, 10)
 		deviceKey := vpnSessionDeviceKey(event.AssignedIP, event.ClientIP)
 		if limit > 0 && deviceKey == "" {
 			return
@@ -213,8 +226,8 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 		devices := map[string]struct{}{}
 		for _, record := range next {
 			if len(record) >= 5 &&
-				record[1] == normalizedVPNProtocol(event.Protocol) &&
-				record[2] == safeName(event.InboundTag) &&
+				record[1] == protocol &&
+				record[2] == inboundTag &&
 				record[4] != "" &&
 				record[4] == strings.TrimSpace(event.AssignedIP) {
 				assignedIPInUse = true
@@ -247,8 +260,8 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 		}
 		next = append(next, []string{
 			uidText,
-			normalizedVPNProtocol(event.Protocol),
-			safeName(event.InboundTag),
+			protocol,
+			inboundTag,
 			sessionID,
 			strings.TrimSpace(event.AssignedIP),
 			strings.TrimSpace(event.ClientIP),

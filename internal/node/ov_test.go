@@ -145,7 +145,12 @@ func TestOVAuthCountsPendingUsage(t *testing.T) {
 		"used = $5 + pending[$1]",
 		"assigned_ip=$(printf '%s' \"$info\"",
 		"remote_ip=${trusted_ip:-${untrusted_ip:-unknown}}",
-		"vpn_admit \"$uid\" \"ov\" \"ov\" \"$session\" \"$assigned_ip\"",
+		"MANAGEMENT=\"$(dirname \"$USERS\")/management.sock\"",
+		"old_endpoint=$(awk",
+		"printf 'kill %s\\nquit\\n' \"$old_endpoint\"",
+		"--unix-socket \"$MANAGEMENT\" -T - telnet://localhost",
+		"vpn_admit \"$uid\" \"ov\" \"ov\" \"$session\" \"$assigned_ip\" \"$remote_ip\" \"$device_limit\" \"$remote_port\"",
+		"ov_reconnect = proto == \"ov\"",
 		"\"$USAGE\" \"$USERS\"",
 	} {
 		if !strings.Contains(script, want) {

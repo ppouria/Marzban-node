@@ -138,6 +138,31 @@ func TestVPNSessionLedgerRejectsAssignedIPConflict(t *testing.T) {
 	}
 }
 
+func TestVPNSessionLedgerReplacesOpenVPNReconnect(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpn-sessions.tsv")
+	first := vpnSessionEvent{
+		UserID:     42,
+		Protocol:   "ov",
+		InboundTag: "ov-main",
+		SessionID:  "ov:first",
+		AssignedIP: "10.66.0.2",
+		ClientIP:   "198.51.100.10",
+		Event:      "start",
+	}
+	if !vpnAdmitGoSession(path, nil, first, 1) {
+		t.Fatal("expected first OpenVPN session to be admitted")
+	}
+	second := first
+	second.SessionID = "ov:second"
+	if !vpnAdmitGoSession(path, nil, second, 1) {
+		t.Fatal("expected reconnect to replace the previous OpenVPN session")
+	}
+	records := vpnSessionRecordsLocked(path)
+	if len(records) != 1 || records[0][3] != safeName(second.SessionID) {
+		t.Fatalf("OpenVPN reconnect was not replaced: %#v", records)
+	}
+}
+
 func TestVPNSessionLedgerIgnoresLegacySessionWithoutAddresses(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "vpn-sessions.tsv")
 	if err := os.WriteFile(path, []byte("42\tov\tov-main\tov:legacy\t\t\t1\n"), 0o600); err != nil {
