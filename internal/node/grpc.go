@@ -357,6 +357,7 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 		)
 		if err != nil {
 			log.Printf("failed to query online user IPs: %v", err)
+			partialOnlineIPs := onlineIPs
 			onlineUIDs, err = xray.QueryOnlineUserUIDs(
 				api.server.settings.XrayAPIHost,
 				api.server.settings.XrayAPIPort,
@@ -365,6 +366,7 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 			if err != nil {
 				log.Printf("failed to query online users: %v", err)
 			}
+			onlineIPs = partialOnlineIPs
 		} else {
 			onlineUIDs = onlineUserIPUIDs(onlineIPs)
 		}

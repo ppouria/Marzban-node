@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	statscommand "github.com/xtls/xray-core/app/stats/command"
@@ -164,9 +165,22 @@ func QueryOnlineUserIPs(apiHost string, apiPort int, timeout time.Duration) ([]O
 	if err != nil {
 		return nil, fmt.Errorf("query Xray online users: %w", err)
 	}
+	return queryOnlineUserIPs(ctx, client, res.GetUsers())
+}
 
-	users := make([]OnlineUserIP, 0, len(res.GetUsers()))
-	for _, name := range res.GetUsers() {
+type onlineIPStatsClient interface {
+	GetStatsOnlineIpList(context.Context, *statscommand.GetStatsRequest, ...grpc.CallOption) (*statscommand.GetStatsOnlineIpListResponse, error)
+}
+
+type onlineIPTask struct {
+	statsName string
+	email     string
+	uid       string
+}
+
+func queryOnlineUserIPs(ctx context.Context, client onlineIPStatsClient, names []string) ([]OnlineUserIP, error) {
+	tasks := make([]onlineIPTask, 0, len(names))
+	for _, name := range names {
 		statsName := strings.TrimSpace(name)
 		email, uid, ok := parseOnlineUserName(statsName)
 		if !ok {
@@ -175,25 +189,53 @@ func QueryOnlineUserIPs(apiHost string, apiPort int, timeout time.Duration) ([]O
 		if !strings.Contains(statsName, ">>>") {
 			statsName = onlineUserStatsName(email)
 		}
-		ipRes, err := client.GetStatsOnlineIpList(ctx, &statscommand.GetStatsRequest{Name: statsName})
-		if err != nil {
-			if status.Code(err) == codes.NotFound {
-				continue
+		tasks = append(tasks, onlineIPTask{statsName: statsName, email: email, uid: uid})
+	}
+	if len(tasks) == 0 {
+		return nil, nil
+	}
+	jobs := make(chan onlineIPTask, len(tasks))
+	results := make(chan OnlineUserIP, len(tasks))
+	errors := make(chan error, 1)
+	for _, task := range tasks {
+		jobs <- task
+	}
+	close(jobs)
+	workers := min(8, len(tasks))
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for task := range jobs {
+				ipRes, err := client.GetStatsOnlineIpList(ctx, &statscommand.GetStatsRequest{Name: task.statsName})
+				if err != nil {
+					if status.Code(err) != codes.NotFound {
+						select {
+						case errors <- fmt.Errorf("query Xray online IPs for %s: %w", task.email, err):
+						default:
+						}
+					}
+					continue
+				}
+				ips := make([]OnlineIP, 0, len(ipRes.GetIps()))
+				for ip, lastSeen := range ipRes.GetIps() {
+					ip = strings.TrimSpace(ip)
+					if ip != "" {
+						ips = append(ips, OnlineIP{IP: ip, LastSeenUnix: lastSeen})
+					}
+				}
+				sort.Slice(ips, func(i, j int) bool { return ips[i].IP < ips[j].IP })
+				results <- OnlineUserIP{UID: task.uid, Email: task.email, IPs: ips}
 			}
-			return nil, fmt.Errorf("query Xray online IPs for %s: %w", email, err)
-		}
-		ips := make([]OnlineIP, 0, len(ipRes.GetIps()))
-		for ip, lastSeen := range ipRes.GetIps() {
-			ip = strings.TrimSpace(ip)
-			if ip == "" {
-				continue
-			}
-			ips = append(ips, OnlineIP{IP: ip, LastSeenUnix: lastSeen})
-		}
-		sort.Slice(ips, func(i, j int) bool {
-			return ips[i].IP < ips[j].IP
-		})
-		users = append(users, OnlineUserIP{UID: uid, Email: email, IPs: ips})
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	users := make([]OnlineUserIP, 0, len(results))
+	for user := range results {
+		users = append(users, user)
 	}
 	sort.Slice(users, func(i, j int) bool {
 		if users[i].UID == users[j].UID {
@@ -201,7 +243,12 @@ func QueryOnlineUserIPs(apiHost string, apiPort int, timeout time.Duration) ([]O
 		}
 		return users[i].UID < users[j].UID
 	})
-	return users, nil
+	select {
+	case err := <-errors:
+		return users, err
+	default:
+		return users, nil
+	}
 }
 
 func queryStats(apiHost string, apiPort int, timeout time.Duration, pattern string, reset bool) ([]*statscommand.Stat, error) {
