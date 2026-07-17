@@ -66,13 +66,10 @@ vpn_safe() {
 vpn_device_key() {
   ip=$1
   client_ip=$2
-  session=$3
   if [ -n "$client_ip" ]; then
     printf 'client:%%s' "$(vpn_safe "$client_ip")"
   elif [ -n "$ip" ]; then
     printf 'assigned:%%s' "$(vpn_safe "$ip")"
-  else
-    printf 'session:%%s' "$(vpn_safe "$session")"
   fi
 }
 
@@ -106,18 +103,22 @@ vpn_admit() {
   (
     flock -x 9 || exit 50
     tmp="${VPN_SESSIONS}.$$"
-    awk -F '\t' -v sid="$session" '$4 != sid { print }' "$VPN_SESSIONS" > "$tmp"
+    awk -F '\t' -v sid="$session" '$4 != sid && ($5 != "" || $6 != "") { print }' "$VPN_SESSIONS" > "$tmp"
     device_key=$(vpn_device_key "$ip" "$client_ip" "$session")
+    if [ "$limit" -gt 0 ] && [ -z "$device_key" ]; then
+      rm -f "$tmp"
+      exit 33
+    fi
     count=$(awk -F '\t' -v uid="$uid" '
       function key(ip, client_ip, session) {
         if (client_ip != "") return "client:" client_ip
         if (ip != "") return "assigned:" ip
-        return "session:" session
+        return ""
       }
       $1 == uid {
         client = (NF >= 7 ? $6 : "")
         k = key($5, client, $4)
-        if (!(k in seen)) { seen[k] = 1; n++ }
+        if (k != "" && !(k in seen)) { seen[k] = 1; n++ }
       }
       END { print n+0 }
     ' "$tmp")
@@ -125,11 +126,11 @@ vpn_admit() {
       function key(ip, client_ip, session) {
         if (client_ip != "") return "client:" client_ip
         if (ip != "") return "assigned:" ip
-        return "session:" session
+        return ""
       }
       $1 == uid {
         client = (NF >= 7 ? $6 : "")
-        if (key($5, client, $4) == want) found = 1
+        if (want != "" && key($5, client, $4) == want) found = 1
       }
       END { print found+0 }
     ' "$tmp")
@@ -193,6 +194,9 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 		records := vpnSessionRecordsLocked(path)
 		next := records[:0]
 		for _, record := range records {
+			if vpnRecordDeviceKey(record) == "" {
+				continue
+			}
 			if len(record) >= 4 && record[3] == sessionID {
 				continue
 			}
@@ -200,7 +204,10 @@ func vpnAdmitGoSession(path string, callback *vpnSessionCallback, event vpnSessi
 		}
 		count := 0
 		uidText := strconv.FormatInt(event.UserID, 10)
-		deviceKey := vpnSessionDeviceKey(event.AssignedIP, event.ClientIP, sessionID)
+		deviceKey := vpnSessionDeviceKey(event.AssignedIP, event.ClientIP)
+		if limit > 0 && deviceKey == "" {
+			return
+		}
 		hasDevice := false
 		assignedIPInUse := false
 		devices := map[string]struct{}{}
@@ -270,18 +277,18 @@ func vpnRecordDeviceKey(record []string) string {
 	if len(record) >= 7 {
 		clientIP = record[5]
 	}
-	return vpnSessionDeviceKey(assignedIP, clientIP, record[3])
+	if strings.TrimSpace(assignedIP) == "" && strings.TrimSpace(clientIP) == "" {
+		return ""
+	}
+	return vpnSessionDeviceKey(assignedIP, clientIP)
 }
 
-func vpnSessionDeviceKey(assignedIP string, clientIP string, sessionID string) string {
+func vpnSessionDeviceKey(assignedIP string, clientIP string) string {
 	if text := strings.TrimSpace(clientIP); text != "" {
 		return "client:" + safeName(text)
 	}
 	if text := strings.TrimSpace(assignedIP); text != "" {
 		return "assigned:" + safeName(text)
-	}
-	if text := strings.TrimSpace(sessionID); text != "" {
-		return "session:" + safeName(text)
 	}
 	return ""
 }

@@ -3,6 +3,7 @@ package node
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -134,5 +135,27 @@ func TestVPNSessionLedgerRejectsAssignedIPConflict(t *testing.T) {
 		Event:      "start",
 	}, 0) {
 		t.Fatal("expected duplicate assigned IP to be rejected")
+	}
+}
+
+func TestVPNSessionLedgerIgnoresLegacySessionWithoutAddresses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpn-sessions.tsv")
+	if err := os.WriteFile(path, []byte("42\tov\tov-main\tov:legacy\t\t\t1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !vpnAdmitGoSession(path, nil, vpnSessionEvent{
+		UserID:     42,
+		Protocol:   "ov",
+		InboundTag: "ov-main",
+		SessionID:  "ov:new",
+		AssignedIP: "10.66.0.2",
+		ClientIP:   "198.51.100.10",
+		Event:      "start",
+	}, 1) {
+		t.Fatal("legacy session without an address must not consume a device slot")
+	}
+	records := vpnSessionRecordsLocked(path)
+	if len(records) != 1 || records[0][3] != safeName("ov:new") {
+		t.Fatalf("legacy session was not pruned: %#v", records)
 	}
 }
