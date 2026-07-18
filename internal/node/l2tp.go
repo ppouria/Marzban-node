@@ -1027,7 +1027,7 @@ func l2tpServicesRunning() bool {
 }
 
 func commandOutput(name string, args ...string) string {
-	output, err := exec.Command(name, args...).Output()
+	output, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
 		return ""
 	}
