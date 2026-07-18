@@ -452,7 +452,7 @@ func anyConnectConfig(inbound remoteAccessRuntimeInbound, dir, name string) stri
 	}
 	line(&b, "rekey-method = "+firstString(s["rekey_method"], "ssl"))
 	line(&b, "tls-priorities = "+strconv.Quote(firstString(s["tls_priorities"], "NORMAL:%SERVER_PRECEDENCE:%COMPAT:-VERS-SSL3.0:-VERS-TLS1.0:-VERS-TLS1.1")))
-	line(&b, "isolate-workers = true")
+	line(&b, "isolate-workers = "+yesNo(anyConnectWorkerIsolationSafe(commandOutput("ocserv", "--version"))))
 	line(&b, "predictable-ips = true")
 	line(&b, "use-occtl = true")
 	return b.String()
@@ -464,6 +464,10 @@ func anyConnectInt(settings map[string]any, key string, fallback, min, max int) 
 		return fallback
 	}
 	return boundedInt(value, fallback, min, max)
+}
+
+func anyConnectWorkerIsolationSafe(version string) bool {
+	return !strings.HasPrefix(strings.TrimSpace(version), "ocserv 1.1.")
 }
 
 func anyConnectDevicePrefix(port int) string {

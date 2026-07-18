@@ -92,6 +92,15 @@ func TestAnyConnectConfigDisablesUDP(t *testing.T) {
 	}
 }
 
+func TestAnyConnectDisablesWorkerIsolationOnOcserv11(t *testing.T) {
+	if anyConnectWorkerIsolationSafe("ocserv 1.1.3\n") {
+		t.Fatal("ocserv 1.1 worker isolation is not safe with current distribution libc")
+	}
+	if !anyConnectWorkerIsolationSafe("ocserv 1.4.0\n") {
+		t.Fatal("worker isolation should remain enabled on current ocserv")
+	}
+}
+
 func TestParseHumanBytes(t *testing.T) {
 	if got := parseHumanBytes("1.5 MB"); got != 1572864 {
 		t.Fatalf("got %d", got)
