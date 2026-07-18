@@ -49,7 +49,13 @@ func TestParseIKEv2SAs(t *testing.T) {
 func TestAnyConnectConfigIsStable(t *testing.T) {
 	inbound := remoteAccessRuntimeInbound{Port: 443, Settings: map[string]any{
 		"auth_mode": "password", "ipv4_pool_cidr": "10.71.0.0/24", "udp_enabled": true,
+		"udp_port": 8443, "listen_host": "vpn.example.com", "udp_listen_host": "192.0.2.10",
 		"max_clients": 100, "max_same_clients": 2, "mtu": 1400,
+		"dns_servers": []any{"1.1.1.1"}, "nbns_servers": []any{"192.0.2.53"},
+		"split_dns": []any{"corp.example.com"}, "routes": []any{"10.0.0.0/8"},
+		"restrict_user_to_ports": "tcp(443), udp(53)", "rekey_method": "new-tunnel",
+		"tls_priorities": "NORMAL:-VERS-TLS1.0", "dtls_psk": true,
+		"persistent_cookies": true, "try_mtu_discovery": true,
 	}}
 	first := anyConnectConfig(inbound, "/tmp/ac", "edge")
 	for i := 0; i < 20; i++ {
@@ -62,6 +68,27 @@ func TestAnyConnectConfigIsStable(t *testing.T) {
 	}
 	if !strings.Contains(first, "device = rac443") || !strings.Contains(first, "connect-script = ") {
 		t.Fatal("missing isolated device or active-user gate")
+	}
+	for _, expected := range []string{
+		"tcp-port = 443", "udp-port = 8443", "listen-host = vpn.example.com",
+		"udp-listen-host = 192.0.2.10", "dns = 1.1.1.1", "nbns = 192.0.2.53",
+		"split-dns = corp.example.com", "route = 10.0.0.0/8",
+		`restrict-user-to-ports = "tcp(443), udp(53)"`, "rekey-method = new-tunnel",
+		`tls-priorities = "NORMAL:-VERS-TLS1.0"`,
+		"persistent-cookies = true", "try-mtu-discovery = true",
+	} {
+		if !strings.Contains(first, expected) {
+			t.Fatalf("missing %q in:\n%s", expected, first)
+		}
+	}
+}
+
+func TestAnyConnectConfigDisablesUDP(t *testing.T) {
+	config := anyConnectConfig(remoteAccessRuntimeInbound{Port: 443, Settings: map[string]any{
+		"auth_mode": "password", "udp_enabled": false,
+	}}, "/tmp/ac", "tcp-only")
+	if !strings.Contains(config, "tcp-port = 443") || !strings.Contains(config, "udp-port = 0") {
+		t.Fatalf("unexpected TCP-only config:\n%s", config)
 	}
 }
 

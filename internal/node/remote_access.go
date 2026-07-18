@@ -332,11 +332,20 @@ func anyConnectConfig(inbound remoteAccessRuntimeInbound, dir, name string) stri
 	if auth != "password" {
 		line(&b, `auth = "certificate"`)
 		line(&b, "ca-cert = "+filepath.Join(dir, "ca.crt"))
-		line(&b, "cert-user-oid = 2.5.4.3")
+		line(&b, "cert-user-oid = "+firstString(s["cert_user_oid"], "2.5.4.3"))
+	}
+	if value := firstString(s["listen_host"]); value != "" {
+		line(&b, "listen-host = "+value)
+	}
+	if value := firstString(s["udp_listen_host"]); value != "" && boolValue(s["udp_enabled"], true) {
+		line(&b, "udp-listen-host = "+value)
+	}
+	if boolValue(s["listen_host_is_dyndns"], false) {
+		line(&b, "listen-host-is-dyndns = true")
 	}
 	line(&b, "tcp-port = "+strconv.Itoa(inbound.Port))
 	if boolValue(s["udp_enabled"], true) {
-		line(&b, "udp-port = "+strconv.Itoa(inbound.Port))
+		line(&b, "udp-port = "+strconv.Itoa(boundedInt(s["udp_port"], inbound.Port, 1, 65535)))
 	} else {
 		line(&b, "udp-port = 0")
 	}
@@ -351,6 +360,12 @@ func anyConnectConfig(inbound remoteAccessRuntimeInbound, dir, name string) stri
 	for _, dns := range stringList(s["dns_servers"]) {
 		line(&b, "dns = "+dns)
 	}
+	for _, nbns := range stringList(s["nbns_servers"]) {
+		line(&b, "nbns = "+nbns)
+	}
+	for _, domain := range stringList(s["split_dns"]) {
+		line(&b, "split-dns = "+domain)
+	}
 	for _, route := range stringList(s["routes"]) {
 		line(&b, "route = "+route)
 	}
@@ -360,22 +375,95 @@ func anyConnectConfig(inbound remoteAccessRuntimeInbound, dir, name string) stri
 	if boolValue(s["redirect_gateway"], true) && len(stringList(s["routes"])) == 0 {
 		line(&b, "route = default")
 	}
-	for _, item := range [][2]string{{"max_clients", "max-clients"}, {"max_same_clients", "max-same-clients"}, {"cookie_timeout", "cookie-timeout"}, {"idle_timeout", "idle-timeout"}, {"mobile_idle_timeout", "mobile-idle-timeout"}, {"session_timeout", "session-timeout"}, {"keepalive", "keepalive"}, {"dpd", "dpd"}, {"mobile_dpd", "mobile-dpd"}, {"mtu", "mtu"}} {
-		line(&b, fmt.Sprintf("%s = %d", item[1], intValue(s[item[0]])))
+	for _, item := range []struct {
+		key, directive     string
+		fallback, min, max int
+	}{
+		{"max_clients", "max-clients", 1024, 1, 1000000},
+		{"max_same_clients", "max-same-clients", 0, 0, 1000000},
+		{"cookie_timeout", "cookie-timeout", 300, 0, 2592000},
+		{"auth_timeout", "auth-timeout", 240, 1, 86400},
+		{"min_reauth_time", "min-reauth-time", 300, 0, 2592000},
+		{"idle_timeout", "idle-timeout", 1200, 0, 2592000},
+		{"mobile_idle_timeout", "mobile-idle-timeout", 2400, 0, 2592000},
+		{"session_timeout", "session-timeout", 0, 0, 2592000},
+		{"keepalive", "keepalive", 300, 0, 2592000},
+		{"dpd", "dpd", 60, 0, 2592000},
+		{"mobile_dpd", "mobile-dpd", 300, 0, 2592000},
+		{"max_ban_score", "max-ban-score", 80, 0, 1000000},
+		{"ban_reset_time", "ban-reset-time", 1200, 0, 2592000},
+		{"rekey_time", "rekey-time", 172800, 0, 2592000},
+		{"switch_to_tcp_timeout", "switch-to-tcp-timeout", 25, 0, 86400},
+		{"rate_limit_ms", "rate-limit-ms", 100, 0, 60000},
+		{"mtu", "mtu", 1400, 576, 1500},
+		{"no_compress_limit", "no-compress-limit", 256, 0, 65535},
+	} {
+		line(&b, fmt.Sprintf("%s = %d", item.directive, anyConnectInt(s, item.key, item.fallback, item.min, item.max)))
 	}
-	for _, item := range [][2]string{{"compression", "compression"}, {"cisco_client_compat", "cisco-client-compat"}, {"deny_roaming", "deny-roaming"}, {"tunnel_all_dns", "tunnel-all-dns"}, {"restrict_user_to_routes", "restrict-user-to-routes"}} {
-		line(&b, fmt.Sprintf("%s = %s", item[1], yesNo(boolValue(s[item[0]], false))))
+	for _, item := range []struct {
+		key, directive string
+		fallback       bool
+	}{
+		{"compression", "compression", false},
+		{"cisco_client_compat", "cisco-client-compat", true},
+		{"deny_roaming", "deny-roaming", false},
+		{"tunnel_all_dns", "tunnel-all-dns", true},
+		{"restrict_user_to_routes", "restrict-user-to-routes", false},
+	} {
+		line(&b, fmt.Sprintf("%s = %s", item.directive, yesNo(boolValue(s[item.key], item.fallback))))
+	}
+	for _, item := range [][2]string{
+		{"persistent_cookies", "persistent-cookies"},
+		{"try_mtu_discovery", "try-mtu-discovery"},
+		{"ping_leases", "ping-leases"},
+		{"cisco_svc_client_compat", "cisco-svc-client-compat"},
+		{"client_bypass_protocol", "client-bypass-protocol"},
+		{"match_tls_dtls_ciphers", "match-tls-dtls-ciphers"},
+	} {
+		if boolValue(s[item[0]], false) {
+			line(&b, item[1]+" = true")
+		}
+	}
+	for _, item := range [][2]string{{"dtls_psk", "dtls-psk"}, {"dtls_legacy", "dtls-legacy"}} {
+		if !boolValue(s[item[0]], true) {
+			line(&b, item[1]+" = false")
+		}
+	}
+	for _, item := range [][2]string{
+		{"stats_report_time", "stats-report-time"}, {"rx_data_per_sec", "rx-data-per-sec"},
+		{"tx_data_per_sec", "tx-data-per-sec"}, {"output_buffer", "output-buffer"},
+		{"net_priority", "net-priority"},
+	} {
+		if value := intValue(s[item[0]]); value > 0 {
+			line(&b, fmt.Sprintf("%s = %d", item[1], value))
+		}
 	}
 	if value := firstString(s["banner"]); value != "" {
 		line(&b, "banner = "+strconv.Quote(value))
 	}
+	if value := firstString(s["pre_login_banner"]); value != "" {
+		line(&b, "pre-login-banner = "+strconv.Quote(value))
+	}
 	if value := firstString(s["default_domain"]); value != "" {
 		line(&b, "default-domain = "+value)
 	}
+	if value := firstString(s["restrict_user_to_ports"]); value != "" {
+		line(&b, "restrict-user-to-ports = "+strconv.Quote(value))
+	}
+	line(&b, "rekey-method = "+firstString(s["rekey_method"], "ssl"))
+	line(&b, "tls-priorities = "+strconv.Quote(firstString(s["tls_priorities"], "NORMAL:%SERVER_PRECEDENCE:%COMPAT:-VERS-SSL3.0:-VERS-TLS1.0:-VERS-TLS1.1")))
 	line(&b, "isolate-workers = true")
 	line(&b, "predictable-ips = true")
 	line(&b, "use-occtl = true")
 	return b.String()
+}
+
+func anyConnectInt(settings map[string]any, key string, fallback, min, max int) int {
+	value, ok := settings[key]
+	if !ok || firstString(value) == "" {
+		return fallback
+	}
+	return boundedInt(value, fallback, min, max)
 }
 
 func anyConnectDevicePrefix(port int) string {
