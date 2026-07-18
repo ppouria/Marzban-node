@@ -680,25 +680,33 @@ func configureIKEv2Pool(dir string, users []remoteAccessRuntimeUser) (bool, erro
 }
 
 func ensureAnyConnectPrerequisites() error {
-	if runtime.GOOS != "linux" || commandExists("ocserv") {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if commandExists("ocserv") {
+		_ = exec.Command("systemctl", "disable", "--now", "ocserv.service").Run()
 		return nil
 	}
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("AnyConnect prerequisites are missing and automatic install requires root")
 	}
+	var err error
 	switch {
 	case commandExists("apt-get"):
-		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
-			return err
+		if err = runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err == nil {
+			err = runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "ocserv", "libpam-modules", "nftables", "iptables")
 		}
-		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "ocserv", "libpam-modules", "nftables", "iptables")
 	case commandExists("dnf"):
-		return runInstallCommand(nil, "dnf", "install", "-y", "ocserv", "nftables", "iptables")
+		err = runInstallCommand(nil, "dnf", "install", "-y", "ocserv", "nftables", "iptables")
 	case commandExists("yum"):
-		return runInstallCommand(nil, "yum", "install", "-y", "ocserv", "nftables", "iptables")
+		err = runInstallCommand(nil, "yum", "install", "-y", "ocserv", "nftables", "iptables")
 	default:
 		return fmt.Errorf("AnyConnect prerequisites are missing and no supported package manager was found")
 	}
+	if err == nil {
+		_ = exec.Command("systemctl", "disable", "--now", "ocserv.service").Run()
+	}
+	return err
 }
 
 func restartAnyConnect(name, conf, dir string) error {
