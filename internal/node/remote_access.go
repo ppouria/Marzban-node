@@ -327,7 +327,7 @@ func anyConnectConfig(inbound remoteAccessRuntimeInbound, dir, name string) stri
 	auth := firstString(s["auth_mode"], "password")
 	var b strings.Builder
 	if auth != "certificate" {
-		line(&b, `auth = "pam[service=rebecca-ocserv-`+name+`]"`)
+		line(&b, `auth = "pam"`)
 	}
 	if auth != "password" {
 		line(&b, `auth = "certificate"`)
@@ -471,31 +471,42 @@ func anyConnectDevicePrefix(port int) string {
 }
 
 func writeAnyConnectPAM(dir, name string) error {
-	script := filepath.Join(dir, "auth.sh")
+	base := filepath.Dir(dir)
+	script := filepath.Join(base, "auth.sh")
 	usersPath := filepath.Join(dir, "users.tsv")
-	if err := writeFileIfChanged(script, []byte(anyConnectAuthScript(usersPath)), 0o700); err != nil {
+	if err := writeFileIfChanged(script, []byte(anyConnectAuthScript(base)), 0o700); err != nil {
 		return err
 	}
 	if err := writeFileIfChanged(filepath.Join(dir, "connect.sh"), []byte(anyConnectConnectScript(usersPath)), 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile("/etc/pam.d/rebecca-ocserv-"+name, []byte("auth required pam_exec.so expose_authtok quiet "+script+"\naccount required pam_permit.so\n"), 0o600)
+	if err := os.WriteFile("/etc/pam.d/ocserv", []byte("auth required pam_exec.so expose_authtok quiet "+script+"\naccount required pam_permit.so\n"), 0o600); err != nil {
+		return err
+	}
+	_ = os.Remove("/etc/pam.d/rebecca-ocserv-" + name)
+	return nil
 }
 
-func anyConnectAuthScript(usersPath string) string {
+func anyConnectAuthScript(base string) string {
 	return fmt.Sprintf(`#!/bin/sh
 IFS= read -r password
 now=$(date +%%s)
-awk -F '\t' -v u="$PAM_USER" -v p="$password" -v now="$now" '
-  $2 == u && $3 == p && ($7 == "" || $7 == "active" || $7 == "on_hold") {
-    if ($6 != "" && $5 >= $6) exit 2
-    if ($8 != "" && now >= $8) exit 3
-    found=1
+for users in %q/*/users.tsv; do
+  [ -f "$users" ] || continue
+  if awk -F '\t' -v u="$PAM_USER" -v p="$password" -v now="$now" '
+    $2 == u && $3 == p && ($7 == "" || $7 == "active" || $7 == "on_hold") {
+      if ($6 != "" && $5 >= $6) exit 2
+      if ($8 != "" && now >= $8) exit 3
+      found=1
+      exit 0
+    }
+    END { exit found ? 0 : 1 }
+  ' "$users"; then
     exit 0
-  }
-  END { exit found ? 0 : 1 }
-' %q
-`, usersPath)
+  fi
+done
+exit 1
+`, base)
 }
 
 func anyConnectConnectScript(usersPath string) string {

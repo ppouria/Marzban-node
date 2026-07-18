@@ -63,8 +63,8 @@ func TestAnyConnectConfigIsStable(t *testing.T) {
 			t.Fatal("ocserv config order is unstable")
 		}
 	}
-	if !strings.Contains(first, `auth = "pam[service=rebecca-ocserv-edge]"`) {
-		t.Fatal("missing isolated PAM service")
+	if !strings.Contains(first, `auth = "pam"`) {
+		t.Fatal("missing compatible PAM authentication")
 	}
 	if !strings.Contains(first, "device = rac443") || !strings.Contains(first, "connect-script = ") {
 		t.Fatal("missing isolated device or active-user gate")
