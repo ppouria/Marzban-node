@@ -715,7 +715,7 @@ func ensureAnyConnectPrerequisites() error {
 
 func restartAnyConnect(name, conf, dir string) error {
 	stopAnyConnect(name, dir)
-	cmd := exec.Command("ocserv", "-c", conf)
+	cmd := exec.Command("ocserv", "--foreground", "-c", conf)
 	logPath := filepath.Join(dir, "ocserv.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -727,7 +727,14 @@ func restartAnyConnect(name, conf, dir string) error {
 		return err
 	}
 	_ = logFile.Close()
-	return cmd.Process.Release()
+	go func() { _ = cmd.Wait() }()
+	for range 20 {
+		if anyConnectRunning(dir) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("AnyConnect inbound %s exited before becoming ready; see %s", name, logPath)
 }
 
 func anyConnectRunning(dir string) bool {
@@ -736,7 +743,17 @@ func anyConnectRunning(dir string) bool {
 		return false
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
-	return err == nil && pid > 1 && exec.Command("kill", "-0", strconv.Itoa(pid)).Run() == nil
+	return err == nil && pid > 1 && processAlive(pid)
+}
+
+func processAlive(pid int) bool {
+	if raw, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat")); err == nil {
+		fields := strings.Fields(string(raw))
+		if len(fields) > 2 && fields[2] == "Z" {
+			return false
+		}
+	}
+	return exec.Command("kill", "-0", strconv.Itoa(pid)).Run() == nil
 }
 
 func terminateInvalidAnyConnectUsers(dir string, users []remoteAccessRuntimeUser) error {
@@ -781,11 +798,22 @@ func disconnectAnyConnectSession(dir string, session map[string]any) {
 }
 
 func stopAnyConnect(name, dir string) {
-	if raw, err := os.ReadFile(filepath.Join(dir, "ocserv.pid")); err == nil {
+	pidPath := filepath.Join(dir, "ocserv.pid")
+	if raw, err := os.ReadFile(pidPath); err == nil {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 1 {
 			_ = exec.Command("kill", strconv.Itoa(pid)).Run()
+			for range 40 {
+				if !processAlive(pid) {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if processAlive(pid) {
+				_ = exec.Command("kill", "-KILL", strconv.Itoa(pid)).Run()
+			}
 		}
 	}
+	_ = os.Remove(pidPath)
 	_ = exec.Command("nft", "delete", "table", "inet", "rebecca_anyconnect_"+safeName(name)).Run()
 	_ = vpnRemoveDirectNAT("anyconnect-" + name)
 }
