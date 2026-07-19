@@ -704,7 +704,20 @@ func stripRuntimeUsers(value any) {
 		if !ok {
 			continue
 		}
-		delete(settings, "clients")
+		clients, _ := settings["clients"].([]any)
+		reverseClients := make([]any, 0, len(clients))
+		for _, item := range clients {
+			client, _ := item.(map[string]any)
+			reverse, _ := client["reverse"].(map[string]any)
+			if strings.TrimSpace(asString(reverse["tag"])) != "" {
+				reverseClients = append(reverseClients, client)
+			}
+		}
+		if len(reverseClients) == 0 {
+			delete(settings, "clients")
+		} else {
+			settings["clients"] = reverseClients
+		}
 	}
 }
 

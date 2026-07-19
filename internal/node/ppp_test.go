@@ -28,6 +28,13 @@ func TestL2TPAndPPTPTProxyMasqueradeICMP(t *testing.T) {
 				t.Fatalf("%s script missing %q:\n%s", name, want, script)
 			}
 		}
+		pool := map[string]string{"l2tp": "10.67.0.0/16", "pptp": "10.68.0.0/16"}[name]
+		if !strings.Contains(script, "ip saddr "+pool+" meta mark") {
+			t.Fatalf("%s does not scope TPROXY to its address pool:\n%s", name, script)
+		}
+		if strings.Contains(script, `iifname "ppp*" meta mark`) {
+			t.Fatalf("%s captures traffic from every PPP service:\n%s", name, script)
+		}
 	}
 }
 

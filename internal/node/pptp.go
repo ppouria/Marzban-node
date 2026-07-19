@@ -319,7 +319,7 @@ func pptpNFTScript(inbound pptpRuntimeInbound) string {
 	blockedV4, blockedV6 := ovBlockedDestinations()
 	var rules strings.Builder
 	if len(blockedV4) > 0 {
-		line(&rules, fmt.Sprintf(`    iifname "ppp*" ip daddr { %s } drop`, strings.Join(blockedV4, ", ")))
+		line(&rules, fmt.Sprintf(`    ip saddr %s ip daddr { %s } drop`, pool, strings.Join(blockedV4, ", ")))
 	}
 	if len(blockedV6) > 0 {
 		line(&rules, fmt.Sprintf(`    iifname "ppp*" ip6 daddr { %s } drop`, strings.Join(blockedV6, ", ")))
@@ -328,14 +328,14 @@ func pptpNFTScript(inbound pptpRuntimeInbound) string {
   chain prerouting {
     type filter hook prerouting priority mangle; policy accept;
 %s
-    iifname "ppp*" meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
+    ip saddr %s meta mark != 0xff meta l4proto { tcp, udp } tproxy ip to 127.0.0.1:%d meta mark set 1 accept
   }
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     ip saddr %s meta l4proto icmp masquerade
   }
 }
-`, strings.TrimRight(rules.String(), "\n"), inbound.TunnelPort, pool)
+`, strings.TrimRight(rules.String(), "\n"), pool, inbound.TunnelPort, pool)
 }
 
 func (m *pptpManager) disconnectStaleSessions(users []pptpRuntimeUser) {

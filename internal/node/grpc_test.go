@@ -277,6 +277,25 @@ func TestPublicIPValidation(t *testing.T) {
 	}
 }
 
+func TestCanonicalConfigTopologyKeepsReverseClients(t *testing.T) {
+	base := `{"inbounds":[{"tag":"vless","settings":{"clients":[{"id":"user-1","email":"user"}]}}]}`
+	withUser := `{"inbounds":[{"tag":"vless","settings":{"clients":[{"id":"user-2","email":"other"}]}}]}`
+	withReverse := `{"inbounds":[{"tag":"vless","settings":{"clients":[{"id":"user-1","email":"user"},{"id":"reverse-1","reverse":{"tag":"reverse-out"}}]}}]}`
+
+	baseTopology, ok := canonicalConfigTopologyJSON(base)
+	if !ok {
+		t.Fatal("failed to normalize base topology")
+	}
+	userTopology, ok := canonicalConfigTopologyJSON(withUser)
+	if !ok || userTopology != baseTopology {
+		t.Fatalf("ordinary users must not change topology: %q != %q", userTopology, baseTopology)
+	}
+	reverseTopology, ok := canonicalConfigTopologyJSON(withReverse)
+	if !ok || reverseTopology == baseTopology {
+		t.Fatal("reverse clients must trigger a topology update")
+	}
+}
+
 func writeSelfSignedCert(t *testing.T, dir string, name string, dnsNames []string) (string, string) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
