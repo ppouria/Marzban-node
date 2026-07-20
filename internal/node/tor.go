@@ -1,7 +1,10 @@
 package node
 
 import (
+	"bufio"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -36,6 +39,11 @@ func applyTorProxy(config torProxyConfig) error {
 	if err := ensureTorInstalled(); err != nil {
 		return err
 	}
+	if country != "" {
+		if err := ensureTorGeoIPInstalled(); err != nil {
+			return err
+		}
+	}
 	if err := writeRebeccaTorConfig(config.SocksPort, country, config.StrictExit); err != nil {
 		return err
 	}
@@ -47,7 +55,10 @@ func applyTorProxy(config torProxyConfig) error {
 	if err := restartTorService(); err != nil {
 		return err
 	}
-	return waitForLocalPort(int(config.SocksPort), 20*time.Second)
+	if err := waitForLocalPort(int(config.SocksPort), 20*time.Second); err != nil {
+		return err
+	}
+	return waitForTorSocksReady(int(config.SocksPort), 90*time.Second)
 }
 
 func ensureTorInstalled() error {
@@ -77,6 +88,28 @@ func ensureTorInstalled() error {
 	}
 }
 
+func ensureTorGeoIPInstalled() error {
+	if fileExists("/usr/share/tor/geoip") && fileExists("/usr/share/tor/geoip6") {
+		return nil
+	}
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("Tor GeoIP data is missing and automatic install requires root")
+	}
+	switch {
+	case commandExists("apt-get"):
+		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
+			return err
+		}
+		return runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "install", "-y", "--no-install-recommends", "tor-geoipdb")
+	case commandExists("dnf"):
+		return runInstallCommand(nil, "dnf", "install", "-y", "tor-geoipdb")
+	case commandExists("yum"):
+		return runInstallCommand(nil, "yum", "install", "-y", "tor-geoipdb")
+	default:
+		return fmt.Errorf("Tor GeoIP data is missing and no supported package manager was found")
+	}
+}
+
 func writeRebeccaTorConfig(port uint32, country string, strict bool) error {
 	path := "/etc/tor/torrc"
 	raw, err := os.ReadFile(path)
@@ -85,6 +118,7 @@ func writeRebeccaTorConfig(port uint32, country string, strict bool) error {
 	}
 	lines := []string{
 		torRebeccaBlockStart,
+		"SocksPort 0",
 		fmt.Sprintf("SocksPort 127.0.0.1:%d", port),
 		"ClientOnly 1",
 		"AvoidDiskWrites 1",
@@ -151,4 +185,72 @@ func waitForLocalPort(port int, timeout time.Duration) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("Tor SOCKS proxy did not start on %s: %v", address, lastErr)
+}
+
+func waitForTorSocksReady(port int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if err := testSocks5Connect(port, "example.com", 80); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("Tor SOCKS proxy is not ready on 127.0.0.1:%d: %v", port, lastErr)
+}
+
+func testSocks5Connect(port int, host string, targetPort uint16) error {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(port)), 5*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	r := bufio.NewReader(conn)
+	if _, err := conn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		return err
+	}
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return err
+	}
+	if header[0] != 0x05 || header[1] != 0x00 {
+		return fmt.Errorf("SOCKS auth rejected")
+	}
+	hostBytes := []byte(host)
+	if len(hostBytes) > 255 {
+		return fmt.Errorf("SOCKS host is too long")
+	}
+	request := []byte{0x05, 0x01, 0x00, 0x03, byte(len(hostBytes))}
+	request = append(request, hostBytes...)
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, targetPort)
+	request = append(request, portBytes...)
+	if _, err := conn.Write(request); err != nil {
+		return err
+	}
+	response := make([]byte, 4)
+	if _, err := io.ReadFull(r, response); err != nil {
+		return err
+	}
+	if response[1] != 0x00 {
+		return fmt.Errorf("SOCKS connect failed with code %d", response[1])
+	}
+	switch response[3] {
+	case 0x01:
+		_, err = io.CopyN(io.Discard, r, 6)
+	case 0x03:
+		length, err := r.ReadByte()
+		if err != nil {
+			return err
+		}
+		_, err = io.CopyN(io.Discard, r, int64(length)+2)
+	case 0x04:
+		_, err = io.CopyN(io.Discard, r, 18)
+	default:
+		err = fmt.Errorf("SOCKS response has invalid address type %d", response[3])
+	}
+	return err
 }
