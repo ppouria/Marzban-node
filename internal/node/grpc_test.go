@@ -262,6 +262,14 @@ func TestGRPCTestOutboundRejectsMissingTag(t *testing.T) {
 	}
 }
 
+func TestReplaceMarkedBlock(t *testing.T) {
+	current := "Keep 1\n# BEGIN REBECCA TOR PROXY\nold\n# END REBECCA TOR PROXY\nKeep 2\n"
+	got := replaceMarkedBlock(current, torRebeccaBlockStart, torRebeccaBlockEnd, "new")
+	if got != "Keep 1\n\nKeep 2\n\nnew\n" {
+		t.Fatalf("replaceMarkedBlock()=%q", got)
+	}
+}
+
 func TestPublicIPValidation(t *testing.T) {
 	if !isGlobalIP("8.8.8.8", true) {
 		t.Fatal("expected 8.8.8.8 to be a global IPv4")

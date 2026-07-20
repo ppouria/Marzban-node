@@ -335,6 +335,25 @@ func (api *grpcAPI) ApplyIPBlocks(ctx context.Context, req *nodev1.IPBlockReques
 	return api.server.grpcAction(req.GetOperationId(), true, "IP blocks applied"), nil
 }
 
+func (api *grpcAPI) ApplyTorProxy(ctx context.Context, req *nodev1.TorProxyRequest) (*nodev1.RuntimeActionResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "tor proxy request is required")
+	}
+	if err := applyTorProxy(torProxyConfig{
+		SocksPort:   req.GetSocksPort(),
+		ExitCountry: req.GetExitCountry(),
+		StrictExit:  req.GetStrictExit(),
+	}); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "must be") ||
+			strings.Contains(strings.ToLower(err.Error()), "required") ||
+			strings.Contains(strings.ToLower(err.Error()), "supported") {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	return api.server.grpcAction(req.GetOperationId(), true, "Tor proxy applied"), nil
+}
+
 func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsageRequest) (*nodev1.UserUsageBatch, error) {
 	var stats []xray.UserStat
 	var onlineUIDs []string
