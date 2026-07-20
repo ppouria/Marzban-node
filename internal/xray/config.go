@@ -72,7 +72,7 @@ func (c *Config) applyAPI() {
 	c.filterAPIRoutes()
 
 	c.data["api"] = map[string]any{
-		"services": []any{"HandlerService", "StatsService", "LoggerService"},
+		"services": []any{"HandlerService", "StatsService", "LoggerService", "RoutingService"},
 		"tag":      "API",
 	}
 	c.data["stats"] = map[string]any{}

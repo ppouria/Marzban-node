@@ -12,6 +12,7 @@ import (
 	"time"
 
 	nodev1 "github.com/rebeccapanel/rebecca-node/internal/proto/node/v1"
+	"github.com/rebeccapanel/rebecca-node/internal/xray"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -48,6 +49,35 @@ func (api *grpcAPI) TestOutbound(ctx context.Context, req *nodev1.OutboundTestRe
 		Address:    result.Address,
 		Port:       int32(result.Port),
 		Output:     result.Output,
+	}, nil
+}
+
+func (api *grpcAPI) TestRoute(_ context.Context, req *nodev1.RouteTestRequest) (*nodev1.RouteTestResponse, error) {
+	result, err := xray.TestRoute(
+		api.server.settings.XrayAPIHost,
+		api.server.settings.XrayAPIPort,
+		10*time.Second,
+		xray.RouteTestRequest{
+			InboundTag: req.GetInboundTag(),
+			Domain:     req.GetDomain(),
+			IP:         req.GetIp(),
+			Port:       req.GetPort(),
+			Network:    req.GetNetwork(),
+			Protocol:   req.GetProtocol(),
+			Email:      req.GetEmail(),
+		},
+	)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "required") ||
+			strings.Contains(strings.ToLower(err.Error()), "invalid") {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	return &nodev1.RouteTestResponse{
+		Matched:     result.Matched,
+		OutboundTag: result.OutboundTag,
+		GroupTags:   result.GroupTags,
 	}, nil
 }
 

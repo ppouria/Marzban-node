@@ -96,6 +96,7 @@ github.com/xtls/xray-core/app/commander
 github.com/xtls/xray-core/app/dispatcher
 github.com/xtls/xray-core/app/proxyman
 github.com/xtls/xray-core/app/proxyman/command
+github.com/xtls/xray-core/app/router/command
 github.com/xtls/xray-core/app/stats
 github.com/xtls/xray-core/app/stats/command
 github.com/xtls/xray-core/common
