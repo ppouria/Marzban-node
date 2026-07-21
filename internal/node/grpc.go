@@ -354,6 +354,42 @@ func (api *grpcAPI) ApplyTorProxy(ctx context.Context, req *nodev1.TorProxyReque
 	return api.server.grpcAction(req.GetOperationId(), true, "Tor proxy applied"), nil
 }
 
+func (api *grpcAPI) ConfigureWindscribe(ctx context.Context, req *nodev1.WindscribeProxyRequest) (*nodev1.WindscribeProxyResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "Windscribe proxy request is required")
+	}
+	locations, err := configureWindscribe(ctx, windscribeProxyConfig{
+		Action:        req.GetAction(),
+		Username:      req.GetUsername(),
+		Password:      req.GetPassword(),
+		Location:      req.GetLocation(),
+		SocksPort:     req.GetSocksPort(),
+		ProxyUsername: req.GetProxyUsername(),
+		ProxyPassword: req.GetProxyPassword(),
+	})
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	responseLocations := make([]*nodev1.WindscribeLocation, 0, len(locations))
+	for _, location := range locations {
+		responseLocations = append(responseLocations, &nodev1.WindscribeLocation{
+			Name:      location.Name,
+			Available: location.Available,
+		})
+	}
+	message := "Windscribe locations loaded"
+	if strings.EqualFold(strings.TrimSpace(req.GetAction()), "apply") {
+		message = "Windscribe proxy applied"
+	}
+	return &nodev1.WindscribeProxyResponse{
+		OperationId: req.GetOperationId(),
+		Accepted:    true,
+		Runtime:     api.server.grpcRuntimeState(message),
+		Message:     message,
+		Locations:   responseLocations,
+	}, nil
+}
+
 func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsageRequest) (*nodev1.UserUsageBatch, error) {
 	var stats []xray.UserStat
 	var onlineUIDs []string
