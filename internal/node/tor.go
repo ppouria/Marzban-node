@@ -8,9 +8,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +22,7 @@ const torRebeccaBlockStart = "# BEGIN REBECCA TOR PROXY"
 const torRebeccaBlockEnd = "# END REBECCA TOR PROXY"
 
 var torCountryCodePattern = regexp.MustCompile(`^[a-zA-Z]{2}$`)
+var torSetupMu sync.Mutex
 
 type torProxyConfig struct {
 	SocksPort   uint32
@@ -26,6 +31,9 @@ type torProxyConfig struct {
 }
 
 func applyTorProxy(config torProxyConfig) error {
+	torSetupMu.Lock()
+	defer torSetupMu.Unlock()
+
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("Tor proxy setup is supported on Linux nodes only")
 	}
@@ -44,7 +52,14 @@ func applyTorProxy(config torProxyConfig) error {
 			return err
 		}
 	}
-	if err := writeRebeccaTorConfig(config.SocksPort, country, config.StrictExit); err != nil {
+	if commandExists("systemctl") {
+		return applyTorSystemdProxy(config.SocksPort, country, config.StrictExit)
+	}
+	return applyLegacyTorProxy(config.SocksPort, country, config.StrictExit)
+}
+
+func applyLegacyTorProxy(port uint32, country string, strict bool) error {
+	if err := writeRebeccaTorConfig(port, country, strict); err != nil {
 		return err
 	}
 	if tor, err := exec.LookPath("tor"); err == nil {
@@ -55,10 +70,166 @@ func applyTorProxy(config torProxyConfig) error {
 	if err := restartTorService(); err != nil {
 		return err
 	}
-	if err := waitForLocalPort(int(config.SocksPort), 20*time.Second); err != nil {
+	if err := waitForLocalPort(int(port), 20*time.Second); err != nil {
 		return err
 	}
-	return waitForTorSocksReady(int(config.SocksPort), 90*time.Second)
+	return waitForTorSocksReady(int(port), 90*time.Second)
+}
+
+func applyTorSystemdProxy(port uint32, country string, strict bool) error {
+	torPath, err := exec.LookPath("tor")
+	if err != nil {
+		return fmt.Errorf("locate tor binary: %w", err)
+	}
+	serviceUser, serviceGroup, uid, gid, err := torServiceAccount()
+	if err != nil {
+		return err
+	}
+	name := fmt.Sprintf("rebecca-tor-%d", port)
+	configPath := filepath.Join("/etc/tor/rebecca", name+".torrc")
+	dataRoot := "/var/lib/rebecca-tor"
+	dataPath := filepath.Join(dataRoot, name)
+	unitName := name + ".service"
+	unitPath := filepath.Join("/etc/systemd/system", unitName)
+
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		return fmt.Errorf("create Tor config directory: %w", err)
+	}
+	if err := os.MkdirAll(dataRoot, 0o711); err != nil {
+		return fmt.Errorf("create Tor data root: %w", err)
+	}
+	if err := os.Chmod(dataRoot, 0o711); err != nil {
+		return fmt.Errorf("set Tor data root permissions: %w", err)
+	}
+	if err := os.MkdirAll(dataPath, 0o700); err != nil {
+		return fmt.Errorf("create Tor data directory: %w", err)
+	}
+	if err := os.Chown(dataPath, uid, gid); err != nil {
+		return fmt.Errorf("set Tor data directory owner: %w", err)
+	}
+	if err := os.Chmod(dataPath, 0o700); err != nil {
+		return fmt.Errorf("set Tor data directory permissions: %w", err)
+	}
+	if err := os.WriteFile(configPath, []byte(torInstanceConfig(port, country, strict, dataPath)), 0o644); err != nil {
+		return fmt.Errorf("write Tor instance config: %w", err)
+	}
+	if output, err := exec.Command(torPath, "--verify-config", "-f", configPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("verify Tor instance config: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+
+	disabledLegacy, err := disableLegacyTorSocks()
+	if err != nil {
+		return err
+	}
+	if disabledLegacy {
+		if err := restartTorService(); err != nil {
+			return err
+		}
+	}
+	unit := torSystemdUnit(torPath, configPath, dataPath, serviceUser, serviceGroup)
+	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
+		return fmt.Errorf("write Tor systemd unit: %w", err)
+	}
+	if output, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("reload systemd units: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	if output, err := exec.Command("systemctl", "enable", unitName).CombinedOutput(); err != nil {
+		return fmt.Errorf("enable Tor instance: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	if output, err := exec.Command("systemctl", "restart", unitName).CombinedOutput(); err != nil {
+		return fmt.Errorf("restart Tor instance: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	if err := waitForLocalPort(int(port), 20*time.Second); err != nil {
+		return err
+	}
+	return waitForTorSocksReady(int(port), 90*time.Second)
+}
+
+func torServiceAccount() (string, string, int, int, error) {
+	for _, name := range []string{"debian-tor", "tor", "toranon", "_tor"} {
+		account, err := user.Lookup(name)
+		if err != nil {
+			continue
+		}
+		uid, uidErr := strconv.Atoi(account.Uid)
+		gid, gidErr := strconv.Atoi(account.Gid)
+		if uidErr != nil || gidErr != nil {
+			continue
+		}
+		groupName := account.Gid
+		if group, err := user.LookupGroupId(account.Gid); err == nil {
+			groupName = group.Name
+		}
+		return account.Username, groupName, uid, gid, nil
+	}
+	return "", "", 0, 0, fmt.Errorf("Tor service account was not created by the installed package")
+}
+
+func torInstanceConfig(port uint32, country string, strict bool, dataPath string) string {
+	lines := []string{
+		fmt.Sprintf("DataDirectory %s", dataPath),
+		fmt.Sprintf("SocksPort 127.0.0.1:%d", port),
+		"SocksPolicy accept 127.0.0.1",
+		"SocksPolicy reject *",
+		"ClientOnly 1",
+		"AvoidDiskWrites 1",
+		"Log notice stderr",
+	}
+	if country != "" {
+		lines = append(lines, fmt.Sprintf("ExitNodes {%s}", country))
+		if strict {
+			lines = append(lines, "StrictNodes 1")
+		}
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func torSystemdUnit(torPath, configPath, dataPath, serviceUser, serviceGroup string) string {
+	return fmt.Sprintf(`[Unit]
+Description=Rebecca Tor SOCKS instance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%s
+Group=%s
+ExecStart=%s -f %s
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGINT
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=%s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+`, serviceUser, serviceGroup, torPath, configPath, dataPath)
+}
+
+func disableLegacyTorSocks() (bool, error) {
+	path := "/etc/tor/torrc"
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	block := strings.Join([]string{torRebeccaBlockStart, "SocksPort 0", torRebeccaBlockEnd}, "\n")
+	next := replaceMarkedBlock(string(raw), torRebeccaBlockStart, torRebeccaBlockEnd, block)
+	if next == string(raw) {
+		return false, nil
+	}
+	if err := os.WriteFile(path, []byte(next), 0o644); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func ensureTorInstalled() error {
