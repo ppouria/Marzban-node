@@ -71,6 +71,26 @@ func TestTCPOutboundTestConnectsToTarget(t *testing.T) {
 	}
 }
 
+func TestBuildOutboundTestConfigExcludesUnrelatedOutbounds(t *testing.T) {
+	config, err := buildOutboundTestConfig("proxy", []map[string]any{
+		{"tag": "unrelated", "protocol": "vless", "settings": map[string]any{}},
+		{
+			"tag":           "proxy",
+			"protocol":      "vless",
+			"proxySettings": map[string]any{"tag": "relay"},
+			"settings":      map[string]any{},
+		},
+		{"tag": "relay", "protocol": "shadowsocks", "settings": map[string]any{}},
+	}, 18080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbounds := config["outbounds"].([]map[string]any)
+	if len(outbounds) != 2 || outbounds[0]["tag"] != "proxy" || outbounds[1]["tag"] != "relay" {
+		t.Fatalf("unexpected test outbounds: %#v", outbounds)
+	}
+}
+
 func TestICMPOutboundTestRequiresAddress(t *testing.T) {
 	result := (&Core{}).TestOutbound("proxy", "vless", []map[string]any{
 		{"tag": "proxy", "protocol": "vless", "settings": map[string]any{}},

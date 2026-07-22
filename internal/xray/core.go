@@ -15,6 +15,7 @@ import (
 
 type Core struct {
 	lifecycleMu    sync.Mutex
+	outboundTestMu sync.Mutex
 	mu             sync.Mutex
 	executablePath string
 	assetsPath     string

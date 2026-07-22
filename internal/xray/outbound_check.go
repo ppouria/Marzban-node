@@ -64,6 +64,8 @@ func (c *Core) TestOutbound(outboundTag string, outboundProtocol string, allOutb
 		}
 		return OutboundTestResult{Success: true, Delay: delay, StatusCode: statusCode, TestType: testType}
 	}
+	c.outboundTestMu.Lock()
+	defer c.outboundTestMu.Unlock()
 
 	port, listener, err := findAvailablePort()
 	if err != nil {
@@ -98,19 +100,25 @@ func (c *Core) TestOutbound(outboundTag string, outboundProtocol string, allOutb
 	if err := cmd.Start(); err != nil {
 		return OutboundTestResult{Success: false, Error: "Failed to start test xray instance", TestType: testType}
 	}
-	defer stopTestProcess(cmd)
 
 	if _, err := stdin.Write(configJSON); err != nil {
 		return OutboundTestResult{Success: false, Error: "Outbound test failed", TestType: testType}
 	}
 	_ = stdin.Close()
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	if ready, errText := waitForPort(done, port, 3*time.Second); !ready {
-		if strings.TrimSpace(output.String()) != "" && errText == "Xray test instance exited before it was ready" {
-			return OutboundTestResult{Success: false, Error: errText, TestType: testType}
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	defer func() {
+		stopTestProcess(cmd)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
 		}
+	}()
+	if ready, errText := waitForPort(done, port, 3*time.Second); !ready {
 		return OutboundTestResult{Success: false, Error: errText, TestType: testType}
 	}
 
@@ -307,8 +315,12 @@ func firstNonEmptyString(values ...string) string {
 }
 
 func buildOutboundTestConfig(outboundTag string, allOutbounds []map[string]any, testPort int) (map[string]any, error) {
-	outbounds := make([]map[string]any, 0, len(allOutbounds))
-	for _, outbound := range allOutbounds {
+	testOutbounds, err := selectOutboundTestOutbounds(outboundTag, allOutbounds)
+	if err != nil {
+		return nil, err
+	}
+	outbounds := make([]map[string]any, 0, len(testOutbounds))
+	for _, outbound := range testOutbounds {
 		cloned := map[string]any{}
 		raw, err := json.Marshal(outbound)
 		if err != nil {
@@ -359,6 +371,33 @@ func buildOutboundTestConfig(outboundTag string, allOutbounds []map[string]any, 
 	}, nil
 }
 
+func selectOutboundTestOutbounds(outboundTag string, allOutbounds []map[string]any) ([]map[string]any, error) {
+	byTag := make(map[string]map[string]any, len(allOutbounds))
+	for _, outbound := range allOutbounds {
+		tag := strings.TrimSpace(fmt.Sprint(outbound["tag"]))
+		if tag != "" {
+			byTag[tag] = outbound
+		}
+	}
+
+	selected := make([]map[string]any, 0, 2)
+	seen := make(map[string]struct{}, 2)
+	for tag := strings.TrimSpace(outboundTag); tag != ""; {
+		if _, ok := seen[tag]; ok {
+			break
+		}
+		outbound, ok := byTag[tag]
+		if !ok {
+			return nil, fmt.Errorf("outbound %q was not found", tag)
+		}
+		seen[tag] = struct{}{}
+		selected = append(selected, outbound)
+		proxySettings, _ := outbound["proxySettings"].(map[string]any)
+		tag = strings.TrimSpace(stringFromMap(proxySettings, "tag"))
+	}
+	return selected, nil
+}
+
 func findAvailablePort() (int, net.Listener, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -372,7 +411,7 @@ func findAvailablePort() (int, net.Listener, error) {
 	return addr.Port, listener, nil
 }
 
-func waitForPort(done <-chan error, port int, timeout time.Duration) (bool, string) {
+func waitForPort(done <-chan struct{}, port int, timeout time.Duration) (bool, string) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
