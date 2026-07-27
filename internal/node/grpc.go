@@ -390,6 +390,35 @@ func (api *grpcAPI) ConfigureWindscribe(ctx context.Context, req *nodev1.Windscr
 	}, nil
 }
 
+func (api *grpcAPI) ConfigurePsiphon(ctx context.Context, req *nodev1.PsiphonProxyRequest) (*nodev1.PsiphonProxyResponse, error) {
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "Psiphon proxy request is required")
+	}
+	instances, err := configurePsiphon(ctx, psiphonProxyConfig{
+		ConfigJSON: req.GetConfigJson(),
+		Locations:  req.GetLocations(),
+		SocksPort:  req.GetSocksPort(),
+	})
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+	responseInstances := make([]*nodev1.PsiphonProxyInstance, 0, len(instances))
+	for _, instance := range instances {
+		responseInstances = append(responseInstances, &nodev1.PsiphonProxyInstance{
+			Location:  instance.Location,
+			SocksPort: instance.SocksPort,
+		})
+	}
+	message := "Psiphon proxies started"
+	return &nodev1.PsiphonProxyResponse{
+		OperationId: req.GetOperationId(),
+		Accepted:    true,
+		Runtime:     api.server.grpcRuntimeState(message),
+		Message:     message,
+		Instances:   responseInstances,
+	}, nil
+}
+
 func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsageRequest) (*nodev1.UserUsageBatch, error) {
 	var stats []xray.UserStat
 	var onlineUIDs []string
