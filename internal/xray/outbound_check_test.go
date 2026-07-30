@@ -1,6 +1,7 @@
 package xray
 
 import (
+	"encoding/json"
 	"net"
 	"strings"
 	"testing"
@@ -88,6 +89,36 @@ func TestBuildOutboundTestConfigExcludesUnrelatedOutbounds(t *testing.T) {
 	outbounds := config["outbounds"].([]map[string]any)
 	if len(outbounds) != 2 || outbounds[0]["tag"] != "proxy" || outbounds[1]["tag"] != "relay" {
 		t.Fatalf("unexpected test outbounds: %#v", outbounds)
+	}
+}
+
+func TestBuildRouteTestConfigPreservesRoutingAndAddsTestInbound(t *testing.T) {
+	configJSON, err := buildRouteTestConfig(`{
+		"inbounds": [{"tag":"public","protocol":"vless"}],
+		"outbounds": [
+			{"tag":"direct","protocol":"freedom"},
+			{"tag":"wg","protocol":"wireguard","settings":{}}
+		],
+		"routing": {"rules": [{"type":"field","inboundTag":["public"],"outboundTag":"direct"}]}
+	}`, "public", 18080, 18081)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		t.Fatal(err)
+	}
+	inbounds := config["inbounds"].([]any)
+	if len(inbounds) != 2 || inbounds[0].(map[string]any)["tag"] != "API_INBOUND" || inbounds[1].(map[string]any)["tag"] != "public" {
+		t.Fatalf("unexpected test inbounds: %#v", inbounds)
+	}
+	outbounds := config["outbounds"].([]any)
+	if outbounds[1].(map[string]any)["settings"].(map[string]any)["noKernelTun"] != true {
+		t.Fatalf("wireguard test outbound did not disable kernel TUN: %#v", outbounds[1])
+	}
+	rules := config["routing"].(map[string]any)["rules"].([]any)
+	if len(rules) != 2 || rules[1].(map[string]any)["outboundTag"] != "direct" {
+		t.Fatalf("unexpected routing rules: %#v", rules)
 	}
 }
 

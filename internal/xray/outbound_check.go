@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	appconfig "github.com/rebeccapanel/rebecca-node/internal/config"
 	"golang.org/x/net/proxy"
 )
 
@@ -31,6 +32,138 @@ type OutboundTestResult struct {
 	Address    string `json:"address,omitempty"`
 	Port       int    `json:"port,omitempty"`
 	Output     string `json:"output,omitempty"`
+}
+
+type RouteTestRun struct {
+	OutboundTestResult
+	Matched         bool
+	OutboundTag     string
+	GroupTags       []string
+	OutboundTraffic []OutboundStat
+}
+
+func (c *Core) TestRoute(rawConfig string, inboundTag string, testURL string, request RouteTestRequest) RouteTestRun {
+	testURL = strings.TrimSpace(testURL)
+	if testURL == "" {
+		testURL = DefaultOutboundTestURL
+	}
+	c.outboundTestMu.Lock()
+	defer c.outboundTestMu.Unlock()
+
+	socksPort, listener, err := findAvailablePort()
+	if err != nil {
+		return RouteTestRun{OutboundTestResult: OutboundTestResult{Error: "Failed to find available test port", TestType: "latency"}}
+	}
+	_ = listener.Close()
+	apiPort, listener, err := findAvailablePort()
+	if err != nil {
+		return RouteTestRun{OutboundTestResult: OutboundTestResult{Error: "Failed to find available test API port", TestType: "latency"}}
+	}
+	_ = listener.Close()
+
+	configJSON, err := buildRouteTestConfig(rawConfig, inboundTag, socksPort, apiPort)
+	if err != nil {
+		return RouteTestRun{OutboundTestResult: OutboundTestResult{Error: err.Error(), TestType: "latency"}}
+	}
+
+	c.mu.Lock()
+	executable := c.executablePath
+	assets := c.assetsPath
+	c.mu.Unlock()
+
+	cmd := exec.Command(executable, "run", "-config", "stdin:")
+	configureManagedProcess(cmd)
+	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+assets)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return RouteTestRun{OutboundTestResult: OutboundTestResult{Error: "Failed to create stdin pipe for test Xray process", TestType: "latency"}}
+	}
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		return RouteTestRun{OutboundTestResult: OutboundTestResult{Error: "Failed to start test Xray instance", TestType: "latency"}}
+	}
+	if _, err := stdin.Write(configJSON); err != nil {
+		stopTestProcess(cmd)
+		return RouteTestRun{OutboundTestResult: OutboundTestResult{Error: "Route test failed", TestType: "latency"}}
+	}
+	_ = stdin.Close()
+
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	defer func() {
+		stopTestProcess(cmd)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}()
+	if ready, errText := waitForPort(done, socksPort, 3*time.Second); !ready {
+		return RouteTestRun{OutboundTestResult: OutboundTestResult{Error: errText, TestType: "latency"}}
+	}
+	if ready, errText := waitForPort(done, apiPort, 3*time.Second); !ready {
+		return RouteTestRun{OutboundTestResult: OutboundTestResult{Error: errText, TestType: "latency"}}
+	}
+
+	selected, _ := TestRoute("127.0.0.1", apiPort, 3*time.Second, request)
+	run := RouteTestRun{Matched: selected.Matched, OutboundTag: selected.OutboundTag, GroupTags: selected.GroupTags}
+	delay, statusCode, err := measureSocksDelay(socksPort, testURL)
+	if err != nil {
+		run.OutboundTestResult = OutboundTestResult{Error: "Request failed", TestType: "latency"}
+		return run
+	}
+	run.OutboundTestResult = OutboundTestResult{Success: true, Delay: delay, StatusCode: statusCode, TestType: "latency"}
+	run.OutboundTraffic, _ = QueryOutboundStats("127.0.0.1", apiPort, 3*time.Second, true)
+	return run
+}
+
+func buildRouteTestConfig(rawConfig string, inboundTag string, socksPort int, apiPort int) ([]byte, error) {
+	data := map[string]any{}
+	if err := json.Unmarshal([]byte(rawConfig), &data); err != nil {
+		return nil, errors.New("invalid Xray config")
+	}
+	if outbounds, _ := data["outbounds"].([]any); len(outbounds) == 0 {
+		return nil, errors.New("Xray config has no outbounds")
+	} else {
+		for _, item := range outbounds {
+			outbound, _ := item.(map[string]any)
+			if !strings.EqualFold(strings.TrimSpace(fmt.Sprint(outbound["protocol"])), "wireguard") {
+				continue
+			}
+			settings, _ := outbound["settings"].(map[string]any)
+			if settings == nil {
+				settings = map[string]any{}
+				outbound["settings"] = settings
+			}
+			settings["noKernelTun"] = true
+		}
+	}
+	inboundTag = strings.TrimSpace(inboundTag)
+	if inboundTag == "" {
+		inboundTag = "route-test"
+	}
+	data["log"] = map[string]any{"loglevel": "warning", "access": "none", "error": "none", "dnsLog": false}
+	data["inbounds"] = []any{map[string]any{
+		"tag":      inboundTag,
+		"listen":   "127.0.0.1",
+		"port":     socksPort,
+		"protocol": "socks",
+		"settings": map[string]any{"auth": "noauth", "udp": false},
+		"sniffing": map[string]any{"enabled": true, "destOverride": []any{"http", "tls", "quic"}},
+	}}
+	prepared, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	config, err := NewConfig(string(prepared), "127.0.0.1", appconfig.Settings{XrayAPIHost: "127.0.0.1", XrayAPIPort: apiPort})
+	if err != nil {
+		return nil, err
+	}
+	return config.JSON()
 }
 
 func (c *Core) TestOutbound(outboundTag string, outboundProtocol string, allOutbounds []map[string]any, testURL string, testType string) OutboundTestResult {

@@ -53,10 +53,13 @@ func (api *grpcAPI) TestOutbound(ctx context.Context, req *nodev1.OutboundTestRe
 }
 
 func (api *grpcAPI) TestRoute(_ context.Context, req *nodev1.RouteTestRequest) (*nodev1.RouteTestResponse, error) {
-	result, err := xray.TestRoute(
-		api.server.settings.XrayAPIHost,
-		api.server.settings.XrayAPIPort,
-		10*time.Second,
+	if strings.TrimSpace(req.GetConfigJson()) == "" || strings.TrimSpace(req.GetTestUrl()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "config_json and test_url are required")
+	}
+	result := api.server.core.TestRoute(
+		req.GetConfigJson(),
+		req.GetInboundTag(),
+		req.GetTestUrl(),
 		xray.RouteTestRequest{
 			InboundTag: req.GetInboundTag(),
 			Domain:     req.GetDomain(),
@@ -67,17 +70,19 @@ func (api *grpcAPI) TestRoute(_ context.Context, req *nodev1.RouteTestRequest) (
 			Email:      req.GetEmail(),
 		},
 	)
-	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "required") ||
-			strings.Contains(strings.ToLower(err.Error()), "invalid") {
-			return nil, status.Error(codes.InvalidArgument, err.Error())
-		}
-		return nil, status.Error(codes.Unavailable, err.Error())
+	traffic := make([]*nodev1.RouteTestTraffic, 0, len(result.OutboundTraffic))
+	for _, item := range result.OutboundTraffic {
+		traffic = append(traffic, &nodev1.RouteTestTraffic{Tag: item.Tag, Up: item.Up, Down: item.Down})
 	}
 	return &nodev1.RouteTestResponse{
-		Matched:     result.Matched,
-		OutboundTag: result.OutboundTag,
-		GroupTags:   result.GroupTags,
+		Matched:         result.Matched,
+		OutboundTag:     result.OutboundTag,
+		GroupTags:       result.GroupTags,
+		Success:         result.Success,
+		Delay:           result.Delay,
+		StatusCode:      int32(result.StatusCode),
+		OutboundTraffic: traffic,
+		Error:           result.Error,
 	}, nil
 }
 
