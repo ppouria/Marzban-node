@@ -1,14 +1,17 @@
 package node
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +34,7 @@ var (
 )
 
 type psiphonProxyConfig struct {
+	Action     string
 	ConfigJSON string
 	Locations  []string
 	SocksPort  uint32
@@ -41,51 +45,69 @@ type psiphonProxyInstance struct {
 	SocksPort uint32
 }
 
-func configurePsiphon(ctx context.Context, config psiphonProxyConfig) ([]psiphonProxyInstance, error) {
+type psiphonProxyResult struct {
+	Instances []psiphonProxyInstance
+	Locations []string
+}
+
+func configurePsiphon(ctx context.Context, config psiphonProxyConfig) (psiphonProxyResult, error) {
+	action := strings.ToLower(strings.TrimSpace(config.Action))
+	if action == "" {
+		action = "apply"
+	}
+	if action != "locations" && action != "apply" {
+		return psiphonProxyResult{}, fmt.Errorf("Psiphon action must be locations or apply")
+	}
+
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		return psiphonProxyResult{}, fmt.Errorf("Psiphon automatic setup is supported on Linux amd64 nodes only")
+	}
+	if os.Geteuid() != 0 {
+		return psiphonProxyResult{}, fmt.Errorf("Psiphon automatic setup requires root")
+	}
+	if action == "locations" {
+		locations, err := psiphonAvailableLocations(ctx, config.ConfigJSON)
+		return psiphonProxyResult{Locations: locations}, err
+	}
+
 	psiphonSetupMu.Lock()
 	defer psiphonSetupMu.Unlock()
 
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		return nil, fmt.Errorf("Psiphon automatic setup is supported on Linux amd64 nodes only")
-	}
-	if os.Geteuid() != 0 {
-		return nil, fmt.Errorf("Psiphon automatic setup requires root")
-	}
 	if !commandExists("systemctl") {
-		return nil, fmt.Errorf("Psiphon setup requires systemd")
+		return psiphonProxyResult{}, fmt.Errorf("Psiphon setup requires systemd")
 	}
 	locations, err := normalizedPsiphonLocations(config.Locations)
 	if err != nil {
-		return nil, err
+		return psiphonProxyResult{}, err
 	}
 	if config.SocksPort < 1024 || uint64(config.SocksPort)+uint64(len(locations))-1 > 65535 {
-		return nil, fmt.Errorf("Psiphon SOCKS ports must be between 1024 and 65535")
+		return psiphonProxyResult{}, fmt.Errorf("Psiphon SOCKS ports must be between 1024 and 65535")
 	}
 	if _, err := psiphonConfigContents(config.ConfigJSON, locations[0], config.SocksPort); err != nil {
-		return nil, err
+		return psiphonProxyResult{}, err
 	}
 	if err := ensurePsiphonInstalled(ctx); err != nil {
-		return nil, err
+		return psiphonProxyResult{}, err
 	}
 	account, err := ensurePsiphonAccount(ctx)
 	if err != nil {
-		return nil, err
+		return psiphonProxyResult{}, err
 	}
 
 	instances := make([]psiphonProxyInstance, 0, len(locations))
 	for index, location := range locations {
 		port := config.SocksPort + uint32(index)
 		if err := applyPsiphonInstance(ctx, account, config.ConfigJSON, location, port); err != nil {
-			return nil, err
+			return psiphonProxyResult{}, err
 		}
 		instances = append(instances, psiphonProxyInstance{Location: location, SocksPort: port})
 	}
 	for _, instance := range instances {
 		if err := waitForLocalPort(int(instance.SocksPort), 30*time.Second); err != nil {
-			return nil, fmt.Errorf("Psiphon SOCKS proxy did not start: %w", err)
+			return psiphonProxyResult{}, fmt.Errorf("Psiphon SOCKS proxy did not start: %w", err)
 		}
 	}
-	return instances, nil
+	return psiphonProxyResult{Instances: instances}, nil
 }
 
 func normalizedPsiphonLocations(values []string) ([]string, error) {
@@ -109,6 +131,87 @@ func normalizedPsiphonLocations(values []string) ([]string, error) {
 }
 
 func psiphonConfigContents(raw, location string, port uint32) ([]byte, error) {
+	config, err := parsePsiphonConfig(raw)
+	if err != nil {
+		return nil, err
+	}
+	config["EgressRegion"] = strings.ToUpper(location)
+	config["LocalSocksProxyPort"] = port
+	config["DisableLocalSocksProxy"] = false
+	config["DisableLocalHTTPProxy"] = true
+	config["LocalHttpProxyPort"] = 0
+	return json.MarshalIndent(config, "", "  ")
+}
+
+func psiphonAvailableLocations(ctx context.Context, rawConfig string) ([]string, error) {
+	contents, err := psiphonDiscoveryConfigContents(rawConfig)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensurePsiphonInstalled(ctx); err != nil {
+		return nil, err
+	}
+	directory, err := os.MkdirTemp("", "rebecca-psiphon-locations-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(directory)
+	if err := os.Chmod(directory, 0o700); err != nil {
+		return nil, err
+	}
+	configPath := filepath.Join(directory, "config.json")
+	if err := os.WriteFile(configPath, contents, 0o600); err != nil {
+		return nil, err
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	command := exec.CommandContext(runCtx, psiphonBinaryPath, "-config", configPath, "-dataRootDirectory", directory, "-listenInterface", "127.0.0.1")
+	stderr, err := command.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := command.Start(); err != nil {
+		return nil, fmt.Errorf("start Psiphon location discovery: %w", err)
+	}
+	locationsResult := make(chan []string, 1)
+	readResult := make(chan error, 1)
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		scanner.Buffer(make([]byte, 1024), 256<<10)
+		for scanner.Scan() {
+			if locations, reported := parsePsiphonAvailableRegions(scanner.Bytes()); reported {
+				locationsResult <- locations
+				return
+			}
+		}
+		readResult <- scanner.Err()
+	}()
+
+	select {
+	case locations := <-locationsResult:
+		cancel()
+		_ = command.Wait()
+		if len(locations) == 0 {
+			return nil, fmt.Errorf("Psiphon did not report any available exit regions")
+		}
+		return locations, nil
+	case err := <-readResult:
+		waitErr := command.Wait()
+		if err != nil {
+			return nil, fmt.Errorf("read Psiphon location discovery: %w", err)
+		}
+		if waitErr != nil {
+			return nil, fmt.Errorf("Psiphon location discovery failed: %w", waitErr)
+		}
+		return nil, fmt.Errorf("Psiphon did not report any available exit regions")
+	case <-runCtx.Done():
+		_ = command.Wait()
+		return nil, fmt.Errorf("Psiphon location discovery timed out")
+	}
+}
+
+func parsePsiphonConfig(raw string) (map[string]any, error) {
 	if len(raw) == 0 || len(raw) > psiphonMaxConfigSize {
 		return nil, fmt.Errorf("Psiphon config must be a JSON object no larger than 1 MB")
 	}
@@ -122,12 +225,50 @@ func psiphonConfigContents(raw, location string, port uint32) ([]byte, error) {
 			return nil, fmt.Errorf("Psiphon config requires %s", field)
 		}
 	}
-	config["EgressRegion"] = strings.ToUpper(location)
-	config["LocalSocksProxyPort"] = port
-	config["DisableLocalSocksProxy"] = false
+	return config, nil
+}
+
+func psiphonDiscoveryConfigContents(raw string) ([]byte, error) {
+	config, err := parsePsiphonConfig(raw)
+	if err != nil {
+		return nil, err
+	}
+	delete(config, "EgressRegion")
+	config["DisableLocalSocksProxy"] = true
 	config["DisableLocalHTTPProxy"] = true
+	config["DisableServerEntriesReporter"] = false
+	config["DisableTunnels"] = false
+	config["EnableLightProxyFallback"] = false
+	config["LocalSocksProxyPort"] = 0
 	config["LocalHttpProxyPort"] = 0
 	return json.MarshalIndent(config, "", "  ")
+}
+
+func parsePsiphonAvailableRegions(notice []byte) ([]string, bool) {
+	var payload struct {
+		NoticeType string `json:"noticeType"`
+		Data       struct {
+			Regions []string `json:"regions"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(notice, &payload) != nil || payload.NoticeType != "AvailableEgressRegions" {
+		return nil, false
+	}
+	regions := make([]string, 0, len(payload.Data.Regions))
+	seen := make(map[string]struct{}, len(payload.Data.Regions))
+	for _, value := range payload.Data.Regions {
+		region := strings.ToLower(strings.TrimSpace(value))
+		if !psiphonCountryPattern.MatchString(region) {
+			continue
+		}
+		if _, exists := seen[region]; exists {
+			continue
+		}
+		seen[region] = struct{}{}
+		regions = append(regions, region)
+	}
+	sort.Strings(regions)
+	return regions, true
 }
 
 func ensurePsiphonInstalled(ctx context.Context) error {

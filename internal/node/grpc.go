@@ -394,7 +394,8 @@ func (api *grpcAPI) ConfigurePsiphon(ctx context.Context, req *nodev1.PsiphonPro
 	if req == nil {
 		return nil, status.Error(codes.InvalidArgument, "Psiphon proxy request is required")
 	}
-	instances, err := configurePsiphon(ctx, psiphonProxyConfig{
+	result, err := configurePsiphon(ctx, psiphonProxyConfig{
+		Action:     req.GetAction(),
 		ConfigJSON: req.GetConfigJson(),
 		Locations:  req.GetLocations(),
 		SocksPort:  req.GetSocksPort(),
@@ -402,20 +403,24 @@ func (api *grpcAPI) ConfigurePsiphon(ctx context.Context, req *nodev1.PsiphonPro
 	if err != nil {
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
-	responseInstances := make([]*nodev1.PsiphonProxyInstance, 0, len(instances))
-	for _, instance := range instances {
+	responseInstances := make([]*nodev1.PsiphonProxyInstance, 0, len(result.Instances))
+	for _, instance := range result.Instances {
 		responseInstances = append(responseInstances, &nodev1.PsiphonProxyInstance{
 			Location:  instance.Location,
 			SocksPort: instance.SocksPort,
 		})
 	}
 	message := "Psiphon proxies started"
+	if strings.EqualFold(strings.TrimSpace(req.GetAction()), "locations") {
+		message = "Psiphon locations loaded"
+	}
 	return &nodev1.PsiphonProxyResponse{
 		OperationId: req.GetOperationId(),
 		Accepted:    true,
 		Runtime:     api.server.grpcRuntimeState(message),
 		Message:     message,
 		Instances:   responseInstances,
+		Locations:   result.Locations,
 	}, nil
 }
 

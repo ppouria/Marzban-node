@@ -26,3 +26,13 @@ func TestNormalizedPsiphonLocationsRejectsDuplicates(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestParsePsiphonAvailableRegions(t *testing.T) {
+	regions, reported := parsePsiphonAvailableRegions([]byte(`{"noticeType":"AvailableEgressRegions","data":{"regions":["US","de","DE","invalid"]}}`))
+	if !reported {
+		t.Fatal("notice was not reported")
+	}
+	if strings.Join(regions, ",") != "de,us" {
+		t.Fatalf("regions=%v", regions)
+	}
+}
