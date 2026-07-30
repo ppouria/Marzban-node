@@ -1,11 +1,33 @@
 package xray
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestTestRuntimeSlotsAllowTwoConcurrentRuns(t *testing.T) {
+	core := &Core{}
+	firstRelease, ok := core.acquireTestRuntime(context.Background())
+	if !ok {
+		t.Fatal("first test slot was not acquired")
+	}
+	defer firstRelease()
+	secondRelease, ok := core.acquireTestRuntime(context.Background())
+	if !ok {
+		t.Fatal("second test slot was not acquired")
+	}
+	defer secondRelease()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, acquired := core.acquireTestRuntime(ctx); acquired {
+		t.Fatal("third test acquired a slot before either active test completed")
+	}
+}
 
 func TestOutboundTargetFromConfigVLESS(t *testing.T) {
 	target, ok := outboundTargetFromConfig(map[string]any{
@@ -58,7 +80,7 @@ func TestTCPOutboundTestConnectsToTarget(t *testing.T) {
 	}()
 
 	addr := listener.Addr().(*net.TCPAddr)
-	result := (&Core{}).TestOutbound("proxy", "vless", []map[string]any{
+	result := (&Core{}).TestOutbound(context.Background(), "proxy", "vless", []map[string]any{
 		{
 			"tag":      "proxy",
 			"protocol": "vless",
@@ -123,7 +145,7 @@ func TestBuildRouteTestConfigPreservesRoutingAndAddsTestInbound(t *testing.T) {
 }
 
 func TestICMPOutboundTestRequiresAddress(t *testing.T) {
-	result := (&Core{}).TestOutbound("proxy", "vless", []map[string]any{
+	result := (&Core{}).TestOutbound(context.Background(), "proxy", "vless", []map[string]any{
 		{"tag": "proxy", "protocol": "vless", "settings": map[string]any{}},
 	}, "", "icmp")
 	if result.Success || result.TestType != "icmp" || !strings.Contains(result.Error, "address") {

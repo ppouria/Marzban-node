@@ -3,6 +3,7 @@ package xray
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"log"
 	"os"
@@ -15,7 +16,8 @@ import (
 
 type Core struct {
 	lifecycleMu    sync.Mutex
-	outboundTestMu sync.Mutex
+	testSlotsOnce  sync.Once
+	testSlots      chan struct{}
 	mu             sync.Mutex
 	executablePath string
 	assetsPath     string
@@ -24,6 +26,20 @@ type Core struct {
 	logs           *LogBus
 	version        string
 	debug          bool
+}
+
+const maxConcurrentTestRuntimes = 2
+
+func (c *Core) acquireTestRuntime(ctx context.Context) (func(), bool) {
+	c.testSlotsOnce.Do(func() {
+		c.testSlots = make(chan struct{}, maxConcurrentTestRuntimes)
+	})
+	select {
+	case c.testSlots <- struct{}{}:
+		return func() { <-c.testSlots }, true
+	case <-ctx.Done():
+		return nil, false
+	}
 }
 
 func NewCore(executablePath, assetsPath string, debug bool) (*Core, error) {

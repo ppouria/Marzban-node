@@ -34,6 +34,7 @@ func (api *grpcAPI) TestOutbound(ctx context.Context, req *nodev1.OutboundTestRe
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("invalid all_outbounds_json: %v", err))
 	}
 	result := api.server.core.TestOutbound(
+		ctx,
 		req.GetOutboundTag(),
 		req.GetOutboundProtocol(),
 		allOutbounds,
@@ -52,11 +53,12 @@ func (api *grpcAPI) TestOutbound(ctx context.Context, req *nodev1.OutboundTestRe
 	}, nil
 }
 
-func (api *grpcAPI) TestRoute(_ context.Context, req *nodev1.RouteTestRequest) (*nodev1.RouteTestResponse, error) {
+func (api *grpcAPI) TestRoute(ctx context.Context, req *nodev1.RouteTestRequest) (*nodev1.RouteTestResponse, error) {
 	if strings.TrimSpace(req.GetConfigJson()) == "" || strings.TrimSpace(req.GetTestUrl()) == "" {
 		return nil, status.Error(codes.InvalidArgument, "config_json and test_url are required")
 	}
 	result := api.server.core.TestRoute(
+		ctx,
 		req.GetConfigJson(),
 		req.GetInboundTag(),
 		req.GetTestUrl(),

@@ -20,6 +20,7 @@ func (s *Server) handleOutboundTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	result := s.core.TestOutbound(
+		r.Context(),
 		payload.OutboundTag,
 		payload.OutboundProtocol,
 		payload.AllOutbounds,

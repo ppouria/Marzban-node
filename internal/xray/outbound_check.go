@@ -42,13 +42,16 @@ type RouteTestRun struct {
 	OutboundTraffic []OutboundStat
 }
 
-func (c *Core) TestRoute(rawConfig string, inboundTag string, testURL string, request RouteTestRequest) RouteTestRun {
+func (c *Core) TestRoute(ctx context.Context, rawConfig string, inboundTag string, testURL string, request RouteTestRequest) RouteTestRun {
 	testURL = strings.TrimSpace(testURL)
 	if testURL == "" {
 		testURL = DefaultOutboundTestURL
 	}
-	c.outboundTestMu.Lock()
-	defer c.outboundTestMu.Unlock()
+	release, ok := c.acquireTestRuntime(ctx)
+	if !ok {
+		return RouteTestRun{OutboundTestResult: OutboundTestResult{Error: "Route test queue timed out", TestType: "latency"}}
+	}
+	defer release()
 
 	socksPort, listener, err := findAvailablePort()
 	if err != nil {
@@ -166,7 +169,7 @@ func buildRouteTestConfig(rawConfig string, inboundTag string, socksPort int, ap
 	return config.JSON()
 }
 
-func (c *Core) TestOutbound(outboundTag string, outboundProtocol string, allOutbounds []map[string]any, testURL string, testType string) OutboundTestResult {
+func (c *Core) TestOutbound(ctx context.Context, outboundTag string, outboundProtocol string, allOutbounds []map[string]any, testURL string, testType string) OutboundTestResult {
 	outboundTag = strings.TrimSpace(outboundTag)
 	outboundProtocol = strings.ToLower(strings.TrimSpace(outboundProtocol))
 	testType = normalizeOutboundTestType(testType)
@@ -197,8 +200,11 @@ func (c *Core) TestOutbound(outboundTag string, outboundProtocol string, allOutb
 		}
 		return OutboundTestResult{Success: true, Delay: delay, StatusCode: statusCode, TestType: testType}
 	}
-	c.outboundTestMu.Lock()
-	defer c.outboundTestMu.Unlock()
+	release, ok := c.acquireTestRuntime(ctx)
+	if !ok {
+		return OutboundTestResult{Success: false, Error: "Outbound test queue timed out", TestType: testType}
+	}
+	defer release()
 
 	port, listener, err := findAvailablePort()
 	if err != nil {
