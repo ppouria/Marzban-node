@@ -85,11 +85,10 @@ func New(settings appconfig.Settings) (*Server, error) {
 		system:       newSystemSampler(),
 		sessions:     make(map[string]time.Time),
 	}
-	// Rebuild WireGuard interfaces from disk first, independently of Xray: kernel
-	// WG state does not survive a reboot, and its ingress should come back even if
-	// the cached Xray config fails to start below.
-	if err := server.wg.Reconcile(); err != nil {
-		log.Printf("failed to reconcile WireGuard runtime on startup: %v", err)
+	// Auxiliary VPN state is authoritative on the master. Never resurrect stale
+	// WireGuard peers from disk while waiting for the first full sync.
+	if err := server.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
+		log.Printf("failed to clear cached WireGuard runtime on startup: %v", err)
 	}
 	server.startCachedConfig()
 	return server, nil
@@ -991,24 +990,6 @@ func (s *Server) startCachedConfig() {
 	s.mu.Lock()
 	s.lastConfig = cfg
 	s.mu.Unlock()
-	if err := s.ov.Apply(payload.OVRuntime); err != nil {
-		log.Printf("failed to apply cached OV runtime: %v", err)
-	}
-	if err := s.l2tp.Apply(payload.L2TPRuntime); err != nil {
-		log.Printf("failed to apply cached L2TP runtime: %v", err)
-	}
-	if err := s.pptp.Apply(payload.PPTPRuntime); err != nil {
-		log.Printf("failed to apply cached PPTP runtime: %v", err)
-	}
-	if err := s.wg.Apply(payload.WGRuntime); err != nil {
-		log.Printf("failed to apply cached WireGuard runtime: %v", err)
-	}
-	if err := s.remoteAccess.ApplyIKEv2(payload.IKEv2Runtime); err != nil {
-		log.Printf("failed to apply cached IKEv2 runtime: %v", err)
-	}
-	if err := s.remoteAccess.ApplyAnyConnect(payload.AnyConnectRuntime); err != nil {
-		log.Printf("failed to apply cached AnyConnect runtime: %v", err)
-	}
 }
 
 type downloadFile struct {

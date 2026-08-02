@@ -825,7 +825,12 @@ func (s *Server) grpcConfig(ctx context.Context, req *nodev1.RuntimeConfigReques
 func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, *pptpRuntime, *wgRuntime, *remoteAccessRuntime, *remoteAccessRuntime, error) {
 	raw := strings.TrimSpace(req.GetOvRuntimeJson())
 	if raw == "" {
-		return nil, nil, nil, nil, nil, nil, nil
+		return &ovRuntime{Inbounds: []ovRuntimeInbound{}},
+			&l2tpRuntime{Inbounds: []l2tpRuntimeInbound{}},
+			&pptpRuntime{Inbounds: []pptpRuntimeInbound{}},
+			&wgRuntime{Inbounds: []wgRuntimeInbound{}},
+			&remoteAccessRuntime{Inbounds: []remoteAccessRuntimeInbound{}},
+			&remoteAccessRuntime{Inbounds: []remoteAccessRuntimeInbound{}}, nil
 	}
 	var envelope struct {
 		GeneratedAt         string                       `json:"generated_at"`

@@ -22,6 +22,19 @@ import (
 	"google.golang.org/grpc/credentials"
 )
 
+func TestGRPCVPNRuntimeClearsMissingAuxiliaryState(t *testing.T) {
+	ov, l2tp, pptp, wg, ikev2, anyConnect, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ov == nil || l2tp == nil || pptp == nil || wg == nil || ikev2 == nil || anyConnect == nil {
+		t.Fatal("missing runtime payload must clear every auxiliary runtime")
+	}
+	if len(ov.Inbounds)+len(l2tp.Inbounds)+len(pptp.Inbounds)+len(wg.Inbounds)+len(ikev2.Inbounds)+len(anyConnect.Inbounds) != 0 {
+		t.Fatal("missing runtime payload must not restore cached auxiliary inbounds")
+	}
+}
+
 func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 	tempDir := t.TempDir()
 	serverCertFile, serverKeyFile := writeSelfSignedCert(t, tempDir, "server", []string{"rebecca-node.test"})
