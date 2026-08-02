@@ -113,7 +113,12 @@ func applyTorSystemdProxy(port uint32, country string, strict bool) error {
 	if err := os.WriteFile(configPath, []byte(torInstanceConfig(port, country, strict, dataPath)), 0o644); err != nil {
 		return fmt.Errorf("write Tor instance config: %w", err)
 	}
-	if output, err := exec.Command(torPath, "--verify-config", "-f", configPath).CombinedOutput(); err != nil {
+	verifyPath, err := os.MkdirTemp("", "rebecca-tor-verify-")
+	if err != nil {
+		return fmt.Errorf("create Tor verification directory: %w", err)
+	}
+	defer os.RemoveAll(verifyPath)
+	if output, err := exec.Command(torPath, "--verify-config", "-f", configPath, "--DataDirectory", verifyPath).CombinedOutput(); err != nil {
 		return fmt.Errorf("verify Tor instance config: %v: %s", err, strings.TrimSpace(string(output)))
 	}
 
