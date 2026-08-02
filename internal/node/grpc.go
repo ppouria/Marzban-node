@@ -54,6 +54,7 @@ func (s *Server) ListenAndServeGRPC() error {
 		grpc.MaxSendMsgSize(64<<20),
 	)
 	s.registerGRPC(grpcServer)
+	go s.notifyMasterReady()
 	return grpcServer.Serve(listener)
 }
 

@@ -1,12 +1,35 @@
 package node
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+
+	appconfig "github.com/rebeccapanel/rebecca-node/internal/config"
 )
+
+func TestNodeReadyUsesCachedSessionCallback(t *testing.T) {
+	received := make(chan vpnSessionEvent, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var event vpnSessionEvent
+		if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+			t.Error(err)
+		}
+		received <- event
+	}))
+	defer server.Close()
+
+	node := &Server{settings: appconfig.Settings{RebeccaDataDir: t.TempDir()}}
+	node.saveConfigCache(`{"inbounds":[]}`, "127.0.0.1", &ovRuntime{SessionCallback: &vpnSessionCallback{URL: server.URL, Token: "token", NodeID: 7}}, nil, nil, nil)
+	node.notifyMasterReady()
+	event := <-received
+	if event.NodeID != 7 || event.Event != "ready" {
+		t.Fatalf("ready event = %#v", event)
+	}
+}
 
 func TestVPNSessionLedgerHonorsMasterAdmission(t *testing.T) {
 	status := http.StatusConflict

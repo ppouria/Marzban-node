@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -418,6 +419,49 @@ func vpnSendSession(callback *vpnSessionCallback, event vpnSessionEvent) bool {
 	}
 	_ = res.Body.Close()
 	return res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices
+}
+
+func (s *Server) notifyMasterReady() {
+	callback := s.cachedSessionCallback()
+	if callback == nil {
+		return
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		if vpnSendSession(callback, vpnSessionEvent{Event: "ready"}) {
+			return
+		}
+		time.Sleep(time.Duration(1<<attempt) * time.Second)
+	}
+	log.Printf("failed to notify master that node is ready")
+}
+
+func (s *Server) cachedSessionCallback() *vpnSessionCallback {
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return nil
+	}
+	callbacks := []*vpnSessionCallback{}
+	if payload.OVRuntime != nil {
+		callbacks = append(callbacks, payload.OVRuntime.SessionCallback)
+	}
+	if payload.L2TPRuntime != nil {
+		callbacks = append(callbacks, payload.L2TPRuntime.SessionCallback)
+	}
+	if payload.WGRuntime != nil {
+		callbacks = append(callbacks, payload.WGRuntime.SessionCallback)
+	}
+	if payload.IKEv2Runtime != nil {
+		callbacks = append(callbacks, payload.IKEv2Runtime.SessionCallback)
+	}
+	if payload.AnyConnectRuntime != nil {
+		callbacks = append(callbacks, payload.AnyConnectRuntime.SessionCallback)
+	}
+	for _, callback := range callbacks {
+		if vpnSessionCallbackReady(callback) {
+			return callback
+		}
+	}
+	return nil
 }
 
 func normalizedVPNProtocol(value string) string {
