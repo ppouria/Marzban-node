@@ -889,6 +889,10 @@ func wgEnsureLink(ctx context.Context, iface, serverAddress string, mtu int) err
 			return fmt.Errorf("add wg link %s: %v: %s", iface, err, strings.TrimSpace(out))
 		}
 	}
+	threadedPath := filepath.Join("/sys/class/net", iface, "threaded")
+	if err := os.WriteFile(threadedPath, []byte("0"), 0o644); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("disable threaded NAPI on %s: %w", iface, err)
+	}
 	if mtu > 0 {
 		if out, err := wgRunIP(ctx, "link", "set", "dev", iface, "mtu", strconv.Itoa(mtu)); err != nil {
 			return fmt.Errorf("set mtu on %s: %v: %s", iface, err, strings.TrimSpace(out))
