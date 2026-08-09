@@ -3,6 +3,7 @@ package xray
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -53,6 +54,61 @@ func TestParseOutboundStatName(t *testing.T) {
 
 	if _, _, ok := parseOutboundStatName("user>>>1.test>>>traffic>>>uplink"); ok {
 		t.Fatal("non-outbound stats should be ignored")
+	}
+}
+
+func TestParseInboundStatName(t *testing.T) {
+	tests := []struct {
+		name string
+		tag  string
+		link string
+		ok   bool
+	}{
+		{name: "inbound>>>vless-in>>>traffic>>>uplink", tag: "vless-in", link: "uplink", ok: true},
+		{name: "inbound>>>vless-in>>>traffic>>>downlink", tag: "vless-in", link: "downlink", ok: true},
+		{name: "outbound>>>proxy>>>traffic>>>uplink", ok: false},
+		{name: "inbound>>>>>>traffic>>>uplink", ok: false},
+		{name: "inbound>>>vless-in>>>traffic>>>other", ok: false},
+	}
+	for _, test := range tests {
+		tag, link, ok := parseInboundStatName(test.name)
+		if tag != test.tag || link != test.link || ok != test.ok {
+			t.Fatalf("parseInboundStatName(%q) = (%q, %q, %v), want (%q, %q, %v)", test.name, tag, link, ok, test.tag, test.link, test.ok)
+		}
+	}
+}
+
+func TestInboundStatsFromCountersMapsDirectionsAndMissingCounters(t *testing.T) {
+	stats := inboundStatsFromCounters([]*statscommand.Stat{
+		{Name: "inbound>>>shared>>>traffic>>>uplink", Value: 10},
+		{Name: "inbound>>>shared>>>traffic>>>downlink", Value: 20},
+		{Name: "inbound>>>upload-only>>>traffic>>>uplink", Value: 5},
+		{Name: "inbound>>>api>>>traffic>>>uplink", Value: 99},
+		{Name: "inbound>>>API_INBOUND>>>traffic>>>downlink", Value: 99},
+		{Name: "inbound>>>shared>>>traffic>>>uplink", Value: -1},
+		nil,
+	})
+	if len(stats) != 2 {
+		t.Fatalf("unexpected stats: %#v", stats)
+	}
+	if stats[0] != (InboundStat{Tag: "shared", Up: 10, Down: 20}) {
+		t.Fatalf("uplink/downlink mapping changed: %#v", stats[0])
+	}
+	if stats[1] != (InboundStat{Tag: "upload-only", Up: 5}) {
+		t.Fatalf("missing downlink counter should remain zero: %#v", stats[1])
+	}
+	if missing := inboundStatsFromCounters(nil); len(missing) != 0 {
+		t.Fatalf("disabled stats should return an empty result: %#v", missing)
+	}
+}
+
+func TestInboundStatsFromCountersSaturatesDuplicateCounters(t *testing.T) {
+	stats := inboundStatsFromCounters([]*statscommand.Stat{
+		{Name: "inbound>>>shared>>>traffic>>>uplink", Value: math.MaxInt64 - 1},
+		{Name: "inbound>>>shared>>>traffic>>>uplink", Value: 10},
+	})
+	if len(stats) != 1 || stats[0].Up != math.MaxInt64 {
+		t.Fatalf("duplicate counters must saturate instead of wrapping: %#v", stats)
 	}
 }
 

@@ -3,6 +3,7 @@ package xray
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"sort"
 	"strconv"
@@ -18,6 +19,12 @@ import (
 )
 
 type OutboundStat struct {
+	Tag  string `json:"tag"`
+	Up   int64  `json:"up"`
+	Down int64  `json:"down"`
+}
+
+type InboundStat struct {
 	Tag  string `json:"tag"`
 	Up   int64  `json:"up"`
 	Down int64  `json:"down"`
@@ -47,7 +54,7 @@ func QueryOutboundStats(apiHost string, apiPort int, timeout time.Duration, rese
 
 	byTag := map[string]*OutboundStat{}
 	for _, stat := range stats {
-		if stat == nil || stat.GetValue() == 0 {
+		if stat == nil || stat.GetValue() <= 0 {
 			continue
 		}
 		tag, link, ok := parseOutboundStatName(stat.GetName())
@@ -61,9 +68,9 @@ func QueryOutboundStats(apiHost string, apiPort int, timeout time.Duration, rese
 		}
 		switch link {
 		case "uplink":
-			item.Up += stat.GetValue()
+			item.Up = addStatCounter(item.Up, stat.GetValue())
 		case "downlink":
-			item.Down += stat.GetValue()
+			item.Down = addStatCounter(item.Down, stat.GetValue())
 		}
 	}
 
@@ -81,6 +88,63 @@ func QueryOutboundStats(apiHost string, apiPort int, timeout time.Duration, rese
 		}
 	}
 	return result, nil
+}
+
+func QueryInboundStats(apiHost string, apiPort int, timeout time.Duration, reset bool) ([]InboundStat, error) {
+	stats, err := queryStats(apiHost, apiPort, timeout, "inbound>>>", reset)
+	if err != nil {
+		return nil, err
+	}
+	return inboundStatsFromCounters(stats), nil
+}
+
+func inboundStatsFromCounters(stats []*statscommand.Stat) []InboundStat {
+	byTag := map[string]*InboundStat{}
+	for _, stat := range stats {
+		if stat == nil || stat.GetValue() <= 0 {
+			continue
+		}
+		tag, link, ok := parseInboundStatName(stat.GetName())
+		if !ok || strings.EqualFold(tag, "api") || strings.EqualFold(tag, "API_INBOUND") {
+			continue
+		}
+		item := byTag[tag]
+		if item == nil {
+			item = &InboundStat{Tag: tag}
+			byTag[tag] = item
+		}
+		switch link {
+		case "uplink":
+			item.Up = addStatCounter(item.Up, stat.GetValue())
+		case "downlink":
+			item.Down = addStatCounter(item.Down, stat.GetValue())
+		}
+	}
+
+	tags := make([]string, 0, len(byTag))
+	for tag := range byTag {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+
+	result := make([]InboundStat, 0, len(tags))
+	for _, tag := range tags {
+		item := byTag[tag]
+		if item.Up != 0 || item.Down != 0 {
+			result = append(result, *item)
+		}
+	}
+	return result
+}
+
+func addStatCounter(current, delta int64) int64 {
+	if delta <= 0 {
+		return current
+	}
+	if current > math.MaxInt64-delta {
+		return math.MaxInt64
+	}
+	return current + delta
 }
 
 func QueryUserStats(apiHost string, apiPort int, timeout time.Duration, reset bool) ([]UserStat, error) {
@@ -290,6 +354,19 @@ func dialAPI(ctx context.Context, apiHost string, apiPort int) (*grpc.ClientConn
 func parseOutboundStatName(name string) (string, string, bool) {
 	parts := strings.Split(name, ">>>")
 	if len(parts) < 4 || parts[0] != "outbound" || parts[2] != "traffic" {
+		return "", "", false
+	}
+	tag := strings.TrimSpace(parts[1])
+	link := strings.ToLower(strings.TrimSpace(parts[3]))
+	if tag == "" || (link != "uplink" && link != "downlink") {
+		return "", "", false
+	}
+	return tag, link, true
+}
+
+func parseInboundStatName(name string) (string, string, bool) {
+	parts := strings.Split(name, ">>>")
+	if len(parts) < 4 || parts[0] != "inbound" || parts[2] != "traffic" {
 		return "", "", false
 	}
 	tag := strings.TrimSpace(parts[1])

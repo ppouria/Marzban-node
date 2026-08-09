@@ -498,6 +498,7 @@ func (api *grpcAPI) AckUserUsage(ctx context.Context, req *nodev1.AckUsageReques
 
 func (api *grpcAPI) CollectOutboundUsage(ctx context.Context, req *nodev1.CollectUsageRequest) (*nodev1.OutboundUsageBatch, error) {
 	var stats []xray.OutboundStat
+	var inboundStats []xray.InboundStat
 	if api.server.core.Started() {
 		var err error
 		stats, err = xray.QueryOutboundStats(
@@ -509,11 +510,29 @@ func (api *grpcAPI) CollectOutboundUsage(ctx context.Context, req *nodev1.Collec
 		if err != nil {
 			return nil, status.Error(codes.Unavailable, err.Error())
 		}
+		api.server.usage.add(stats)
+		stats = nil
+		inboundStats, err = xray.QueryInboundStats(
+			api.server.settings.XrayAPIHost,
+			api.server.settings.XrayAPIPort,
+			10*time.Second,
+			req.GetReset_(),
+		)
+		if err != nil {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
 	}
-	batchID, pending := api.server.usage.addAndSnapshot(stats)
+	batchID, pending, pendingInbounds := api.server.usage.addUsageAndSnapshot(stats, inboundStats)
 	res := &nodev1.OutboundUsageBatch{BatchId: batchID}
 	for _, stat := range pending {
 		res.Stats = append(res.Stats, &nodev1.OutboundUsageSample{
+			Tag:  stat.Tag,
+			Up:   uint64(maxInt64(stat.Up, 0)),
+			Down: uint64(maxInt64(stat.Down, 0)),
+		})
+	}
+	for _, stat := range pendingInbounds {
+		res.InboundStats = append(res.InboundStats, &nodev1.InboundUsageSample{
 			Tag:  stat.Tag,
 			Up:   uint64(maxInt64(stat.Up, 0)),
 			Down: uint64(maxInt64(stat.Down, 0)),

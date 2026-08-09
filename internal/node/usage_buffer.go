@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,9 +19,11 @@ type usageBuffer struct {
 	spoolPath              string
 	nextBatch              uint64
 	pending                map[string]xray.OutboundStat
+	inbounds               map[string]xray.InboundStat
 	users                  map[string]int64
 	activeOutboundBatch    string
 	activeOutboundSnapshot map[string]xray.OutboundStat
+	activeInboundSnapshot  map[string]xray.InboundStat
 	activeUserBatch        string
 	activeUserSnapshot     map[string]int64
 }
@@ -28,17 +31,20 @@ type usageBuffer struct {
 type usageBufferSpool struct {
 	NextBatch              uint64                       `json:"next_batch"`
 	Pending                map[string]xray.OutboundStat `json:"pending,omitempty"`
+	Inbounds               map[string]xray.InboundStat  `json:"inbounds,omitempty"`
 	Users                  map[string]int64             `json:"users,omitempty"`
 	ActiveOutboundBatch    string                       `json:"active_outbound_batch,omitempty"`
 	ActiveOutboundSnapshot map[string]xray.OutboundStat `json:"active_outbound_snapshot,omitempty"`
+	ActiveInboundSnapshot  map[string]xray.InboundStat  `json:"active_inbound_snapshot,omitempty"`
 	ActiveUserBatch        string                       `json:"active_user_batch,omitempty"`
 	ActiveUserSnapshot     map[string]int64             `json:"active_user_snapshot,omitempty"`
 }
 
 func newUsageBuffer() *usageBuffer {
 	return &usageBuffer{
-		pending: map[string]xray.OutboundStat{},
-		users:   map[string]int64{},
+		pending:  map[string]xray.OutboundStat{},
+		inbounds: map[string]xray.InboundStat{},
+		users:    map[string]int64{},
 	}
 }
 
@@ -69,12 +75,17 @@ func newPersistentUsageBuffer(spoolPath string) (*usageBuffer, error) {
 	if buffer.pending == nil {
 		buffer.pending = map[string]xray.OutboundStat{}
 	}
+	buffer.inbounds = state.Inbounds
+	if buffer.inbounds == nil {
+		buffer.inbounds = map[string]xray.InboundStat{}
+	}
 	buffer.users = state.Users
 	if buffer.users == nil {
 		buffer.users = map[string]int64{}
 	}
 	buffer.activeOutboundBatch = state.ActiveOutboundBatch
 	buffer.activeOutboundSnapshot = state.ActiveOutboundSnapshot
+	buffer.activeInboundSnapshot = state.ActiveInboundSnapshot
 	buffer.activeUserBatch = state.ActiveUserBatch
 	buffer.activeUserSnapshot = state.ActiveUserSnapshot
 	return buffer, nil
@@ -87,9 +98,11 @@ func (b *usageBuffer) persistLocked() error {
 	state := usageBufferSpool{
 		NextBatch:              b.nextBatch,
 		Pending:                b.pending,
+		Inbounds:               b.inbounds,
 		Users:                  b.users,
 		ActiveOutboundBatch:    b.activeOutboundBatch,
 		ActiveOutboundSnapshot: b.activeOutboundSnapshot,
+		ActiveInboundSnapshot:  b.activeInboundSnapshot,
 		ActiveUserBatch:        b.activeUserBatch,
 		ActiveUserSnapshot:     b.activeUserSnapshot,
 	}
@@ -161,15 +174,41 @@ func replaceFile(sourcePath, targetPath string) error {
 
 func (b *usageBuffer) addOutboundLocked(samples []xray.OutboundStat) {
 	for _, sample := range samples {
-		if sample.Tag == "" || (sample.Up == 0 && sample.Down == 0) {
+		if sample.Tag == "" || (sample.Up <= 0 && sample.Down <= 0) {
 			continue
 		}
 		current := b.pending[sample.Tag]
 		current.Tag = sample.Tag
-		current.Up += sample.Up
-		current.Down += sample.Down
+		current.Up = addUsageCounter(current.Up, sample.Up)
+		current.Down = addUsageCounter(current.Down, sample.Down)
 		b.pending[sample.Tag] = current
 	}
+}
+
+func (b *usageBuffer) addInboundLocked(samples []xray.InboundStat) {
+	for _, sample := range samples {
+		if sample.Tag == "" || (sample.Up <= 0 && sample.Down <= 0) {
+			continue
+		}
+		current := b.inbounds[sample.Tag]
+		current.Tag = sample.Tag
+		current.Up = addUsageCounter(current.Up, sample.Up)
+		current.Down = addUsageCounter(current.Down, sample.Down)
+		b.inbounds[sample.Tag] = current
+	}
+}
+
+func addUsageCounter(current, delta int64) int64 {
+	if delta <= 0 {
+		return current
+	}
+	if current < 0 {
+		current = 0
+	}
+	if current > math.MaxInt64-delta {
+		return math.MaxInt64
+	}
+	return current + delta
 }
 
 func (b *usageBuffer) add(samples []xray.OutboundStat) {
@@ -180,14 +219,28 @@ func (b *usageBuffer) add(samples []xray.OutboundStat) {
 	b.persistBestEffortLocked()
 }
 
-func (b *usageBuffer) addAndSnapshot(samples []xray.OutboundStat) (string, []xray.OutboundStat) {
+func (b *usageBuffer) addInbound(samples []xray.InboundStat) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.addOutboundLocked(samples)
+	b.addInboundLocked(samples)
+	b.persistBestEffortLocked()
+}
+
+func (b *usageBuffer) addAndSnapshot(samples []xray.OutboundStat) (string, []xray.OutboundStat) {
+	batchID, outbounds, _ := b.addUsageAndSnapshot(samples, nil)
+	return batchID, outbounds
+}
+
+func (b *usageBuffer) addUsageAndSnapshot(outbounds []xray.OutboundStat, inbounds []xray.InboundStat) (string, []xray.OutboundStat, []xray.InboundStat) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.addOutboundLocked(outbounds)
+	b.addInboundLocked(inbounds)
 	if b.activeOutboundBatch != "" {
 		b.persistBestEffortLocked()
-		return b.activeOutboundBatch, outboundSnapshotResult(b.activeOutboundSnapshot)
+		return b.activeOutboundBatch, outboundSnapshotResult(b.activeOutboundSnapshot), inboundSnapshotResult(b.activeInboundSnapshot)
 	}
 
 	snapshot := make(map[string]xray.OutboundStat, len(b.pending))
@@ -197,15 +250,23 @@ func (b *usageBuffer) addAndSnapshot(samples []xray.OutboundStat) (string, []xra
 		}
 		snapshot[tag] = item
 	}
-	if len(snapshot) == 0 {
-		return "", nil
+	inboundSnapshot := make(map[string]xray.InboundStat, len(b.inbounds))
+	for tag, item := range b.inbounds {
+		if item.Up == 0 && item.Down == 0 {
+			continue
+		}
+		inboundSnapshot[tag] = item
+	}
+	if len(snapshot) == 0 && len(inboundSnapshot) == 0 {
+		return "", nil, nil
 	}
 	b.nextBatch++
 	batchID := strconv.FormatUint(b.nextBatch, 10)
 	b.activeOutboundBatch = batchID
 	b.activeOutboundSnapshot = snapshot
+	b.activeInboundSnapshot = inboundSnapshot
 	b.persistBestEffortLocked()
-	return batchID, outboundSnapshotResult(snapshot)
+	return batchID, outboundSnapshotResult(snapshot), inboundSnapshotResult(inboundSnapshot)
 }
 
 func (b *usageBuffer) addUsersLocked(samples []xray.UserStat) {
@@ -282,7 +343,7 @@ func (b *usageBuffer) ack(batchID string) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if batchID == "" || batchID != b.activeOutboundBatch || b.activeOutboundSnapshot == nil {
+	if batchID == "" || batchID != b.activeOutboundBatch || (b.activeOutboundSnapshot == nil && b.activeInboundSnapshot == nil) {
 		return false
 	}
 	for tag, item := range b.activeOutboundSnapshot {
@@ -299,14 +360,39 @@ func (b *usageBuffer) ack(batchID string) bool {
 		current.Tag = tag
 		b.pending[tag] = current
 	}
+	for tag, item := range b.activeInboundSnapshot {
+		current, exists := b.inbounds[tag]
+		if !exists {
+			continue
+		}
+		current.Up -= item.Up
+		current.Down -= item.Down
+		if current.Up <= 0 && current.Down <= 0 {
+			delete(b.inbounds, tag)
+			continue
+		}
+		current.Tag = tag
+		b.inbounds[tag] = current
+	}
 	b.activeOutboundBatch = ""
 	b.activeOutboundSnapshot = nil
+	b.activeInboundSnapshot = nil
 	b.persistBestEffortLocked()
 	return true
 }
 
 func outboundSnapshotResult(snapshot map[string]xray.OutboundStat) []xray.OutboundStat {
 	result := make([]xray.OutboundStat, 0, len(snapshot))
+	for _, item := range snapshot {
+		if item.Up != 0 || item.Down != 0 {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func inboundSnapshotResult(snapshot map[string]xray.InboundStat) []xray.InboundStat {
+	result := make([]xray.InboundStat, 0, len(snapshot))
 	for _, item := range snapshot {
 		if item.Up != 0 || item.Down != 0 {
 			result = append(result, item)

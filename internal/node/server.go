@@ -484,6 +484,7 @@ func (s *Server) handleOutboundUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var stats []xray.OutboundStat
+	var inboundStats []xray.InboundStat
 	if s.core.Started() {
 		var err error
 		stats, err = xray.QueryOutboundStats(
@@ -496,9 +497,21 @@ func (s *Server) handleOutboundUsage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
+		s.usage.add(stats)
+		stats = nil
+		inboundStats, err = xray.QueryInboundStats(
+			s.settings.XrayAPIHost,
+			s.settings.XrayAPIPort,
+			10*time.Second,
+			true,
+		)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
 	}
-	batchID, pending := s.usage.addAndSnapshot(stats)
-	writeJSON(w, http.StatusOK, map[string]any{"batch_id": batchID, "stats": pending})
+	batchID, pending, pendingInbounds := s.usage.addUsageAndSnapshot(stats, inboundStats)
+	writeJSON(w, http.StatusOK, map[string]any{"batch_id": batchID, "stats": pending, "inbound_stats": pendingInbounds})
 }
 
 func (s *Server) snapshotRunningUsage() {
@@ -533,6 +546,17 @@ func (s *Server) snapshotRunningUsage() {
 		s.usage.add(outboundStats)
 	} else {
 		log.Printf("failed to snapshot outbound usage before stopping xray: %v", err)
+	}
+	inboundStats, err := xray.QueryInboundStats(
+		s.settings.XrayAPIHost,
+		s.settings.XrayAPIPort,
+		5*time.Second,
+		true,
+	)
+	if err == nil {
+		s.usage.addInbound(inboundStats)
+	} else {
+		log.Printf("failed to snapshot inbound usage before stopping xray: %v", err)
 	}
 	userStats, err := xray.QueryUserStats(
 		s.settings.XrayAPIHost,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	nodev1 "github.com/rebeccapanel/rebecca-node/internal/proto/node/v1"
 	"github.com/rebeccapanel/rebecca-node/internal/xray"
 )
 
@@ -40,6 +42,70 @@ func TestUsageBufferKeepsPendingUntilAck(t *testing.T) {
 	_, stats = buffer.addAndSnapshot(nil)
 	if len(stats) != 1 || stats[0].Up != 5 || stats[0].Down != 1 {
 		t.Fatalf("ack should only subtract the acknowledged snapshot: %#v", stats)
+	}
+}
+
+func TestUsageBufferKeepsInboundPendingInOutboundBatchUntilAck(t *testing.T) {
+	buffer := newUsageBuffer()
+
+	batchID, outbounds, inbounds := buffer.addUsageAndSnapshot(nil, []xray.InboundStat{{Tag: "shared-in", Up: 10, Down: 20}})
+	if batchID == "" || len(outbounds) != 0 || len(inbounds) != 1 {
+		t.Fatalf("unexpected inbound-only snapshot: batch=%q outbounds=%#v inbounds=%#v", batchID, outbounds, inbounds)
+	}
+
+	secondBatchID, _, inbounds := buffer.addUsageAndSnapshot(nil, []xray.InboundStat{{Tag: "shared-in", Up: 5}})
+	if secondBatchID != batchID || len(inbounds) != 1 || inbounds[0].Up != 10 || inbounds[0].Down != 20 {
+		t.Fatalf("unacked batch changed: batch=%q inbounds=%#v", secondBatchID, inbounds)
+	}
+	if !buffer.ack(batchID) {
+		t.Fatal("expected inbound batch ack")
+	}
+
+	_, _, inbounds = buffer.addUsageAndSnapshot(nil, nil)
+	if len(inbounds) != 1 || inbounds[0].Up != 5 || inbounds[0].Down != 0 {
+		t.Fatalf("ack should preserve later inbound deltas: %#v", inbounds)
+	}
+}
+
+func TestUsageBufferSaturatesInboundAndOutboundCounters(t *testing.T) {
+	buffer := newUsageBuffer()
+	buffer.pending["out"] = xray.OutboundStat{Tag: "out", Up: -5}
+	buffer.inbounds["in"] = xray.InboundStat{Tag: "in", Down: -6}
+	buffer.add([]xray.OutboundStat{{Tag: "out", Up: math.MaxInt64 - 1}, {Tag: "out", Up: 10}})
+	buffer.addInbound([]xray.InboundStat{{Tag: "in", Down: math.MaxInt64 - 1}, {Tag: "in", Down: 10}})
+
+	_, outbounds, inbounds := buffer.addUsageAndSnapshot(nil, nil)
+	if len(outbounds) != 1 || outbounds[0].Up != math.MaxInt64 {
+		t.Fatalf("outbound counter wrapped: %#v", outbounds)
+	}
+	if len(inbounds) != 1 || inbounds[0].Down != math.MaxInt64 {
+		t.Fatalf("inbound counter wrapped: %#v", inbounds)
+	}
+}
+
+func TestPersistentUsageBufferRestoresInboundBatch(t *testing.T) {
+	spoolPath := filepath.Join(t.TempDir(), "usage-spool.json")
+	buffer, err := newPersistentUsageBuffer(spoolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchID, _, _ := buffer.addUsageAndSnapshot(nil, []xray.InboundStat{{Tag: "in-a", Up: 7, Down: 9}})
+	buffer.addInbound([]xray.InboundStat{{Tag: "in-a", Up: 3, Down: 4}})
+
+	recovered, err := newPersistentUsageBuffer(spoolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveredBatchID, _, inbounds := recovered.addUsageAndSnapshot(nil, nil)
+	if recoveredBatchID != batchID || len(inbounds) != 1 || inbounds[0].Up != 7 || inbounds[0].Down != 9 {
+		t.Fatalf("unexpected restored inbound batch: batch=%q stats=%#v", recoveredBatchID, inbounds)
+	}
+	if !recovered.ack(batchID) {
+		t.Fatal("expected recovered batch ack")
+	}
+	_, _, inbounds = recovered.addUsageAndSnapshot(nil, nil)
+	if len(inbounds) != 1 || inbounds[0].Up != 3 || inbounds[0].Down != 4 {
+		t.Fatalf("unexpected queued inbound deltas: %#v", inbounds)
 	}
 }
 
@@ -178,6 +244,7 @@ func TestPersistentUsageBufferRestoresEmptyAfterAck(t *testing.T) {
 func TestUsageEndpointsReturnPendingWhenCoreStopped(t *testing.T) {
 	buffer := newUsageBuffer()
 	buffer.add([]xray.OutboundStat{{Tag: "proxy", Up: 10, Down: 20}})
+	buffer.addInbound([]xray.InboundStat{{Tag: "inbound", Up: 30, Down: 40}})
 	buffer.addUsers([]xray.UserStat{{UID: "42", Value: 123}})
 
 	server := &Server{
@@ -195,6 +262,14 @@ func TestUsageEndpointsReturnPendingWhenCoreStopped(t *testing.T) {
 	if outbound["tag"] != "proxy" || outbound["up"].(float64) != 10 || outbound["down"].(float64) != 20 {
 		t.Fatalf("unexpected outbound stats: %#v", outbound)
 	}
+	inboundStats := outboundPayload["inbound_stats"].([]any)
+	if len(inboundStats) != 1 {
+		t.Fatalf("expected pending inbound stats, got %#v", outboundPayload)
+	}
+	inbound := inboundStats[0].(map[string]any)
+	if inbound["tag"] != "inbound" || inbound["up"].(float64) != 30 || inbound["down"].(float64) != 40 {
+		t.Fatalf("unexpected inbound stats: %#v", inbound)
+	}
 
 	userPayload := postUsage(t, http.HandlerFunc(server.handleUserUsage))
 	userStats := userPayload["stats"].([]any)
@@ -204,6 +279,26 @@ func TestUsageEndpointsReturnPendingWhenCoreStopped(t *testing.T) {
 	user := userStats[0].(map[string]any)
 	if user["uid"] != "42" || user["value"].(float64) != 123 {
 		t.Fatalf("unexpected user stats: %#v", user)
+	}
+}
+
+func TestGRPCUsagePayloadIncludesInboundStatsAndSupportsOldEmptyPayload(t *testing.T) {
+	buffer := newUsageBuffer()
+	buffer.addInbound([]xray.InboundStat{{Tag: "inbound", Up: 30, Down: 40}})
+	api := &grpcAPI{server: &Server{core: &xray.Core{}, usage: buffer}}
+
+	batch, err := api.CollectOutboundUsage(t.Context(), &nodev1.CollectUsageRequest{Reset_: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch.GetBatchId() == "" || len(batch.GetStats()) != 0 || len(batch.GetInboundStats()) != 1 {
+		t.Fatalf("unexpected usage payload: %#v", batch)
+	}
+	if stat := batch.GetInboundStats()[0]; stat.GetTag() != "inbound" || stat.GetUp() != 30 || stat.GetDown() != 40 {
+		t.Fatalf("unexpected inbound payload: %#v", stat)
+	}
+	if len((&nodev1.OutboundUsageBatch{}).GetInboundStats()) != 0 {
+		t.Fatal("old payload without inbound_stats should decode as empty")
 	}
 }
 
