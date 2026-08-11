@@ -28,25 +28,70 @@ func (s *Server) applyConfigCacheUserDiff(incomingConfig string) error {
 	if err != nil {
 		return err
 	}
+	return s.applyConfigUserDiffResult(diff)
+}
+
+func (s *Server) applyConfigUserDiffResult(diff configUserDiffResult) error {
+	return applyConfigUserDiff(diff,
+		func(inboundTag string, user xray.InboundUser) error {
+			return xray.AddInboundUser(
+				s.settings.XrayAPIHost,
+				s.settings.XrayAPIPort,
+				grpcOperationTimeout,
+				inboundTag,
+				user,
+			)
+		},
+		func(inboundTag string, email string) error {
+			return xray.RemoveInboundUser(
+				s.settings.XrayAPIHost,
+				s.settings.XrayAPIPort,
+				grpcOperationTimeout,
+				inboundTag,
+				email,
+			)
+		},
+	)
+}
+
+func (s *Server) cachedConfigUser(inboundTag string, email string) (xray.InboundUser, bool, bool, error) {
+	s.mu.Lock()
+	payload, ok := s.loadConfigCache()
+	s.mu.Unlock()
+	if !ok {
+		return xray.InboundUser{}, false, false, nil
+	}
+	states, err := configClientStates(payload.Config)
+	if err != nil {
+		return xray.InboundUser{}, false, true, err
+	}
+	user, ok := states[strings.TrimSpace(inboundTag)].clients[strings.TrimSpace(email)]
+	return user, ok, true, nil
+}
+
+func applyConfigUserDiff(
+	diff configUserDiffResult,
+	add func(string, xray.InboundUser) error,
+	remove func(string, string) error,
+) error {
 	for _, item := range diff.remove {
-		if err := xray.RemoveInboundUser(
-			s.settings.XrayAPIHost,
-			s.settings.XrayAPIPort,
-			grpcOperationTimeout,
-			item.inboundTag,
-			item.email,
-		); err != nil && !isIgnorableXrayRemoveError(err) {
+		if err := remove(item.inboundTag, item.email); err != nil && !isIgnorableXrayRemoveError(err) {
+			return err
+		}
+	}
+	for _, item := range diff.update {
+		if err := remove(item.inboundTag, item.previous.Email); err != nil && !isIgnorableXrayRemoveError(err) {
+			return err
+		}
+		if err := add(item.inboundTag, item.current); err != nil && !isIgnorableXrayAddError(err) {
+			if restoreErr := add(item.inboundTag, item.previous); restoreErr != nil && !isIgnorableXrayAddError(restoreErr) {
+				return fmt.Errorf("update inbound user: %v; restore previous user: %w", err, restoreErr)
+			}
 			return err
 		}
 	}
 	for _, item := range diff.add {
-		if err := xray.AddInboundUser(
-			s.settings.XrayAPIHost,
-			s.settings.XrayAPIPort,
-			grpcOperationTimeout,
-			item.inboundTag,
-			item.user,
-		); err != nil && !isIgnorableXrayAddError(err) {
+		if err := add(item.inboundTag, item.user); err != nil && !isIgnorableXrayAddError(err) {
 			return err
 		}
 	}
@@ -204,6 +249,7 @@ func asString(value any) string {
 type configUserDiffResult struct {
 	add    []configUserAdd
 	remove []configUserRemove
+	update []configUserUpdate
 }
 
 type configUserAdd struct {
@@ -214,6 +260,12 @@ type configUserAdd struct {
 type configUserRemove struct {
 	inboundTag string
 	email      string
+}
+
+type configUserUpdate struct {
+	inboundTag string
+	previous   xray.InboundUser
+	current    xray.InboundUser
 }
 
 type configClientState struct {
@@ -243,8 +295,9 @@ func configUserDiff(cachedConfig string, incomingConfig string) (configUserDiffR
 			if cachedState.raw[email] == incomingState.raw[email] {
 				continue
 			}
-			if _, ok := cachedState.clients[email]; ok {
-				diff.remove = append(diff.remove, configUserRemove{inboundTag: tag, email: email})
+			if previous, ok := cachedState.clients[email]; ok {
+				diff.update = append(diff.update, configUserUpdate{inboundTag: tag, previous: previous, current: user})
+				continue
 			}
 			diff.add = append(diff.add, configUserAdd{inboundTag: tag, user: user})
 		}

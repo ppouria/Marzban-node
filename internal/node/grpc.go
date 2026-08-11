@@ -206,20 +206,20 @@ func (api *grpcAPI) UpdateUser(ctx context.Context, req *nodev1.InboundUserReque
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	_ = xray.RemoveInboundUser(
-		api.server.settings.XrayAPIHost,
-		api.server.settings.XrayAPIPort,
-		grpcOperationTimeout,
-		inboundTag,
-		user.Email,
-	)
-	if err := xray.AddInboundUser(
-		api.server.settings.XrayAPIHost,
-		api.server.settings.XrayAPIPort,
-		grpcOperationTimeout,
-		inboundTag,
-		user,
-	); err != nil {
+	previous, exists, cacheAvailable, err := api.server.cachedConfigUser(inboundTag, user.Email)
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	if !cacheAvailable {
+		return nil, status.Error(codes.FailedPrecondition, "runtime config cache is unavailable; sync config first")
+	}
+	diff := configUserDiffResult{}
+	if exists {
+		diff.update = append(diff.update, configUserUpdate{inboundTag: inboundTag, previous: previous, current: user})
+	} else {
+		diff.add = append(diff.add, configUserAdd{inboundTag: inboundTag, user: user})
+	}
+	if err := api.server.applyConfigUserDiffResult(diff); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
 	if err := api.server.addUserToConfigCache(inboundTag, user); err != nil {

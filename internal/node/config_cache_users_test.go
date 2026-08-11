@@ -2,6 +2,8 @@ package node
 
 import (
 	"encoding/json"
+	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/rebeccapanel/rebecca-node/internal/xray"
@@ -77,27 +79,47 @@ func TestConfigUserDiffAddsUpdatesAndRemovesUsers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(diff.remove) != 2 {
-		t.Fatalf("expected one deleted and one replaced user removal, got %#v", diff.remove)
+	if len(diff.remove) != 1 {
+		t.Fatalf("expected one deleted user removal, got %#v", diff.remove)
 	}
 	if diff.remove[0].inboundTag != "vless-ws" || diff.remove[0].email != "1.old" {
 		t.Fatalf("unexpected deleted user removal: %#v", diff.remove[0])
 	}
-	if diff.remove[1].inboundTag != "vless-ws" || diff.remove[1].email != "2.alice" {
-		t.Fatalf("unexpected replaced user removal: %#v", diff.remove[1])
+	if len(diff.update) != 1 || diff.update[0].inboundTag != "vless-ws" || diff.update[0].previous.ID != "alice-id" || diff.update[0].current.ID != "alice-new-id" {
+		t.Fatalf("unexpected user update: %#v", diff.update)
 	}
-	if len(diff.add) != 2 {
-		t.Fatalf("expected replaced and new user additions, got %#v", diff.add)
+	if len(diff.add) != 1 {
+		t.Fatalf("expected one new user addition, got %#v", diff.add)
 	}
-	adds := map[string]configUserAdd{}
-	for _, item := range diff.add {
-		adds[item.user.Email] = item
-	}
-	if item := adds["2.alice"]; item.inboundTag != "vless-ws" || item.user.ID != "alice-new-id" || item.user.Flow != "xtls-rprx-vision" {
-		t.Fatalf("unexpected replaced user addition: %#v", item)
-	}
-	if item := adds["3.bob"]; item.inboundTag != "vless-ws" || item.user.ID != "bob-id" {
+	if item := diff.add[0]; item.inboundTag != "vless-ws" || item.user.Email != "3.bob" || item.user.ID != "bob-id" {
 		t.Fatalf("unexpected new user addition: %#v", item)
+	}
+}
+
+func TestApplyConfigUserDiffRestoresPreviousUserWhenUpdateFails(t *testing.T) {
+	previous := xray.InboundUser{Protocol: "vless", Email: "2.alice", ID: "old-id"}
+	current := xray.InboundUser{Protocol: "vless", Email: "2.alice", ID: "new-id"}
+	diff := configUserDiffResult{update: []configUserUpdate{{inboundTag: "vless-ws", previous: previous, current: current}}}
+	calls := []string{}
+	err := applyConfigUserDiff(diff,
+		func(tag string, user xray.InboundUser) error {
+			calls = append(calls, "add:"+user.ID)
+			if user.ID == current.ID {
+				return errors.New("temporary Xray API failure")
+			}
+			return nil
+		},
+		func(tag string, email string) error {
+			calls = append(calls, "remove:"+email)
+			return nil
+		},
+	)
+	if err == nil || err.Error() != "temporary Xray API failure" {
+		t.Fatalf("expected original update error, got %v", err)
+	}
+	want := []string{"remove:2.alice", "add:new-id", "add:old-id"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("unexpected update/restore calls: got %#v want %#v", calls, want)
 	}
 }
 
