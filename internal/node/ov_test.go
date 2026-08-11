@@ -165,6 +165,9 @@ func TestOVCollectUsageReadsStatusDeltas(t *testing.T) {
 	if err := os.MkdirAll(inboundDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "openvpn", "runtime.json"), []byte(`{"inbounds":[{"tag":"edge"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(inboundDir, "users.tsv"), []byte("42\talice\tpass\t10.66.0.2\t100\t1000\tactive\t\t0\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +178,7 @@ func TestOVCollectUsageReadsStatusDeltas(t *testing.T) {
 	manager := newOVManager(dir, "binary")
 
 	stats := manager.CollectUsage()
-	if len(stats) != 1 || stats[0].UID != "openvpn:42" || stats[0].Value != 500 {
+	if len(stats) != 1 || stats[0].UID != "openvpn:42" || stats[0].InboundTag != "edge" || stats[0].Value != 500 {
 		t.Fatalf("unexpected first stats: %#v", stats)
 	}
 	stats = manager.CollectUsage()
@@ -210,7 +213,7 @@ func TestOVDisconnectSubtractsAccountedUsage(t *testing.T) {
 	for _, want := range []string{
 		"previous=$(awk",
 		"delta=$((total - previous))",
-		"printf 'openvpn:%s\\t%s\\n' \"$uid\" \"$delta\"",
+		"printf 'openvpn:%s\\t%s\\t%s\\n' \"$uid\" \"$delta\" \"$INBOUND_TAG\"",
 		"remote_ip=${trusted_ip:-${untrusted_ip:-unknown}}",
 		"vpn_release \"$uid\" \"ov\" \"edge\" \"$session\" \"$assigned_ip\"",
 		"awk -F '\\t' -v sid=\"$session\" '$1 != sid { print }'",

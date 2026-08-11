@@ -163,7 +163,7 @@ func (m *wgManager) CollectUsage() []xray.UserStat {
 	}
 	callback := runtimeConfig.SessionCallback
 
-	totals := map[string]int64{}
+	totals := map[userUsageKey]int64{}
 	for _, inbound := range runtimeConfig.Inbounds {
 		iface := wgIfaceName(inbound.Tag)
 		device, err := client.Device(iface)
@@ -204,7 +204,7 @@ func (m *wgManager) CollectUsage() []xray.UserStat {
 				delta = current - previous
 			}
 			if delta > 0 {
-				totals[wgUsageUID(userID)] += delta
+				addUserUsage(totals, wgUsageUID(userID), inbound.Tag, delta)
 			}
 			if runtimePeer.DataLimit != nil && *runtimePeer.DataLimit > 0 && usageBase+current >= *runtimePeer.DataLimit {
 				m.removePeer(client, iface, peer.PublicKey)
@@ -217,13 +217,7 @@ func (m *wgManager) CollectUsage() []xray.UserStat {
 		m.saveUsageBases(iface, nextUsageBases)
 	}
 
-	out := make([]xray.UserStat, 0, len(totals))
-	for uid, value := range totals {
-		if value > 0 {
-			out = append(out, xray.UserStat{UID: uid, Value: value})
-		}
-	}
-	return out
+	return userUsageStats(totals)
 }
 
 func (m *wgManager) markPeerLimited(inboundTag string, publicKey string, limit int64) {

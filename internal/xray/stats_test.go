@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"math"
 	"strings"
@@ -120,6 +121,27 @@ func TestParseUserStatName(t *testing.T) {
 
 	if _, ok := parseUserStatName("outbound>>>proxy>>>traffic>>>uplink"); ok {
 		t.Fatal("non-user stats should be ignored")
+	}
+}
+
+func TestUserStatsKeepInboundDimensionsSeparate(t *testing.T) {
+	encode := func(tag string) string {
+		return base64.RawURLEncoding.EncodeToString([]byte(tag))
+	}
+	stats := userStatsFromCounters([]*statscommand.Stat{
+		{Name: "user>>>42.rb1_" + encode("germany-vless") + ".alice>>>traffic>>>uplink", Value: 10},
+		{Name: "user>>>42.rb1_" + encode("germany-vless") + ".alice>>>traffic>>>downlink", Value: 20},
+		{Name: "user>>>42.rb1_" + encode("تهران") + ".alice>>>traffic>>>uplink", Value: 5},
+		{Name: "user>>>42.alice>>>traffic>>>uplink", Value: 7},
+	})
+	if len(stats) != 3 {
+		t.Fatalf("stats=%#v", stats)
+	}
+	want := map[string]int64{"": 7, "germany-vless": 30, "تهران": 5}
+	for _, stat := range stats {
+		if stat.UID != "42" || want[stat.InboundTag] != stat.Value {
+			t.Fatalf("unexpected stat: %#v", stat)
+		}
 	}
 }
 

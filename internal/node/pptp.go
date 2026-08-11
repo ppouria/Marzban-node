@@ -95,12 +95,31 @@ func (m *pptpManager) Apply(runtimeConfig *pptpRuntime) error {
 	return m.applyInbound(inbound)
 }
 
+func (m *pptpManager) currentRuntime() *pptpRuntime {
+	if m == nil {
+		return nil
+	}
+	raw, err := os.ReadFile(filepath.Join(m.baseDir, "runtime.json"))
+	if err != nil {
+		return nil
+	}
+	var payload pptpRuntime
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	return &payload
+}
+
 func (m *pptpManager) CollectUsage() []xray.UserStat {
 	if m == nil {
 		return nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	inboundTag := ""
+	if runtimeConfig := m.currentRuntime(); runtimeConfig != nil && len(runtimeConfig.Inbounds) > 0 {
+		inboundTag = runtimeConfig.Inbounds[0].Tag
+	}
 	stats := map[string]int64{}
 	path := filepath.Join(m.baseDir, "usage.tsv")
 	file, err := os.Open(path)
@@ -124,7 +143,7 @@ func (m *pptpManager) CollectUsage() []xray.UserStat {
 	collectPPPLiveUsage(m.baseDir, "pptp", stats)
 	out := make([]xray.UserStat, 0, len(stats))
 	for uid, value := range stats {
-		out = append(out, xray.UserStat{UID: uid, Value: value})
+		out = append(out, xray.UserStat{UID: uid, Value: value, InboundTag: inboundTag})
 	}
 	return out
 }

@@ -133,6 +133,10 @@ func (m *l2tpManager) CollectUsage() []xray.UserStat {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	inboundTag := ""
+	if runtimeConfig := m.currentRuntime(); runtimeConfig != nil && len(runtimeConfig.Inbounds) > 0 {
+		inboundTag = runtimeConfig.Inbounds[0].Tag
+	}
 	stats := map[string]int64{}
 	path := filepath.Join(m.baseDir, "usage.tsv")
 	file, err := os.Open(path)
@@ -156,7 +160,7 @@ func (m *l2tpManager) CollectUsage() []xray.UserStat {
 	collectPPPLiveUsage(m.baseDir, "l2tp", stats)
 	out := make([]xray.UserStat, 0, len(stats))
 	for uid, value := range stats {
-		out = append(out, xray.UserStat{UID: uid, Value: value})
+		out = append(out, xray.UserStat{UID: uid, Value: value, InboundTag: inboundTag})
 	}
 	return out
 }

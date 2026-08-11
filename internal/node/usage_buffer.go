@@ -1,6 +1,7 @@
 package node
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"log"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/rebeccapanel/rebecca-node/internal/xray"
@@ -274,7 +276,8 @@ func (b *usageBuffer) addUsersLocked(samples []xray.UserStat) {
 		if sample.UID == "" || sample.Value == 0 {
 			continue
 		}
-		b.users[sample.UID] += sample.Value
+		key := userUsageBufferKey(sample.UID, sample.InboundTag)
+		b.users[key] = addUsageCounter(b.users[key], sample.Value)
 	}
 }
 
@@ -403,10 +406,30 @@ func inboundSnapshotResult(snapshot map[string]xray.InboundStat) []xray.InboundS
 
 func userSnapshotResult(snapshot map[string]int64) []xray.UserStat {
 	result := make([]xray.UserStat, 0, len(snapshot))
-	for uid, value := range snapshot {
+	for key, value := range snapshot {
 		if value != 0 {
-			result = append(result, xray.UserStat{UID: uid, Value: value})
+			uid, inboundTag := parseUserUsageBufferKey(key)
+			result = append(result, xray.UserStat{UID: uid, Value: value, InboundTag: inboundTag})
 		}
 	}
 	return result
+}
+
+func userUsageBufferKey(uid, inboundTag string) string {
+	if inboundTag == "" {
+		return uid
+	}
+	return uid + "\x00" + base64.RawURLEncoding.EncodeToString([]byte(inboundTag))
+}
+
+func parseUserUsageBufferKey(key string) (string, string) {
+	uid, encodedTag, found := strings.Cut(key, "\x00")
+	if !found {
+		return key, ""
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encodedTag)
+	if err != nil {
+		return uid, ""
+	}
+	return uid, string(decoded)
 }

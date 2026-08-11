@@ -148,6 +148,36 @@ func TestUsageBufferKeepsUserPendingUntilAck(t *testing.T) {
 	}
 }
 
+func TestUsageBufferKeepsSameUserSeparateAcrossInboundsAndReload(t *testing.T) {
+	spoolPath := filepath.Join(t.TempDir(), "usage-spool.json")
+	buffer, err := newPersistentUsageBuffer(spoolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchID, stats := buffer.addUsersAndSnapshot([]xray.UserStat{
+		{UID: "42", InboundTag: "in-a", Value: 10},
+		{UID: "42", InboundTag: "in-b", Value: 20},
+	})
+	if batchID == "" || len(stats) != 2 {
+		t.Fatalf("batch=%q stats=%#v", batchID, stats)
+	}
+
+	reloaded, err := newPersistentUsageBuffer(spoolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloadedBatch, reloadedStats := reloaded.addUsersAndSnapshot(nil)
+	if reloadedBatch != batchID || len(reloadedStats) != 2 {
+		t.Fatalf("reloaded batch=%q stats=%#v", reloadedBatch, reloadedStats)
+	}
+	want := map[string]int64{"in-a": 10, "in-b": 20}
+	for _, stat := range reloadedStats {
+		if stat.UID != "42" || want[stat.InboundTag] != stat.Value {
+			t.Fatalf("unexpected reloaded stat: %#v", stat)
+		}
+	}
+}
+
 func TestPersistentUsageBufferRestoresUnackedBatches(t *testing.T) {
 	spoolPath := filepath.Join(t.TempDir(), "usage-spool.json")
 	buffer, err := newPersistentUsageBuffer(spoolPath)

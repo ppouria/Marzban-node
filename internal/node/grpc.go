@@ -484,8 +484,9 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 	res := &nodev1.UserUsageBatch{BatchId: batchID, OnlineIps: protoOnlineUserIPs(onlineIPs)}
 	for _, stat := range pending {
 		res.Stats = append(res.Stats, &nodev1.UserUsageSample{
-			Uid:   stat.UID,
-			Value: uint64(maxInt64(stat.Value, 0)),
+			Uid:        stat.UID,
+			Value:      uint64(maxInt64(stat.Value, 0)),
+			InboundTag: stat.InboundTag,
 		})
 	}
 	return res, nil

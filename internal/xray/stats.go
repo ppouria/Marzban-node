@@ -2,6 +2,7 @@ package xray
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"math"
 	"net"
@@ -31,9 +32,12 @@ type InboundStat struct {
 }
 
 type UserStat struct {
-	UID   string `json:"uid"`
-	Value int64  `json:"value"`
+	UID        string `json:"uid"`
+	Value      int64  `json:"value"`
+	InboundTag string `json:"inbound_tag,omitempty"`
 }
+
+const inboundRuntimeEmailMarker = "rb1_"
 
 type OnlineIP struct {
 	IP           string `json:"ip"`
@@ -152,33 +156,46 @@ func QueryUserStats(apiHost string, apiPort int, timeout time.Duration, reset bo
 	if err != nil {
 		return nil, err
 	}
+	return userStatsFromCounters(stats), nil
+}
 
-	byUID := map[string]int64{}
+func userStatsFromCounters(stats []*statscommand.Stat) []UserStat {
+	type userKey struct {
+		uid        string
+		inboundTag string
+	}
+	byUser := map[userKey]int64{}
 	for _, stat := range stats {
 		if stat == nil || stat.GetValue() == 0 {
 			continue
 		}
-		uid, ok := parseUserStatName(stat.GetName())
+		uid, inboundTag, ok := parseUserStatIdentity(stat.GetName())
 		if !ok {
 			continue
 		}
-		byUID[uid] += stat.GetValue()
+		key := userKey{uid: uid, inboundTag: inboundTag}
+		byUser[key] = addStatCounter(byUser[key], stat.GetValue())
 	}
 
-	uids := make([]string, 0, len(byUID))
-	for uid := range byUID {
-		uids = append(uids, uid)
+	keys := make([]userKey, 0, len(byUser))
+	for key := range byUser {
+		keys = append(keys, key)
 	}
-	sort.Strings(uids)
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].uid == keys[j].uid {
+			return keys[i].inboundTag < keys[j].inboundTag
+		}
+		return keys[i].uid < keys[j].uid
+	})
 
-	result := make([]UserStat, 0, len(uids))
-	for _, uid := range uids {
-		value := byUID[uid]
+	result := make([]UserStat, 0, len(keys))
+	for _, key := range keys {
+		value := byUser[key]
 		if value != 0 {
-			result = append(result, UserStat{UID: uid, Value: value})
+			result = append(result, UserStat{UID: key.uid, Value: value, InboundTag: key.inboundTag})
 		}
 	}
-	return result, nil
+	return result
 }
 
 func QueryOnlineUserUIDs(apiHost string, apiPort int, timeout time.Duration) ([]string, error) {
@@ -378,11 +395,16 @@ func parseInboundStatName(name string) (string, string, bool) {
 }
 
 func parseUserStatName(name string) (string, bool) {
+	uid, _, ok := parseUserStatIdentity(name)
+	return uid, ok
+}
+
+func parseUserStatIdentity(name string) (string, string, bool) {
 	parts := strings.Split(name, ">>>")
 	if len(parts) < 4 || parts[0] != "user" || parts[2] != "traffic" {
-		return "", false
+		return "", "", false
 	}
-	return parseUserEmailUID(parts[1])
+	return parseUserEmailIdentity(parts[1])
 }
 
 func parseOnlineUserName(name string) (string, string, bool) {
@@ -403,11 +425,30 @@ func onlineUserStatsName(email string) string {
 }
 
 func parseUserEmailUID(email string) (string, bool) {
+	uid, _, ok := parseUserEmailIdentity(email)
+	return uid, ok
+}
+
+func parseUserEmailIdentity(email string) (string, string, bool) {
 	email = strings.TrimSpace(email)
 	if email == "" {
-		return "", false
+		return "", "", false
 	}
-	uid, _, _ := strings.Cut(email, ".")
+	uid, rest, hasRest := strings.Cut(email, ".")
 	uid = strings.TrimSpace(uid)
-	return uid, uid != ""
+	if uid == "" {
+		return "", "", false
+	}
+	if !hasRest {
+		return uid, "", true
+	}
+	marker, _, _ := strings.Cut(rest, ".")
+	if !strings.HasPrefix(marker, inboundRuntimeEmailMarker) {
+		return uid, "", true
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(marker, inboundRuntimeEmailMarker))
+	if err != nil || strings.TrimSpace(string(decoded)) == "" {
+		return uid, "", true
+	}
+	return uid, string(decoded), true
 }

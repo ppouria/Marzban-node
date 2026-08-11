@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
@@ -151,13 +152,28 @@ func (m *ovManager) Apply(runtimeConfig *ovRuntime) error {
 	return nil
 }
 
+func (m *ovManager) currentRuntime() *ovRuntime {
+	if m == nil {
+		return nil
+	}
+	raw, err := os.ReadFile(filepath.Join(m.baseDir, "runtime.json"))
+	if err != nil {
+		return nil
+	}
+	var payload ovRuntime
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	return &payload
+}
+
 func (m *ovManager) CollectUsage() []xray.UserStat {
 	if m == nil {
 		return nil
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	stats := map[string]int64{}
+	totals := map[userUsageKey]int64{}
 	path := filepath.Join(m.baseDir, "usage.tsv")
 	file, err := os.Open(path)
 	if err == nil {
@@ -173,16 +189,23 @@ func (m *ovManager) CollectUsage() []xray.UserStat {
 			if uid == "" || value <= 0 {
 				continue
 			}
-			stats[uid] += value
+			inboundTag := ""
+			if len(parts) >= 3 {
+				encodedTag := strings.TrimSpace(parts[2])
+				if strings.HasPrefix(encodedTag, "rb1_") {
+					if decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(encodedTag, "rb1_")); err == nil {
+						inboundTag = string(decoded)
+					}
+				} else {
+					inboundTag = encodedTag
+				}
+			}
+			addUserUsage(totals, uid, inboundTag, value)
 		}
 		_ = os.WriteFile(path, nil, 0o600)
 	}
-	m.collectLiveUsageLocked(stats)
-	out := make([]xray.UserStat, 0, len(stats))
-	for uid, value := range stats {
-		out = append(out, xray.UserStat{UID: uid, Value: value})
-	}
-	return out
+	m.collectLiveUsageLocked(totals)
+	return userUsageStats(totals)
 }
 
 func (m *ovManager) writeInbound(inbound ovRuntimeInbound, callback *vpnSessionCallback) error {
@@ -341,16 +364,23 @@ func (m *ovManager) stopInboundName(name string) {
 	_ = vpnRemoveDirectNAT("openvpn-" + name)
 }
 
-func (m *ovManager) collectLiveUsageLocked(stats map[string]int64) {
+func (m *ovManager) collectLiveUsageLocked(stats map[userUsageKey]int64) {
 	accountingPath := filepath.Join(m.baseDir, "accounting.tsv")
 	_ = withVPNFileLock(accountingPath+".lock", func() {
 		records := readOVAccounting(accountingPath)
+		tagByDir := map[string]string{}
+		if runtimeConfig := m.currentRuntime(); runtimeConfig != nil {
+			for _, inbound := range runtimeConfig.Inbounds {
+				tagByDir[safeName(inbound.Tag)] = inbound.Tag
+			}
+		}
 		if entries, err := os.ReadDir(m.baseDir); err == nil {
 			for _, entry := range entries {
 				if !entry.IsDir() {
 					continue
 				}
 				dir := filepath.Join(m.baseDir, entry.Name())
+				inboundTag := tagByDir[entry.Name()]
 				users := readOVUsers(filepath.Join(dir, "users.tsv"))
 				for _, session := range readOVStatus(filepath.Join(dir, "status.log"), users) {
 					record := records[session.SessionID]
@@ -361,7 +391,7 @@ func (m *ovManager) collectLiveUsageLocked(stats map[string]int64) {
 						record.Base = session.Base
 					}
 					if session.Total > record.Total {
-						stats["openvpn:"+session.UserID] += session.Total - record.Total
+						addUserUsage(stats, "openvpn:"+session.UserID, inboundTag, session.Total-record.Total)
 					}
 					record.Total = session.Total
 					records[session.SessionID] = record
@@ -994,9 +1024,11 @@ fi
 }
 
 func disconnectScript(usersPath string, usagePath string, accountingPath string, callbackPath string, sessionsPath string, inboundTag string) string {
+	encodedInboundTag := "rb1_" + base64.RawURLEncoding.EncodeToString([]byte(inboundTag))
 	return fmt.Sprintf(`#!/bin/sh
 USERS=%q
 USAGE=%q
+INBOUND_TAG=%q
 ACCOUNTING=%q
 ACCOUNTING_LOCK="${ACCOUNTING}.lock"
 %s
@@ -1018,7 +1050,7 @@ if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
     case "$previous" in ''|*[!0-9]*) previous=0 ;; esac
     delta=$((total - previous))
     if [ "$delta" -gt 0 ]; then
-      printf 'openvpn:%%s\t%%s\n' "$uid" "$delta" >> "$USAGE"
+      printf 'openvpn:%%s\t%%s\t%%s\n' "$uid" "$delta" "$INBOUND_TAG" >> "$USAGE"
     fi
     tmp="${ACCOUNTING}.$$"
     awk -F '\t' -v sid="$session" '$1 != sid { print }' "$ACCOUNTING" > "$tmp"
@@ -1027,7 +1059,7 @@ if [ -n "$uid" ] && [ "$total" -gt 0 ]; then
   ) 9>"$ACCOUNTING_LOCK"
 fi
 vpn_release "$uid" "ov" %q "$session" "$assigned_ip" "$remote_ip"
-`, usersPath, usagePath, accountingPath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
+`, usersPath, usagePath, encodedInboundTag, accountingPath, vpnSessionShell(callbackPath, sessionsPath), safeName(inboundTag))
 }
 
 func usersTSV(users []ovRuntimeUser) string {

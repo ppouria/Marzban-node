@@ -831,7 +831,7 @@ func (m *remoteAccessManager) CollectUsage(protocol string) []xray.UserStat {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	stats := map[string]int64{}
+	totals := map[userUsageKey]int64{}
 	base := filepath.Join(m.baseDir, protocol)
 	entries := []string{base}
 	if protocol == "anyconnect" {
@@ -844,34 +844,41 @@ func (m *remoteAccessManager) CollectUsage(protocol string) []xray.UserStat {
 			}
 		}
 	}
+	runtimeConfig := m.runtimeConfig(protocol)
 	for _, dir := range entries {
+		inboundTag := ""
+		if runtimeConfig != nil {
+			for _, inbound := range runtimeConfig.Inbounds {
+				if protocol != "anyconnect" || safeName(inbound.Tag) == filepath.Base(dir) {
+					inboundTag = inbound.Tag
+					break
+				}
+			}
+		}
+		stats := map[string]int64{}
 		if protocol == "anyconnect" {
 			m.collectAnyConnectLive(dir, stats)
 		} else if protocol == "ikev2" {
 			m.collectIKEv2Live(dir, stats)
 		}
 		file, err := os.Open(filepath.Join(dir, "usage.tsv"))
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			parts := strings.Split(scanner.Text(), "\t")
-			if len(parts) >= 2 {
-				value, _ := strconv.ParseInt(parts[1], 10, 64)
-				stats[protocol+":"+parts[0]] += value
+		if err == nil {
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				parts := strings.Split(scanner.Text(), "\t")
+				if len(parts) >= 2 {
+					value, _ := strconv.ParseInt(parts[1], 10, 64)
+					stats[protocol+":"+parts[0]] += value
+				}
 			}
+			_ = file.Close()
+			_ = os.WriteFile(filepath.Join(dir, "usage.tsv"), nil, 0o600)
 		}
-		_ = file.Close()
-		_ = os.WriteFile(filepath.Join(dir, "usage.tsv"), nil, 0o600)
-	}
-	result := make([]xray.UserStat, 0, len(stats))
-	for uid, value := range stats {
-		if value > 0 {
-			result = append(result, xray.UserStat{UID: uid, Value: value})
+		for uid, value := range stats {
+			addUserUsage(totals, uid, inboundTag, value)
 		}
 	}
-	return result
+	return userUsageStats(totals)
 }
 
 type ikev2Session struct {
