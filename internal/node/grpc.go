@@ -1030,6 +1030,7 @@ func (s *Server) grpcRuntimeState(message string) *nodev1.RuntimeState {
 		InstallMode:   s.settings.InstallMode,
 		UpdateChannel: s.updateChannel(),
 		Message:       message,
+		Capabilities:  []string{"safe_user_reconciliation"},
 	}
 }
 
