@@ -21,7 +21,7 @@ RUN apt-get update \
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates haproxy \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/rebecca-node /usr/local/bin/rebecca-node

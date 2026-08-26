@@ -170,6 +170,11 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 	if err := api.server.remoteAccess.ApplyAnyConnect(&remoteAccessRuntime{Inbounds: []remoteAccessRuntimeInbound{}}); err != nil {
 		log.Printf("AnyConnect runtime stop failed: %v", err)
 	}
+	if api.server.haproxy != nil {
+		if err := api.server.haproxy.Apply(&haproxyRuntime{}); err != nil {
+			log.Printf("HAProxy runtime stop failed: %v", err)
+		}
+	}
 	if err := api.server.ipBlocks.Clear(ctx); err != nil {
 		log.Printf("source IP block cleanup failed: %v", err)
 	}
@@ -575,7 +580,7 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if err != nil {
 		return nil, err
 	}
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, haproxyRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -611,6 +616,10 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if cacheAnyConnectRuntime == nil {
 		cacheAnyConnectRuntime = s.cachedAnyConnectRuntime()
 	}
+	cacheHAProxyRuntime := haproxyRuntimeConfig
+	if cacheHAProxyRuntime == nil {
+		cacheHAProxyRuntime = s.cachedHAProxyRuntime()
+	}
 	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -620,12 +629,13 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	wgWarning := s.applyWGRuntime(cacheWGRuntime)
 	ikev2Warning := s.applyIKEv2Runtime(cacheIKEv2Runtime)
 	anyConnectWarning := s.applyAnyConnectRuntime(cacheAnyConnectRuntime)
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
+	haproxyWarning := s.applyHAProxyRuntime(cacheHAProxyRuntime)
+	s.saveConfigCacheWithHAProxy(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheHAProxyRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
 	message := "runtime started"
 	if sync {
 		message = "runtime config synced"
 	}
-	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning); warning != "" {
+	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning, haproxyWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
@@ -636,7 +646,7 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if err != nil {
 		return nil, err
 	}
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, haproxyRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -672,6 +682,10 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if cacheAnyConnectRuntime == nil {
 		cacheAnyConnectRuntime = s.cachedAnyConnectRuntime()
 	}
+	cacheHAProxyRuntime := haproxyRuntimeConfig
+	if cacheHAProxyRuntime == nil {
+		cacheHAProxyRuntime = s.cachedHAProxyRuntime()
+	}
 	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -681,15 +695,16 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	wgWarning := s.applyWGRuntime(cacheWGRuntime)
 	ikev2Warning := s.applyIKEv2Runtime(cacheIKEv2Runtime)
 	anyConnectWarning := s.applyAnyConnectRuntime(cacheAnyConnectRuntime)
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
-	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning); warning != "" {
+	haproxyWarning := s.applyHAProxyRuntime(cacheHAProxyRuntime)
+	s.saveConfigCacheWithHAProxy(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheHAProxyRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
+	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning, haproxyWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
 }
 
 func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeConfigRequest, message string) (*nodev1.RuntimeActionResponse, error) {
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, haproxyRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -720,6 +735,10 @@ func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeCo
 	if cacheAnyConnectRuntime == nil {
 		cacheAnyConnectRuntime = s.cachedAnyConnectRuntime()
 	}
+	cacheHAProxyRuntime := haproxyRuntimeConfig
+	if cacheHAProxyRuntime == nil {
+		cacheHAProxyRuntime = s.cachedHAProxyRuntime()
+	}
 	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -729,8 +748,9 @@ func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeCo
 	wgWarning := s.applyWGRuntime(cacheWGRuntime)
 	ikev2Warning := s.applyIKEv2Runtime(cacheIKEv2Runtime)
 	anyConnectWarning := s.applyAnyConnectRuntime(cacheAnyConnectRuntime)
-	s.saveConfigCache(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
-	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning); warning != "" {
+	haproxyWarning := s.applyHAProxyRuntime(cacheHAProxyRuntime)
+	s.saveConfigCacheWithHAProxy(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheHAProxyRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
+	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning, haproxyWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
@@ -843,7 +863,7 @@ func (s *Server) grpcConfig(ctx context.Context, req *nodev1.RuntimeConfigReques
 	return cfg, nil
 }
 
-func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, *pptpRuntime, *wgRuntime, *remoteAccessRuntime, *remoteAccessRuntime, error) {
+func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, *pptpRuntime, *wgRuntime, *remoteAccessRuntime, *remoteAccessRuntime, *haproxyRuntime, error) {
 	raw := strings.TrimSpace(req.GetOvRuntimeJson())
 	if raw == "" {
 		return &ovRuntime{Inbounds: []ovRuntimeInbound{}},
@@ -851,7 +871,8 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 			&pptpRuntime{Inbounds: []pptpRuntimeInbound{}},
 			&wgRuntime{Inbounds: []wgRuntimeInbound{}},
 			&remoteAccessRuntime{Inbounds: []remoteAccessRuntimeInbound{}},
-			&remoteAccessRuntime{Inbounds: []remoteAccessRuntimeInbound{}}, nil
+			&remoteAccessRuntime{Inbounds: []remoteAccessRuntimeInbound{}},
+			&haproxyRuntime{}, nil
 	}
 	var envelope struct {
 		GeneratedAt         string                       `json:"generated_at"`
@@ -868,9 +889,10 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 		IKEv2Generated      string                       `json:"ikev2_generated,omitempty"`
 		AnyConnectInbounds  []remoteAccessRuntimeInbound `json:"anyconnect_inbounds"`
 		AnyConnectGenerated string                       `json:"anyconnect_generated,omitempty"`
+		HAProxy             *haproxyRuntime              `json:"haproxy,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
-		return nil, nil, nil, nil, nil, nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
+		return nil, nil, nil, nil, nil, nil, nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
 	}
 	ovRuntimeConfig := &ovRuntime{GeneratedAt: envelope.GeneratedAt, Target: envelope.Target, SessionCallback: envelope.SessionCallback, Inbounds: envelope.Inbounds}
 	if ovRuntimeConfig.Inbounds == nil {
@@ -896,7 +918,7 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 	if anyConnectRuntimeConfig.Inbounds == nil {
 		anyConnectRuntimeConfig.Inbounds = []remoteAccessRuntimeInbound{}
 	}
-	return ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, nil
+	return ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, envelope.HAProxy, nil
 }
 
 func (s *Server) grpcAddUser(req *nodev1.InboundUserRequest, message string) (*nodev1.RuntimeActionResponse, error) {
@@ -1030,7 +1052,7 @@ func (s *Server) grpcRuntimeState(message string) *nodev1.RuntimeState {
 		InstallMode:   s.settings.InstallMode,
 		UpdateChannel: s.updateChannel(),
 		Message:       message,
-		Capabilities:  []string{"safe_user_reconciliation"},
+		Capabilities:  []string{"safe_user_reconciliation", "haproxy_runtime"},
 	}
 }
 

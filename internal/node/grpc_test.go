@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"math/big"
 	"net"
@@ -23,15 +24,37 @@ import (
 )
 
 func TestGRPCVPNRuntimeClearsMissingAuxiliaryState(t *testing.T) {
-	ov, l2tp, pptp, wg, ikev2, anyConnect, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{})
+	ov, l2tp, pptp, wg, ikev2, anyConnect, haproxy, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ov == nil || l2tp == nil || pptp == nil || wg == nil || ikev2 == nil || anyConnect == nil {
+	if ov == nil || l2tp == nil || pptp == nil || wg == nil || ikev2 == nil || anyConnect == nil || haproxy == nil {
 		t.Fatal("missing runtime payload must clear every auxiliary runtime")
 	}
 	if len(ov.Inbounds)+len(l2tp.Inbounds)+len(pptp.Inbounds)+len(wg.Inbounds)+len(ikev2.Inbounds)+len(anyConnect.Inbounds) != 0 {
 		t.Fatal("missing runtime payload must not restore cached auxiliary inbounds")
+	}
+}
+
+func TestGRPCVPNRuntimeCarriesManagedHAProxyCertificate(t *testing.T) {
+	certificateFile, privateKeyFile := writeSelfSignedCert(t, t.TempDir(), "managed.example.test", []string{"managed.example.test"})
+	certificate, _ := os.ReadFile(certificateFile)
+	privateKey, _ := os.ReadFile(privateKeyFile)
+	payload, err := json.Marshal(map[string]any{"haproxy": haproxyRuntime{Enabled: true, Sites: []haproxyRuntimeSite{{
+		TLSMode: "managed", CertificatePEM: string(certificate), PrivateKeyPEM: string(privateKey),
+	}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, _, _, runtime, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{OvRuntimeJson: string(payload)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime == nil || len(runtime.Sites) != 1 || runtime.Sites[0].CertificatePEM != string(certificate) || runtime.Sites[0].PrivateKeyPEM != string(privateKey) {
+		t.Fatal("managed certificate files did not reach the node runtime intact")
+	}
+	if _, err := tls.X509KeyPair([]byte(runtime.Sites[0].CertificatePEM), []byte(runtime.Sites[0].PrivateKeyPEM)); err != nil {
+		t.Fatalf("transferred managed certificate cannot be loaded: %v", err)
 	}
 }
 

@@ -35,6 +35,7 @@ type Server struct {
 	pptp         *pptpManager
 	wg           *wgManager
 	remoteAccess *remoteAccessManager
+	haproxy      *haproxyManager
 	ipBlocks     *sourceIPBlocker
 	usage        *usageBuffer
 	system       *systemSampler
@@ -80,6 +81,7 @@ func New(settings appconfig.Settings) (*Server, error) {
 		pptp:         newPPTPManager(settings.RebeccaDataDir, settings.InstallMode),
 		wg:           newWGManager(settings.RebeccaDataDir, settings.InstallMode),
 		remoteAccess: newRemoteAccessManager(settings.RebeccaDataDir, settings.InstallMode),
+		haproxy:      newHAProxyManager(settings.RebeccaDataDir),
 		ipBlocks:     newSourceIPBlocker(settings.RebeccaDataDir, settings.InstallMode),
 		usage:        usage,
 		system:       newSystemSampler(),
@@ -129,6 +131,9 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 	if s.core.Started() {
 		s.snapshotRunningUsage()
 		s.core.Stop()
+	}
+	if s.haproxy != nil {
+		_ = s.haproxy.Apply(&haproxyRuntime{})
 	}
 	if err := s.ipBlocks.Clear(r.Context()); err != nil {
 		log.Printf("source IP block cleanup failed: %v", err)
@@ -232,6 +237,9 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
 		log.Printf("WireGuard runtime stop failed: %v", err)
+	}
+	if s.haproxy != nil {
+		_ = s.haproxy.Apply(&haproxyRuntime{})
 	}
 	if err := s.ipBlocks.Clear(r.Context()); err != nil {
 		log.Printf("source IP block cleanup failed: %v", err)
@@ -826,6 +834,7 @@ type cachedConfigPayload struct {
 	WGRuntime         *wgRuntime           `json:"wg_runtime,omitempty"`
 	IKEv2Runtime      *remoteAccessRuntime `json:"ikev2_runtime,omitempty"`
 	AnyConnectRuntime *remoteAccessRuntime `json:"anyconnect_runtime,omitempty"`
+	HAProxyRuntime    *haproxyRuntime      `json:"haproxy_runtime,omitempty"`
 }
 
 func (s *Server) configCachePath() string {
@@ -833,6 +842,10 @@ func (s *Server) configCachePath() string {
 }
 
 func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime, pptpRuntimeConfig *pptpRuntime, wgRuntimeConfig *wgRuntime, remoteRuntimes ...*remoteAccessRuntime) {
+	s.saveConfigCacheWithHAProxy(rawConfig, peerIP, runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, s.cachedHAProxyRuntime(), remoteRuntimes...)
+}
+
+func (s *Server) saveConfigCacheWithHAProxy(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime, pptpRuntimeConfig *pptpRuntime, wgRuntimeConfig *wgRuntime, haproxyRuntimeConfig *haproxyRuntime, remoteRuntimes ...*remoteAccessRuntime) {
 	if strings.TrimSpace(rawConfig) == "" {
 		return
 	}
@@ -843,7 +856,7 @@ func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig 
 	if len(remoteRuntimes) > 1 {
 		anyConnectRuntime = remoteRuntimes[1]
 	}
-	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig, WGRuntime: wgRuntimeConfig, IKEv2Runtime: ikev2Runtime, AnyConnectRuntime: anyConnectRuntime})
+	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig, WGRuntime: wgRuntimeConfig, IKEv2Runtime: ikev2Runtime, AnyConnectRuntime: anyConnectRuntime, HAProxyRuntime: haproxyRuntimeConfig})
 	if err != nil {
 		return
 	}
@@ -923,6 +936,14 @@ func (s *Server) cachedAnyConnectRuntime() *remoteAccessRuntime {
 	return payload.AnyConnectRuntime
 }
 
+func (s *Server) cachedHAProxyRuntime() *haproxyRuntime {
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return nil
+	}
+	return payload.HAProxyRuntime
+}
+
 func (s *Server) applyL2TPRuntime(runtimeConfig *l2tpRuntime) string {
 	if err := s.l2tp.Apply(runtimeConfig); err != nil {
 		warning := "L2TP runtime apply failed: " + err.Error()
@@ -980,6 +1001,21 @@ func (s *Server) applyAnyConnectRuntime(runtimeConfig *remoteAccessRuntime) stri
 	return ""
 }
 
+func (s *Server) applyHAProxyRuntime(runtimeConfig *haproxyRuntime) string {
+	if s.haproxy == nil {
+		if runtimeConfig == nil || !runtimeConfig.Enabled {
+			return ""
+		}
+		return "HAProxy runtime apply failed: HAProxy manager is unavailable"
+	}
+	if err := s.haproxy.Apply(runtimeConfig); err != nil {
+		warning := "HAProxy runtime apply failed: " + err.Error()
+		log.Print(warning)
+		return warning
+	}
+	return ""
+}
+
 func joinedWarnings(values ...string) string {
 	parts := make([]string, 0, len(values))
 	for _, value := range values {
@@ -1014,6 +1050,9 @@ func (s *Server) startCachedConfig() {
 	s.mu.Lock()
 	s.lastConfig = cfg
 	s.mu.Unlock()
+	if warning := s.applyHAProxyRuntime(payload.HAProxyRuntime); warning != "" {
+		log.Print(warning)
+	}
 }
 
 type downloadFile struct {
