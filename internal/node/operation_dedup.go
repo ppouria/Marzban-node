@@ -1,6 +1,8 @@
 package node
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"log"
@@ -16,7 +18,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const maxOperationReceipts = 2048
+const (
+	maxOperationReceipts    = 2048
+	maxOperationJournalSize = 8 << 20
+)
 
 type operationReceipt struct {
 	Method     string `json:"method"`
@@ -25,10 +30,16 @@ type operationReceipt struct {
 }
 
 type operationDeduper struct {
-	path     string
-	mu       sync.Mutex
-	receipts map[string]operationReceipt
-	inflight map[string]chan struct{}
+	path         string
+	mu           sync.Mutex
+	receipts     map[string]operationReceipt
+	inflight     map[string]chan struct{}
+	journalBytes int64
+}
+
+type operationJournalEntry struct {
+	Key     string           `json:"key"`
+	Receipt operationReceipt `json:"receipt"`
 }
 
 func newOperationDeduper(path string) *operationDeduper {
@@ -37,11 +48,34 @@ func newOperationDeduper(path string) *operationDeduper {
 		receipts: make(map[string]operationReceipt),
 		inflight: make(map[string]chan struct{}),
 	}
-	raw, err := os.ReadFile(path)
-	if err == nil && json.Unmarshal(raw, &d.receipts) != nil {
-		log.Printf("failed to load operation receipts")
-	}
+	d.load()
 	return d
+}
+
+func (d *operationDeduper) load() {
+	raw, err := os.ReadFile(d.path)
+	if err != nil {
+		return
+	}
+	legacy := map[string]operationReceipt{}
+	if json.Unmarshal(raw, &legacy) == nil {
+		d.receipts = legacy
+		d.trimLocked()
+		d.compactLocked()
+		return
+	}
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	for scanner.Scan() {
+		var entry operationJournalEntry
+		if json.Unmarshal(scanner.Bytes(), &entry) == nil && entry.Key != "" {
+			d.receipts[entry.Key] = entry.Receipt
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("failed to load operation receipts: %v", err)
+	}
+	d.trimLocked()
+	d.journalBytes = int64(len(raw))
 }
 
 func (d *operationDeduper) unaryServerInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
@@ -82,9 +116,10 @@ func (d *operationDeduper) unaryServerInterceptor(ctx context.Context, req any, 
 		if err == nil {
 			if message, ok := response.(proto.Message); ok {
 				if raw, marshalErr := proto.Marshal(message); marshalErr == nil {
-					d.receipts[key] = operationReceipt{Method: info.FullMethod, Response: raw, RecordedAt: time.Now().Unix()}
+					receipt := operationReceipt{Method: info.FullMethod, Response: raw, RecordedAt: time.Now().UnixNano()}
+					d.receipts[key] = receipt
 					d.trimLocked()
-					d.saveLocked()
+					d.appendLocked(key, receipt)
 				}
 			}
 		}
@@ -143,11 +178,32 @@ func (d *operationDeduper) trimLocked() {
 	}
 }
 
-func (d *operationDeduper) saveLocked() {
-	raw, err := json.Marshal(d.receipts)
+func (d *operationDeduper) appendLocked(key string, receipt operationReceipt) {
+	raw, err := json.Marshal(operationJournalEntry{Key: key, Receipt: receipt})
 	if err != nil {
 		return
 	}
+	if err := os.MkdirAll(filepath.Dir(d.path), 0o700); err != nil {
+		return
+	}
+	file, err := os.OpenFile(d.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err == nil {
+		_, err = file.Write(append(raw, '\n'))
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil {
+		log.Printf("failed to append operation receipt: %v", err)
+		return
+	}
+	d.journalBytes += int64(len(raw) + 1)
+	if d.journalBytes >= maxOperationJournalSize {
+		d.compactLocked()
+	}
+}
+
+func (d *operationDeduper) compactLocked() {
 	if err := os.MkdirAll(filepath.Dir(d.path), 0o700); err != nil {
 		return
 	}
@@ -157,8 +213,28 @@ func (d *operationDeduper) saveLocked() {
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
+	var size int64
 	if err := tmp.Chmod(0o600); err == nil {
-		_, err = tmp.Write(raw)
+		keys := make([]string, 0, len(d.receipts))
+		for key := range d.receipts {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		writer := bufio.NewWriter(tmp)
+		encoder := json.NewEncoder(writer)
+		for _, key := range keys {
+			if err = encoder.Encode(operationJournalEntry{Key: key, Receipt: d.receipts[key]}); err != nil {
+				break
+			}
+		}
+		if err == nil {
+			err = writer.Flush()
+		}
+		if err == nil {
+			if offset, seekErr := tmp.Seek(0, 1); seekErr == nil {
+				size = offset
+			}
+		}
 	}
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
@@ -167,6 +243,8 @@ func (d *operationDeduper) saveLocked() {
 		err = os.Rename(tmpPath, d.path)
 	}
 	if err != nil {
-		log.Printf("failed to save operation receipts: %v", err)
+		log.Printf("failed to compact operation receipts: %v", err)
+		return
 	}
+	d.journalBytes = size
 }

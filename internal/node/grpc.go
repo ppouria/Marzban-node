@@ -1103,6 +1103,7 @@ func (s *Server) grpcRuntimeState(message string) *nodev1.RuntimeState {
 		Message:       message,
 		Capabilities: []string{
 			"safe_user_reconciliation",
+			"targeted_user_update",
 			"haproxy_runtime",
 			"grpc_control_port",
 			"mutual_tls_required",

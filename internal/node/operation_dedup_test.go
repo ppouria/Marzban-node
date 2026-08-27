@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,29 @@ import (
 	nodev1 "github.com/rebeccapanel/rebecca-node/internal/proto/node/v1"
 	"google.golang.org/grpc"
 )
+
+func TestOperationDeduperKeepsBoundedRecentReceiptWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "receipts.jsonl")
+	deduper := newOperationDeduper(path)
+	info := &grpc.UnaryServerInfo{FullMethod: "/rebecca.node.v1.NodeRuntimeService/RestartService"}
+	handler := func(context.Context, any) (any, error) {
+		return &nodev1.RuntimeActionResponse{Accepted: true}, nil
+	}
+	for i := 0; i < maxOperationReceipts+52; i++ {
+		req := &nodev1.ServiceRestartRequest{OperationId: fmt.Sprintf("operation-%d", i)}
+		if _, err := deduper.unaryServerInterceptor(context.Background(), req, info, handler); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reloaded := newOperationDeduper(path)
+	if len(reloaded.receipts) != maxOperationReceipts {
+		t.Fatalf("loaded receipts = %d, want %d", len(reloaded.receipts), maxOperationReceipts)
+	}
+	if _, ok := reloaded.receipts[info.FullMethod+"\x00operation-"+fmt.Sprint(maxOperationReceipts+51)]; !ok {
+		t.Fatal("newest operation receipt was not retained")
+	}
+}
 
 func TestOperationDeduperPersistsSuccessfulMutation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "receipts.json")
