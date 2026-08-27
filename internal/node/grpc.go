@@ -497,6 +497,21 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 	return res, nil
 }
 
+func (api *grpcAPI) CollectOnlineUsers(context.Context, *nodev1.Empty) (*nodev1.OnlineUsersResponse, error) {
+	if !api.server.core.Started() {
+		return &nodev1.OnlineUsersResponse{}, nil
+	}
+	uids, err := xray.QueryOnlineUserUIDs(
+		api.server.settings.XrayAPIHost,
+		api.server.settings.XrayAPIPort,
+		5*time.Second,
+	)
+	if err != nil {
+		return nil, status.Error(codes.Unavailable, err.Error())
+	}
+	return &nodev1.OnlineUsersResponse{Uids: uids}, nil
+}
+
 func (api *grpcAPI) AckUserUsage(ctx context.Context, req *nodev1.AckUsageRequest) (*nodev1.AckUsageResponse, error) {
 	acknowledged := api.server.usage.ackUsers(req.GetBatchId())
 	return &nodev1.AckUsageResponse{BatchId: req.GetBatchId(), Acknowledged: acknowledged}, nil
