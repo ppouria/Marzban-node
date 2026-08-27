@@ -51,7 +51,7 @@ Read the setup guide here: Soon!
 ## Runtime
 Rebecca-node is implemented in Go and ships one host-level binary:
 
-- `rebecca-node`: the TLS REST API used by the Rebecca master to control Xray and schedule safe on-host restart/update commands
+- `rebecca-node`: the mutually authenticated gRPC service used by the Rebecca master to control Xray and schedule safe on-host restart/update commands
 
 ## Binary builds
 Linux `amd64` and Windows `amd64` binaries are built for:

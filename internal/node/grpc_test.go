@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,7 +62,6 @@ func TestGRPCVPNRuntimeCarriesManagedHAProxyCertificate(t *testing.T) {
 func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 	tempDir := t.TempDir()
 	serverCertFile, serverKeyFile := writeSelfSignedCert(t, tempDir, "server", []string{"rebecca-node.test"})
-	clientCertFile, clientKeyFile := writeSelfSignedCert(t, tempDir, "client", nil)
 
 	settings := appconfig.Settings{
 		AppName:           "rebecca-node",
@@ -69,7 +69,7 @@ func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 		NodeVersion:       "0.2.2",
 		SSLCertFile:       serverCertFile,
 		SSLKeyFile:        serverKeyFile,
-		SSLClientCertFile: clientCertFile,
+		SSLClientCertFile: serverCertFile,
 	}
 	tlsConfig, err := loadGRPCServerTLS(settings)
 	if err != nil {
@@ -77,13 +77,17 @@ func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 	}
 
 	server := &Server{
-		settings: settings,
-		core:     &xray.Core{},
-		usage:    newUsageBuffer(),
-		system:   newSystemSampler(),
-		sessions: make(map[string]time.Time),
+		settings:   settings,
+		core:       &xray.Core{},
+		usage:      newUsageBuffer(),
+		system:     newSystemSampler(),
+		sessions:   make(map[string]time.Time),
+		operations: newOperationDeduper(filepath.Join(tempDir, "operation-receipts.json")),
 	}
-	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
+	grpcServer := grpc.NewServer(
+		grpc.Creds(credentials.NewTLS(tlsConfig)),
+		grpc.ChainUnaryInterceptor(server.sessionUnaryInterceptor, server.operations.unaryServerInterceptor),
+	)
 	server.registerGRPC(grpcServer)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -99,7 +103,7 @@ func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 	}()
 	defer grpcServer.Stop()
 
-	clientCert, err := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
+	clientCert, err := tls.LoadX509KeyPair(serverCertFile, serverKeyFile)
 	if err != nil {
 		t.Fatalf("failed to load client cert: %v", err)
 	}
@@ -135,7 +139,7 @@ func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hello failed: %v", err)
 	}
-	if hello.GetNodeVersion() != "0.2.2" || hello.GetInstallMode() != "binary" {
+	if hello.GetNodeVersion() != "0.2.2" || hello.GetInstallMode() != "binary" || !hello.GetRuntime().GetConnected() {
 		t.Fatalf("unexpected hello response: %#v", hello)
 	}
 	t.Logf("hello: node_version=%s install_mode=%s started=%v", hello.GetNodeVersion(), hello.GetInstallMode(), hello.GetRuntime().GetStarted())
@@ -165,9 +169,26 @@ func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 		metrics.GetMemoryUsed(),
 		metrics.GetMemoryTotal(),
 	)
+
+	unauthenticatedCtx, unauthenticatedCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer unauthenticatedCancel()
+	unauthenticated, err := grpc.DialContext(
+		unauthenticatedCtx,
+		listener.Addr().String(),
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+			ServerName: "rebecca-node.test",
+			RootCAs:    roots,
+			MinVersion: tls.VersionTLS12,
+		})),
+		grpc.WithBlock(),
+	)
+	if err == nil {
+		_ = unauthenticated.Close()
+		t.Fatal("gRPC accepted a client without the installer certificate")
+	}
 }
 
-func TestGRPCServerAcceptsPinnedTLSWithoutClientCertificate(t *testing.T) {
+func TestGRPCServerRequiresClientCertificateConfiguration(t *testing.T) {
 	tempDir := t.TempDir()
 	serverCertFile, serverKeyFile := writeSelfSignedCert(t, tempDir, "server", []string{"rebecca-node.test"})
 
@@ -178,70 +199,8 @@ func TestGRPCServerAcceptsPinnedTLSWithoutClientCertificate(t *testing.T) {
 		SSLCertFile: serverCertFile,
 		SSLKeyFile:  serverKeyFile,
 	}
-	tlsConfig, err := loadGRPCServerTLS(settings)
-	if err != nil {
-		t.Fatalf("failed to load gRPC TLS config: %v", err)
-	}
-	if tlsConfig.ClientAuth != tls.NoClientCert {
-		t.Fatalf("expected legacy-compatible no-client-cert mode, got %v", tlsConfig.ClientAuth)
-	}
-
-	server := &Server{
-		settings: settings,
-		core:     &xray.Core{},
-		usage:    newUsageBuffer(),
-		system:   newSystemSampler(),
-		sessions: make(map[string]time.Time),
-	}
-	grpcServer := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
-	server.registerGRPC(grpcServer)
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-	defer listener.Close()
-
-	go func() {
-		if err := grpcServer.Serve(listener); err != nil {
-			t.Logf("gRPC test server stopped: %v", err)
-		}
-	}()
-	defer grpcServer.Stop()
-
-	serverRootPEM, err := os.ReadFile(serverCertFile)
-	if err != nil {
-		t.Fatalf("failed to read server cert: %v", err)
-	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(serverRootPEM) {
-		t.Fatal("failed to add server cert root")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(
-		ctx,
-		listener.Addr().String(),
-		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
-			ServerName: "rebecca-node.test",
-			RootCAs:    roots,
-			MinVersion: tls.VersionTLS12,
-		})),
-		grpc.WithBlock(),
-	)
-	if err != nil {
-		t.Fatalf("failed to dial gRPC server without client cert: %v", err)
-	}
-	defer conn.Close()
-
-	control := nodev1.NewNodeControlServiceClient(conn)
-	hello, err := control.Hello(ctx, &nodev1.HelloRequest{MasterId: "legacy-master"})
-	if err != nil {
-		t.Fatalf("hello failed: %v", err)
-	}
-	if hello.GetNodeVersion() != "0.2.2" || hello.GetInstallMode() != "binary" {
-		t.Fatalf("unexpected hello response: %#v", hello)
+	if _, err := loadGRPCServerTLS(settings); err == nil || !strings.Contains(err.Error(), "SSL_CLIENT_CERT_FILE") {
+		t.Fatalf("expected missing client certificate error, got %v", err)
 	}
 }
 
@@ -355,9 +314,8 @@ func writeSelfSignedCert(t *testing.T, dir string, name string, dnsNames []strin
 		Subject:      pkix.Name{CommonName: name},
 		NotBefore:    time.Now().Add(-time.Minute),
 		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		IsCA:         true,
 		DNSNames:     dnsNames,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)

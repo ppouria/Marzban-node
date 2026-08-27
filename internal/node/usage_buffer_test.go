@@ -1,12 +1,8 @@
 package node
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"math"
-	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -271,43 +267,48 @@ func TestPersistentUsageBufferRestoresEmptyAfterAck(t *testing.T) {
 	}
 }
 
-func TestUsageEndpointsReturnPendingWhenCoreStopped(t *testing.T) {
+func TestGRPCUsageReturnsPendingWhenCoreStopped(t *testing.T) {
 	buffer := newUsageBuffer()
 	buffer.add([]xray.OutboundStat{{Tag: "proxy", Up: 10, Down: 20}})
 	buffer.addInbound([]xray.InboundStat{{Tag: "inbound", Up: 30, Down: 40}})
 	buffer.addUsers([]xray.UserStat{{UID: "42", Value: 123}})
 
-	server := &Server{
+	api := &grpcAPI{server: &Server{
 		core:     &xray.Core{},
 		usage:    buffer,
 		sessions: map[string]time.Time{"session": time.Now()},
-	}
+	}}
 
-	outboundPayload := postUsage(t, http.HandlerFunc(server.handleOutboundUsage))
-	outboundStats := outboundPayload["stats"].([]any)
-	if outboundPayload["batch_id"] == "" || len(outboundStats) != 1 {
+	outboundPayload, err := api.CollectOutboundUsage(t.Context(), &nodev1.CollectUsageRequest{Reset_: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outboundPayload.GetBatchId() == "" || len(outboundPayload.GetStats()) != 1 {
 		t.Fatalf("expected pending outbound batch, got %#v", outboundPayload)
 	}
-	outbound := outboundStats[0].(map[string]any)
-	if outbound["tag"] != "proxy" || outbound["up"].(float64) != 10 || outbound["down"].(float64) != 20 {
+	outbound := outboundPayload.GetStats()[0]
+	if outbound.GetTag() != "proxy" || outbound.GetUp() != 10 || outbound.GetDown() != 20 {
 		t.Fatalf("unexpected outbound stats: %#v", outbound)
 	}
-	inboundStats := outboundPayload["inbound_stats"].([]any)
+	inboundStats := outboundPayload.GetInboundStats()
 	if len(inboundStats) != 1 {
 		t.Fatalf("expected pending inbound stats, got %#v", outboundPayload)
 	}
-	inbound := inboundStats[0].(map[string]any)
-	if inbound["tag"] != "inbound" || inbound["up"].(float64) != 30 || inbound["down"].(float64) != 40 {
+	inbound := inboundStats[0]
+	if inbound.GetTag() != "inbound" || inbound.GetUp() != 30 || inbound.GetDown() != 40 {
 		t.Fatalf("unexpected inbound stats: %#v", inbound)
 	}
 
-	userPayload := postUsage(t, http.HandlerFunc(server.handleUserUsage))
-	userStats := userPayload["stats"].([]any)
-	if userPayload["batch_id"] == "" || len(userStats) != 1 {
+	userPayload, err := api.CollectUserUsage(t.Context(), &nodev1.CollectUsageRequest{Reset_: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userStats := userPayload.GetStats()
+	if userPayload.GetBatchId() == "" || len(userStats) != 1 {
 		t.Fatalf("expected pending user batch, got %#v", userPayload)
 	}
-	user := userStats[0].(map[string]any)
-	if user["uid"] != "42" || user["value"].(float64) != 123 {
+	user := userStats[0]
+	if user.GetUid() != "42" || user.GetValue() != 123 {
 		t.Fatalf("unexpected user stats: %#v", user)
 	}
 }
@@ -633,22 +634,4 @@ func TestUsageBufferConcurrentSnapshotRequestsShareInFlightBatch(t *testing.T) {
 	if len(outboundStats) != 1 || outboundStats[0].Up != workers || outboundStats[0].Down != workers {
 		t.Fatalf("expected queued outbound deltas after ack, got %#v", outboundStats)
 	}
-}
-
-func postUsage(t *testing.T, handler http.Handler) map[string]any {
-	t.Helper()
-
-	req := httptest.NewRequest(http.MethodPost, "/usage", bytes.NewBufferString(`{"session_id":"session"}`))
-	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d: %s", rr.Code, rr.Body.String())
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-	return payload
 }

@@ -20,7 +20,7 @@ func main() {
 		log.Fatalf("failed to initialize node service: %v", err)
 	}
 
-	log.Printf("Node gRPC service running on %s:%d", settings.GRPCServiceHost, settings.GRPCServicePort)
+	log.Printf("Node gRPC service running on %s:%d", settings.ServiceHost, settings.ServicePort)
 	if err := server.ListenAndServeGRPC(); err != nil {
 		log.Fatal(err)
 	}

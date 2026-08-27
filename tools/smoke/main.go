@@ -51,8 +51,8 @@ func smokeNode(binaryPath string, tempDir string) error {
 	keyPath := filepath.Join(tempDir, "ssl_key.pem")
 	port := "43110"
 	env := append(os.Environ(),
-		"GRPC_SERVICE_HOST=127.0.0.1",
-		"GRPC_SERVICE_PORT="+port,
+		"SERVICE_HOST=127.0.0.1",
+		"SERVICE_PORT="+port,
 		"XRAY_EXECUTABLE_PATH="+fakeXray,
 		"XRAY_ASSETS_PATH="+tempDir,
 		"SSL_CERT_FILE="+certPath,

@@ -58,6 +58,21 @@ func TestLoadDefaultsInstallModeToDocker(t *testing.T) {
 	}
 }
 
+func TestLoadUsesServicePortForGRPCAndKeepsLegacyXrayDefault(t *testing.T) {
+	t.Setenv("SERVICE_HOST", "127.0.0.2")
+	t.Setenv("SERVICE_PORT", "63050")
+	t.Setenv("XRAY_API_PORT", "63051")
+	_ = os.Unsetenv("XRAY_API_HOST")
+
+	settings := Load()
+	if settings.ServiceHost != "127.0.0.2" || settings.ServicePort != 63050 {
+		t.Fatalf("unexpected gRPC listener %s:%d", settings.ServiceHost, settings.ServicePort)
+	}
+	if settings.XrayAPIHost != "0.0.0.0" || settings.XrayAPIPort != 63051 {
+		t.Fatalf("unexpected Xray API listener %s:%d", settings.XrayAPIHost, settings.XrayAPIPort)
+	}
+}
+
 func ensureTestFile(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err

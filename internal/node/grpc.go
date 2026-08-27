@@ -43,19 +43,26 @@ func (s *Server) ListenAndServeGRPC() error {
 		return err
 	}
 
-	listener, err := net.Listen("tcp", net.JoinHostPort(s.settings.GRPCServiceHost, strconv.Itoa(s.settings.GRPCServicePort)))
+	listener, err := net.Listen("tcp", net.JoinHostPort(s.settings.ServiceHost, strconv.Itoa(s.settings.ServicePort)))
 	if err != nil {
 		return err
 	}
 
 	grpcServer := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsConfig)),
+		grpc.ChainUnaryInterceptor(s.sessionUnaryInterceptor, s.operations.unaryServerInterceptor),
 		grpc.MaxRecvMsgSize(64<<20),
 		grpc.MaxSendMsgSize(64<<20),
 	)
 	s.registerGRPC(grpcServer)
 	go s.notifyMasterReady()
 	return grpcServer.Serve(listener)
+}
+
+func (s *Server) sessionUnaryInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	peerIP := grpcPeerIP(ctx)
+	s.addSession("grpc:"+peerIP, peerIP)
+	return handler(ctx, req)
 }
 
 func (s *Server) registerGRPC(grpcServer *grpc.Server) {
@@ -70,6 +77,9 @@ func loadGRPCServerTLS(settings appconfig.Settings) (*tls.Config, error) {
 	if settings.SSLCertFile == "" || settings.SSLKeyFile == "" {
 		return nil, errors.New("SSL_CERT_FILE and SSL_KEY_FILE are required for gRPC")
 	}
+	if strings.TrimSpace(settings.SSLClientCertFile) == "" || !fileExists(settings.SSLClientCertFile) {
+		return nil, errors.New("SSL_CLIENT_CERT_FILE is required for gRPC client authentication")
+	}
 
 	cert, err := tls.LoadX509KeyPair(settings.SSLCertFile, settings.SSLKeyFile)
 	if err != nil {
@@ -79,18 +89,16 @@ func loadGRPCServerTLS(settings appconfig.Settings) (*tls.Config, error) {
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
 	}
-	if strings.TrimSpace(settings.SSLClientCertFile) != "" && fileExists(settings.SSLClientCertFile) {
-		clientCAPEM, err := os.ReadFile(settings.SSLClientCertFile)
-		if err != nil {
-			return nil, fmt.Errorf("read gRPC client certificate: %w", err)
-		}
-		clientCAs := x509.NewCertPool()
-		if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
-			return nil, errors.New("failed to load SSL_CLIENT_CERT_FILE for gRPC")
-		}
-		config.ClientCAs = clientCAs
-		config.ClientAuth = tls.VerifyClientCertIfGiven
+	clientCAPEM, err := os.ReadFile(settings.SSLClientCertFile)
+	if err != nil {
+		return nil, fmt.Errorf("read gRPC client certificate: %w", err)
 	}
+	clientCAs := x509.NewCertPool()
+	if !clientCAs.AppendCertsFromPEM(clientCAPEM) {
+		return nil, errors.New("failed to load SSL_CLIENT_CERT_FILE for gRPC")
+	}
+	config.ClientCAs = clientCAs
+	config.ClientAuth = tls.RequireAndVerifyClientCert
 	return config, nil
 }
 
@@ -127,22 +135,39 @@ func (api *grpcAPI) Health(ctx context.Context, req *nodev1.HealthRequest) (*nod
 func (api *grpcAPI) StartRuntime(ctx context.Context, req *nodev1.RuntimeConfigRequest) (*nodev1.RuntimeActionResponse, error) {
 	api.server.runtimeMu.Lock()
 	defer api.server.runtimeMu.Unlock()
+	if err := api.server.validateDesiredRevision(req); err != nil {
+		return nil, err
+	}
+	var response *nodev1.RuntimeActionResponse
+	var err error
 	if api.server.core.Started() {
 		if api.server.runtimeConfigMatchesCache(req.GetConfigJson()) {
-			return api.server.grpcApplyRuntimeOnly(ctx, req, "runtime already started")
+			response, err = api.server.grpcApplyRuntimeOnly(ctx, req, "runtime already started")
+		} else {
+			response, err = api.server.grpcRestartRuntime(ctx, req, "runtime restarted")
 		}
-		return api.server.grpcRestartRuntime(ctx, req, "runtime restarted")
+	} else {
+		response, err = api.server.grpcStartRuntime(ctx, req, false)
 	}
-	return api.server.grpcStartRuntime(ctx, req, false)
+	api.server.recordAppliedRevision(req, err)
+	return response, err
 }
 
 func (api *grpcAPI) RestartRuntime(ctx context.Context, req *nodev1.RuntimeConfigRequest) (*nodev1.RuntimeActionResponse, error) {
 	api.server.runtimeMu.Lock()
 	defer api.server.runtimeMu.Unlock()
-	if api.server.core.Started() && api.server.runtimeConfigMatchesCache(req.GetConfigJson()) {
-		return api.server.grpcApplyRuntimeOnly(ctx, req, "runtime config unchanged")
+	if err := api.server.validateDesiredRevision(req); err != nil {
+		return nil, err
 	}
-	return api.server.grpcRestartRuntime(ctx, req, "runtime restarted")
+	var response *nodev1.RuntimeActionResponse
+	var err error
+	if api.server.core.Started() && api.server.runtimeConfigMatchesCache(req.GetConfigJson()) {
+		response, err = api.server.grpcApplyRuntimeOnly(ctx, req, "runtime config unchanged")
+	} else {
+		response, err = api.server.grpcRestartRuntime(ctx, req, "runtime restarted")
+	}
+	api.server.recordAppliedRevision(req, err)
+	return response, err
 }
 
 func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequest) (*nodev1.RuntimeActionResponse, error) {
@@ -185,13 +210,22 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 func (api *grpcAPI) SyncConfig(ctx context.Context, req *nodev1.RuntimeConfigRequest) (*nodev1.RuntimeActionResponse, error) {
 	api.server.runtimeMu.Lock()
 	defer api.server.runtimeMu.Unlock()
+	if err := api.server.validateDesiredRevision(req); err != nil {
+		return nil, err
+	}
+	var response *nodev1.RuntimeActionResponse
+	var err error
 	if api.server.core.Started() {
 		if api.server.runtimeConfigMatchesCache(req.GetConfigJson()) || api.server.runtimeTopologyMatchesCache(req.GetConfigJson()) {
-			return api.server.grpcApplyRuntimeOnly(ctx, req, "runtime config synced")
+			response, err = api.server.grpcApplyRuntimeOnly(ctx, req, "runtime config synced")
+		} else {
+			response, err = api.server.grpcRestartRuntime(ctx, req, "runtime config synced")
 		}
-		return api.server.grpcRestartRuntime(ctx, req, "runtime config synced")
+	} else {
+		response, err = api.server.grpcStartRuntime(ctx, req, true)
 	}
-	return api.server.grpcStartRuntime(ctx, req, true)
+	api.server.recordAppliedRevision(req, err)
+	return response, err
 }
 
 func (api *grpcAPI) AddUser(ctx context.Context, req *nodev1.InboundUserRequest) (*nodev1.RuntimeActionResponse, error) {
@@ -1067,7 +1101,19 @@ func (s *Server) grpcRuntimeState(message string) *nodev1.RuntimeState {
 		InstallMode:   s.settings.InstallMode,
 		UpdateChannel: s.updateChannel(),
 		Message:       message,
-		Capabilities:  []string{"safe_user_reconciliation", "haproxy_runtime"},
+		Capabilities: []string{
+			"safe_user_reconciliation",
+			"haproxy_runtime",
+			"grpc_control_port",
+			"mutual_tls_required",
+			"operation_deduplication",
+			"config_revision",
+			"host_actions",
+			"tor_proxy",
+			"windscribe_proxy",
+			"psiphon_proxy",
+		},
+		AppliedRevision: s.appliedRevision(),
 	}
 }
 

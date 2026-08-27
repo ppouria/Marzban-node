@@ -22,9 +22,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	appconfig "github.com/rebeccapanel/rebecca-node/internal/config"
+	nodev1 "github.com/rebeccapanel/rebecca-node/internal/proto/node/v1"
 	"github.com/rebeccapanel/rebecca-node/internal/xray"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type Server struct {
@@ -39,6 +41,7 @@ type Server struct {
 	ipBlocks     *sourceIPBlocker
 	usage        *usageBuffer
 	system       *systemSampler
+	operations   *operationDeduper
 
 	mu         sync.Mutex
 	connected  bool
@@ -85,6 +88,7 @@ func New(settings appconfig.Settings) (*Server, error) {
 		ipBlocks:     newSourceIPBlocker(settings.RebeccaDataDir, settings.InstallMode),
 		usage:        usage,
 		system:       newSystemSampler(),
+		operations:   newOperationDeduper(filepath.Join(settings.RebeccaDataDir, "operation-receipts.json")),
 		sessions:     make(map[string]time.Time),
 	}
 	// Auxiliary VPN state is authoritative on the master. Never resurrect stale
@@ -94,432 +98,6 @@ func New(settings appconfig.Settings) (*Server, error) {
 	}
 	server.startCachedConfig()
 	return server, nil
-}
-
-func (s *Server) handleBase(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		writeError(w, http.StatusNotFound, "Not Found")
-		return
-	}
-	writeJSON(w, http.StatusOK, s.response(nil))
-}
-
-func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
-	sessionID, err := newUUID()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	clientIP := remoteIP(r)
-
-	s.addSession(sessionID, clientIP)
-
-	writeJSON(w, http.StatusOK, s.response(map[string]any{"session_id": sessionID}))
-}
-
-func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
-	s.runtimeMu.Lock()
-	defer s.runtimeMu.Unlock()
-	if !s.matchRequestSession(w, r) {
-		return
-	}
-	s.mu.Lock()
-	s.connected = false
-	s.clientIP = ""
-	s.sessions = make(map[string]time.Time)
-	s.mu.Unlock()
-	if s.core.Started() {
-		s.snapshotRunningUsage()
-		s.core.Stop()
-	}
-	if s.haproxy != nil {
-		_ = s.haproxy.Apply(&haproxyRuntime{})
-	}
-	if err := s.ipBlocks.Clear(r.Context()); err != nil {
-		log.Printf("source IP block cleanup failed: %v", err)
-	}
-	s.clearConfigCache()
-	writeJSON(w, http.StatusOK, s.response(nil))
-}
-
-func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
-	if !s.matchRequestSession(w, r) {
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{})
-}
-
-func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
-	s.runtimeMu.Lock()
-	defer s.runtimeMu.Unlock()
-	payload, ok := s.readConfigPayload(w, r)
-	if !ok {
-		return
-	}
-	if s.core.Started() && s.runtimeConfigMatchesCache(payload.Config) {
-		s.handleRuntimeOnly(w, payload)
-		return
-	}
-	cfg, err := xray.NewConfig(payload.Config, s.currentClientIP(), s.settings)
-	if err != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": map[string]string{"config": "Failed to decode config: " + err.Error()}})
-		return
-	}
-	if s.core.Started() {
-		if err := s.core.Restart(cfg); err != nil {
-			writeError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-	} else {
-		if err := s.core.Start(cfg); err != nil {
-			writeError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-	}
-	s.mu.Lock()
-	s.lastConfig = cfg
-	s.mu.Unlock()
-	time.Sleep(3 * time.Second)
-	if !s.core.Started() {
-		writeError(w, http.StatusServiceUnavailable, strings.Join(s.core.Logs().Snapshot(), "\n"))
-		return
-	}
-	ovRuntimeConfig := payload.OVRuntime
-	if ovRuntimeConfig == nil {
-		ovRuntimeConfig = s.cachedOVRuntime()
-	}
-	l2tpRuntimeConfig := payload.L2TPRuntime
-	if l2tpRuntimeConfig == nil {
-		l2tpRuntimeConfig = s.cachedL2TPRuntime()
-	}
-	pptpRuntimeConfig := payload.PPTPRuntime
-	if pptpRuntimeConfig == nil {
-		pptpRuntimeConfig = s.cachedPPTPRuntime()
-	}
-	wgRuntimeConfig := payload.WGRuntime
-	if wgRuntimeConfig == nil {
-		wgRuntimeConfig = s.cachedWGRuntime()
-	}
-	if err := s.ov.Apply(ovRuntimeConfig); err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
-	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
-	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
-	s.saveConfigCache(payload.Config, s.currentClientIP(), ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig)
-	response := s.response(nil)
-	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
-		response["warning"] = warning
-	}
-	writeJSON(w, http.StatusOK, response)
-}
-
-func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
-	s.runtimeMu.Lock()
-	defer s.runtimeMu.Unlock()
-	if !s.matchRequestSession(w, r) {
-		return
-	}
-	s.snapshotRunningUsage()
-	s.core.Stop()
-	if err := s.ov.Apply(&ovRuntime{Inbounds: []ovRuntimeInbound{}}); err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	if err := s.l2tp.Apply(&l2tpRuntime{Inbounds: []l2tpRuntimeInbound{}}); err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	if err := s.pptp.Apply(&pptpRuntime{Inbounds: []pptpRuntimeInbound{}}); err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	if err := s.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
-		log.Printf("WireGuard runtime stop failed: %v", err)
-	}
-	if s.haproxy != nil {
-		_ = s.haproxy.Apply(&haproxyRuntime{})
-	}
-	if err := s.ipBlocks.Clear(r.Context()); err != nil {
-		log.Printf("source IP block cleanup failed: %v", err)
-	}
-	s.clearConfigCache()
-	writeJSON(w, http.StatusOK, s.response(nil))
-}
-
-func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
-	s.runtimeMu.Lock()
-	defer s.runtimeMu.Unlock()
-	payload, ok := s.readConfigPayload(w, r)
-	if !ok {
-		return
-	}
-	if s.core.Started() && s.runtimeConfigMatchesCache(payload.Config) {
-		s.handleRuntimeOnly(w, payload)
-		return
-	}
-	cfg, err := xray.NewConfig(payload.Config, s.currentClientIP(), s.settings)
-	if err != nil {
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"detail": map[string]string{"config": "Failed to decode config: " + err.Error()}})
-		return
-	}
-	if err := s.core.Restart(cfg); err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	s.mu.Lock()
-	s.lastConfig = cfg
-	s.mu.Unlock()
-	time.Sleep(3 * time.Second)
-	if !s.core.Started() {
-		writeError(w, http.StatusServiceUnavailable, strings.Join(s.core.Logs().Snapshot(), "\n"))
-		return
-	}
-	ovRuntimeConfig := payload.OVRuntime
-	if ovRuntimeConfig == nil {
-		ovRuntimeConfig = s.cachedOVRuntime()
-	}
-	l2tpRuntimeConfig := payload.L2TPRuntime
-	if l2tpRuntimeConfig == nil {
-		l2tpRuntimeConfig = s.cachedL2TPRuntime()
-	}
-	pptpRuntimeConfig := payload.PPTPRuntime
-	if pptpRuntimeConfig == nil {
-		pptpRuntimeConfig = s.cachedPPTPRuntime()
-	}
-	wgRuntimeConfig := payload.WGRuntime
-	if wgRuntimeConfig == nil {
-		wgRuntimeConfig = s.cachedWGRuntime()
-	}
-	if err := s.ov.Apply(ovRuntimeConfig); err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
-	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
-	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
-	s.saveConfigCache(payload.Config, s.currentClientIP(), ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig)
-	response := s.response(nil)
-	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
-		response["warning"] = warning
-	}
-	writeJSON(w, http.StatusOK, response)
-}
-
-func (s *Server) handleRuntimeOnly(w http.ResponseWriter, payload configPayload) {
-	ovRuntimeConfig := payload.OVRuntime
-	if ovRuntimeConfig == nil {
-		ovRuntimeConfig = s.cachedOVRuntime()
-	}
-	l2tpRuntimeConfig := payload.L2TPRuntime
-	if l2tpRuntimeConfig == nil {
-		l2tpRuntimeConfig = s.cachedL2TPRuntime()
-	}
-	pptpRuntimeConfig := payload.PPTPRuntime
-	if pptpRuntimeConfig == nil {
-		pptpRuntimeConfig = s.cachedPPTPRuntime()
-	}
-	wgRuntimeConfig := payload.WGRuntime
-	if wgRuntimeConfig == nil {
-		wgRuntimeConfig = s.cachedWGRuntime()
-	}
-	if err := s.ov.Apply(ovRuntimeConfig); err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	l2tpWarning := s.applyL2TPRuntime(l2tpRuntimeConfig)
-	pptpWarning := s.applyPPTPRuntime(pptpRuntimeConfig)
-	wgWarning := s.applyWGRuntime(wgRuntimeConfig)
-	s.saveConfigCache(payload.Config, s.currentClientIP(), ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig)
-	response := s.response(nil)
-	if warning := joinedWarnings(l2tpWarning, pptpWarning, wgWarning); warning != "" {
-		response["warning"] = warning
-	}
-	writeJSON(w, http.StatusOK, response)
-}
-
-func (s *Server) handleUpdateCore(w http.ResponseWriter, r *http.Request) {
-	var payload struct {
-		Version string `json:"version"`
-	}
-	if !decodeJSON(w, r, &payload) {
-		return
-	}
-	payload.Version = strings.TrimSpace(payload.Version)
-	if payload.Version == "" {
-		writeError(w, http.StatusUnprocessableEntity, "version is required")
-		return
-	}
-	if !validXrayVersion(payload.Version) {
-		writeError(w, http.StatusUnprocessableEntity, "invalid version")
-		return
-	}
-	asset, err := detectXrayAsset()
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	body, err := downloadXrayCoreArchive(payload.Version, asset, 120*time.Second)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, "Download failed: "+err.Error())
-		return
-	}
-
-	baseDir := filepath.Join(s.settings.RebeccaDataDir, "xray-core")
-	if err := os.MkdirAll(baseDir, 0o755); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if s.core.Started() {
-		s.core.Stop()
-	}
-	extracted, err := installZipTo(body, baseDir)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	finalExe := filepath.Join(baseDir, executableName("xray"))
-	if extracted != finalExe {
-		_ = os.Remove(finalExe)
-		if err := os.Rename(extracted, finalExe); err != nil {
-			if copyErr := copyFile(extracted, finalExe); copyErr != nil {
-				writeError(w, http.StatusInternalServerError, copyErr.Error())
-				return
-			}
-		}
-	}
-	_ = os.Chmod(finalExe, 0o755)
-	if err := s.core.SetExecutablePath(finalExe); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"detail": "Node core ready at " + finalExe, "version": s.core.Version()})
-}
-
-func (s *Server) handleUpdateGeo(w http.ResponseWriter, r *http.Request) {
-	var payload struct {
-		Files []downloadFile `json:"files"`
-	}
-	if !decodeJSON(w, r, &payload) {
-		return
-	}
-	if len(payload.Files) == 0 {
-		writeError(w, http.StatusUnprocessableEntity, "'files' must be a non-empty list of {name,url}.")
-		return
-	}
-	assetsDir := filepath.Join(s.settings.RebeccaDataDir, "assets")
-	if err := os.MkdirAll(assetsDir, 0o755); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	saved := make([]map[string]string, 0, len(payload.Files))
-	for _, file := range payload.Files {
-		name := safeGeoFilename(file.Name)
-		url := strings.TrimSpace(file.URL)
-		if name == "" || url == "" {
-			writeError(w, http.StatusUnprocessableEntity, "Each file must include non-empty 'name' and 'url'.")
-			return
-		}
-		if err := validatePublicHTTPURL(url); err != nil {
-			writeError(w, http.StatusUnprocessableEntity, err.Error())
-			return
-		}
-		body, err := download(url, 120*time.Second)
-		if err != nil {
-			writeError(w, http.StatusBadGateway, "Failed to download "+name+": "+err.Error())
-			return
-		}
-		path := filepath.Join(assetsDir, name)
-		if err := os.WriteFile(path, body, 0o644); err != nil {
-			writeError(w, http.StatusInternalServerError, "Failed to save "+name+": "+err.Error())
-			return
-		}
-		saved = append(saved, map[string]string{"name": name, "path": path})
-	}
-	s.core.SetAssetsPath(assetsDir)
-	writeJSON(w, http.StatusOK, map[string]any{"detail": "Geo assets saved to " + assetsDir, "saved": saved})
-}
-
-func (s *Server) handleServiceRestart(w http.ResponseWriter, r *http.Request) {
-	if !s.matchRequestSession(w, r) {
-		return
-	}
-	if err := s.scheduleNodeCLI("restart", "-n"); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted"})
-}
-
-func (s *Server) handleServiceUpdate(w http.ResponseWriter, r *http.Request) {
-	var payload struct {
-		SessionID string `json:"session_id"`
-		Channel   string `json:"channel"`
-		Version   string `json:"version"`
-	}
-	if !decodeJSON(w, r, &payload) {
-		return
-	}
-	if !s.matchSession(w, payload.SessionID) {
-		return
-	}
-	args, err := nodeUpdateArgs(payload.Channel, payload.Version)
-	if err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
-		return
-	}
-	if err := s.scheduleNodeCLI(args...); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted"})
-}
-
-func (s *Server) handleHostReboot(w http.ResponseWriter, r *http.Request) {
-	if !s.matchRequestSession(w, r) {
-		return
-	}
-	if err := scheduleHostReboot(); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": "accepted"})
-}
-
-func (s *Server) handleOutboundUsage(w http.ResponseWriter, r *http.Request) {
-	if !s.matchRequestSession(w, r) {
-		return
-	}
-	var stats []xray.OutboundStat
-	var inboundStats []xray.InboundStat
-	if s.core.Started() {
-		var err error
-		stats, err = xray.QueryOutboundStats(
-			s.settings.XrayAPIHost,
-			s.settings.XrayAPIPort,
-			10*time.Second,
-			true,
-		)
-		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		s.usage.add(stats)
-		stats = nil
-		inboundStats, err = xray.QueryInboundStats(
-			s.settings.XrayAPIHost,
-			s.settings.XrayAPIPort,
-			10*time.Second,
-			true,
-		)
-		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-	}
-	batchID, pending, pendingInbounds := s.usage.addUsageAndSnapshot(stats, inboundStats)
-	writeJSON(w, http.StatusOK, map[string]any{"batch_id": batchID, "stats": pending, "inbound_stats": pendingInbounds})
 }
 
 func (s *Server) snapshotRunningUsage() {
@@ -579,97 +157,6 @@ func (s *Server) snapshotRunningUsage() {
 	}
 }
 
-func (s *Server) handleUserUsage(w http.ResponseWriter, r *http.Request) {
-	if !s.matchRequestSession(w, r) {
-		return
-	}
-	var stats []xray.UserStat
-	var onlineUIDs []string
-	var onlineIPs []xray.OnlineUserIP
-	if s.core.Started() {
-		var err error
-		stats, err = xray.QueryUserStats(
-			s.settings.XrayAPIHost,
-			s.settings.XrayAPIPort,
-			30*time.Second,
-			true,
-		)
-		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		onlineIPs, err = xray.QueryOnlineUserIPs(
-			s.settings.XrayAPIHost,
-			s.settings.XrayAPIPort,
-			5*time.Second,
-		)
-		if err != nil {
-			log.Printf("failed to query online user IPs: %v", err)
-			onlineUIDs, err = xray.QueryOnlineUserUIDs(
-				s.settings.XrayAPIHost,
-				s.settings.XrayAPIPort,
-				5*time.Second,
-			)
-			if err != nil {
-				log.Printf("failed to query online users: %v", err)
-			}
-		} else {
-			onlineUIDs = onlineUserIPUIDs(onlineIPs)
-		}
-	}
-	if OVStats := s.ov.CollectUsage(); len(OVStats) > 0 {
-		stats = append(stats, OVStats...)
-	}
-	if l2tpStats := s.l2tp.CollectUsage(); len(l2tpStats) > 0 {
-		stats = append(stats, l2tpStats...)
-	}
-	if pptpStats := s.pptp.CollectUsage(); len(pptpStats) > 0 {
-		stats = append(stats, pptpStats...)
-	}
-	if wgStats := s.wg.CollectUsage(); len(wgStats) > 0 {
-		stats = append(stats, wgStats...)
-	}
-	if ikev2Stats := s.remoteAccess.CollectUsage("ikev2"); len(ikev2Stats) > 0 {
-		stats = append(stats, ikev2Stats...)
-	}
-	if anyConnectStats := s.remoteAccess.CollectUsage("anyconnect"); len(anyConnectStats) > 0 {
-		stats = append(stats, anyConnectStats...)
-	}
-	batchID, pending := s.usage.addUsersAndSnapshot(stats)
-	pending = appendOnlineUserMarkers(pending, onlineUIDs)
-	writeJSON(w, http.StatusOK, map[string]any{"batch_id": batchID, "stats": pending, "online_ips": onlineIPs})
-}
-
-func (s *Server) handleOutboundUsageAck(w http.ResponseWriter, r *http.Request) {
-	s.handleUsageAck(w, r, s.usage.ack)
-}
-
-func (s *Server) handleUserUsageAck(w http.ResponseWriter, r *http.Request) {
-	s.handleUsageAck(w, r, s.usage.ackUsers)
-}
-
-func (s *Server) handleUsageAck(w http.ResponseWriter, r *http.Request, ack func(string) bool) {
-	var payload struct {
-		SessionID string `json:"session_id"`
-		BatchID   string `json:"batch_id"`
-	}
-	if !decodeJSON(w, r, &payload) {
-		return
-	}
-	if !s.matchSession(w, payload.SessionID) {
-		return
-	}
-	if payload.BatchID == "" {
-		writeError(w, http.StatusUnprocessableEntity, "batch_id is required")
-		return
-	}
-	if !ack(payload.BatchID) {
-		writeError(w, http.StatusNotFound, "batch_id was not found")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "acknowledged"})
-}
-
 func (s *Server) scheduleNodeCLI(args ...string) error {
 	cli, err := resolveNodeCLI(s.settings.AppName)
 	if err != nil {
@@ -716,116 +203,8 @@ func scheduleHostReboot() error {
 	return exec.Command("sh", "-c", command).Start()
 }
 
-func (s *Server) handleAccessLogs(w http.ResponseWriter, r *http.Request) {
-	var payload struct {
-		SessionID string `json:"session_id"`
-		MaxLines  int    `json:"max_lines"`
-	}
-	if !decodeJSON(w, r, &payload) {
-		return
-	}
-	if payload.MaxLines == 0 {
-		payload.MaxLines = 500
-	}
-	if !s.matchSession(w, payload.SessionID) {
-		return
-	}
-
-	logPath := ""
-	s.mu.Lock()
-	if s.lastConfig != nil {
-		logPath = s.lastConfig.AccessLogPath()
-	}
-	s.mu.Unlock()
-	if logPath == "" || strings.EqualFold(logPath, "none") {
-		baseDir := s.settings.XrayLogDir
-		if strings.TrimSpace(baseDir) == "" {
-			baseDir = s.settings.XrayAssetsPath
-		}
-		if strings.TrimSpace(baseDir) == "" {
-			baseDir = "/var/log"
-		}
-		logPath = filepath.Join(baseDir, "access.log")
-	}
-	lines, exists, err := tailFile(logPath, payload.MaxLines)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Failed to read access logs: "+err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"log_path":    logPath,
-		"exists":      exists,
-		"lines":       lines,
-		"total_lines": len(lines),
-	})
-}
-
-func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
-	sessionID := r.URL.Query().Get("session_id")
-	if !s.sessionMatches(sessionID) {
-		http.Error(w, "Session ID mismatch.", http.StatusForbidden)
-		return
-	}
-	interval := 0 * time.Second
-	if raw := r.URL.Query().Get("interval"); raw != "" {
-		parsed, err := time.ParseDuration(raw + "s")
-		if err != nil || parsed <= 0 || parsed > 10*time.Second {
-			http.Error(w, "Invalid interval value", http.StatusBadRequest)
-			return
-		}
-		interval = parsed
-	}
-
-	conn, err := websocket.Upgrade(w, r, nil, 1024, 1024)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	logs, cancel := s.core.Logs().Subscribe()
-	defer cancel()
-
-	if interval == 0 {
-		for line := range logs {
-			if !s.sessionMatches(sessionID) {
-				return
-			}
-			if err := conn.WriteMessage(websocket.TextMessage, []byte(line)); err != nil {
-				return
-			}
-		}
-		return
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	var buffer bytes.Buffer
-	for {
-		select {
-		case line := <-logs:
-			buffer.WriteString(line)
-			buffer.WriteByte('\n')
-		case <-ticker.C:
-			if buffer.Len() > 0 {
-				if err := conn.WriteMessage(websocket.TextMessage, buffer.Bytes()); err != nil {
-					return
-				}
-				buffer.Reset()
-			}
-		}
-	}
-}
-
-type configPayload struct {
-	SessionID   string       `json:"session_id"`
-	Config      string       `json:"config"`
-	OVRuntime   *ovRuntime   `json:"ov_runtime,omitempty"`
-	L2TPRuntime *l2tpRuntime `json:"l2tp_runtime,omitempty"`
-	PPTPRuntime *pptpRuntime `json:"pptp_runtime,omitempty"`
-	WGRuntime   *wgRuntime   `json:"wg_runtime,omitempty"`
-}
-
 type cachedConfigPayload struct {
+	AppliedRevision   uint64               `json:"applied_revision,omitempty"`
 	Config            string               `json:"config"`
 	PeerIP            string               `json:"peer_ip"`
 	OVRuntime         *ovRuntime           `json:"ov_runtime,omitempty"`
@@ -856,7 +235,11 @@ func (s *Server) saveConfigCacheWithHAProxy(rawConfig string, peerIP string, run
 	if len(remoteRuntimes) > 1 {
 		anyConnectRuntime = remoteRuntimes[1]
 	}
-	payload, err := json.Marshal(cachedConfigPayload{Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig, WGRuntime: wgRuntimeConfig, IKEv2Runtime: ikev2Runtime, AnyConnectRuntime: anyConnectRuntime, HAProxyRuntime: haproxyRuntimeConfig})
+	appliedRevision := uint64(0)
+	if cached, ok := s.loadConfigCache(); ok {
+		appliedRevision = cached.AppliedRevision
+	}
+	payload, err := json.Marshal(cachedConfigPayload{AppliedRevision: appliedRevision, Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig, WGRuntime: wgRuntimeConfig, IKEv2Runtime: ikev2Runtime, AnyConnectRuntime: anyConnectRuntime, HAProxyRuntime: haproxyRuntimeConfig})
 	if err != nil {
 		return
 	}
@@ -865,9 +248,73 @@ func (s *Server) saveConfigCacheWithHAProxy(rawConfig string, peerIP string, run
 		log.Printf("failed to create config cache directory: %v", err)
 		return
 	}
-	if err := os.WriteFile(path, payload, 0o600); err != nil {
+	if err := writeFileAtomic(path, payload, 0o600); err != nil {
 		log.Printf("failed to save config cache: %v", err)
 	}
+}
+
+func (s *Server) appliedRevision() uint64 {
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return 0
+	}
+	return payload.AppliedRevision
+}
+
+func (s *Server) setAppliedRevision(revision uint64) {
+	if revision == 0 {
+		return
+	}
+	payload, ok := s.loadConfigCache()
+	if !ok || revision <= payload.AppliedRevision {
+		return
+	}
+	payload.AppliedRevision = revision
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	if err := writeFileAtomic(s.configCachePath(), raw, 0o600); err != nil {
+		log.Printf("failed to save applied revision: %v", err)
+	}
+}
+
+func (s *Server) validateDesiredRevision(req *nodev1.RuntimeConfigRequest) error {
+	if req == nil || req.GetDesiredRevision() == 0 {
+		return nil
+	}
+	if applied := s.appliedRevision(); req.GetDesiredRevision() < applied {
+		return status.Errorf(codes.FailedPrecondition, "stale desired revision %d; node already applied %d", req.GetDesiredRevision(), applied)
+	}
+	return nil
+}
+
+func (s *Server) recordAppliedRevision(req *nodev1.RuntimeConfigRequest, err error) {
+	if err == nil && req != nil {
+		s.setAppliedRevision(req.GetDesiredRevision())
+	}
+}
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".rebecca-cache-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err = tmp.Chmod(mode); err == nil {
+		_, err = tmp.Write(data)
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func (s *Server) loadConfigCache() (cachedConfigPayload, bool) {
@@ -1060,35 +507,6 @@ type downloadFile struct {
 	URL  string `json:"url"`
 }
 
-func (s *Server) readConfigPayload(w http.ResponseWriter, r *http.Request) (configPayload, bool) {
-	var payload configPayload
-	if !decodeJSON(w, r, &payload) {
-		return payload, false
-	}
-	if !s.matchSession(w, payload.SessionID) {
-		return payload, false
-	}
-	return payload, true
-}
-
-func (s *Server) matchRequestSession(w http.ResponseWriter, r *http.Request) bool {
-	var payload struct {
-		SessionID string `json:"session_id"`
-	}
-	if !decodeJSON(w, r, &payload) {
-		return false
-	}
-	return s.matchSession(w, payload.SessionID)
-}
-
-func (s *Server) matchSession(w http.ResponseWriter, sessionID string) bool {
-	if !s.sessionMatches(sessionID) {
-		writeError(w, http.StatusForbidden, "Session ID mismatch.")
-		return false
-	}
-	return true
-}
-
 func (s *Server) sessionMatches(sessionID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1133,36 +551,6 @@ func (s *Server) pruneSessionsLocked(now time.Time) {
 	if len(s.sessions) == 0 {
 		s.connected = false
 	}
-}
-
-func (s *Server) response(extra map[string]any) map[string]any {
-	s.mu.Lock()
-	s.pruneSessionsLocked(time.Now())
-	connected := s.connected && len(s.sessions) > 0
-	s.mu.Unlock()
-	binaryMetadata := s.binaryMetadata()
-	payload := map[string]any{
-		"connected":    connected,
-		"started":      s.core.Started(),
-		"core_version": s.core.Version(),
-		"node_version": s.nodeVersion(),
-		"install_mode": s.settings.InstallMode,
-	}
-	if s.system != nil {
-		payload["system"] = s.system.Snapshot()
-	}
-	if binaryMetadata != nil {
-		payload["binary"] = binaryMetadata
-		if tag, ok := binaryMetadata["tag"].(string); ok && strings.TrimSpace(tag) != "" {
-			payload["node_binary_tag"] = tag
-			payload["binary_tag"] = tag
-			payload["update_channel"] = updateChannelForTag(tag)
-		}
-	}
-	for key, value := range extra {
-		payload[key] = value
-	}
-	return payload
 }
 
 func (s *Server) binaryMetadata() map[string]any {
@@ -1453,37 +841,6 @@ func summarizeDownloadBody(body []byte) string {
 		text = text[:240] + "..."
 	}
 	return text
-}
-
-func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
-	if r.Body == nil {
-		writeError(w, http.StatusUnprocessableEntity, "Request body is required")
-		return false
-	}
-	defer r.Body.Close()
-	if err := json.NewDecoder(r.Body).Decode(target); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, err.Error())
-		return false
-	}
-	return true
-}
-
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func writeError(w http.ResponseWriter, status int, detail any) {
-	writeJSON(w, status, map[string]any{"detail": detail})
-}
-
-func remoteIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 func fileExists(path string) bool {

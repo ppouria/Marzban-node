@@ -13,12 +13,10 @@ import (
 const NodeVersionFallback = "0.2.2"
 
 type Settings struct {
-	AppName         string
-	InstallMode     string
-	ServiceHost     string
-	ServicePort     int
-	GRPCServiceHost string
-	GRPCServicePort int
+	AppName     string
+	InstallMode string
+	ServiceHost string
+	ServicePort int
 
 	XrayAPIHost        string
 	XrayAPIPort        int
@@ -76,13 +74,10 @@ func Load() Settings {
 	servicePort := getInt("SERVICE_PORT", 62050)
 	xrayAPIPort := getInt("XRAY_API_PORT", 62051)
 	return Settings{
-		AppName:         getString("REBECCA_NODE_APP_NAME", "rebecca-node"),
-		InstallMode:     getInstallMode(),
-		ServiceHost:     serviceHost,
-		ServicePort:     servicePort,
-		GRPCServiceHost: getString("GRPC_SERVICE_HOST", serviceHost),
-		GRPCServicePort: getInt("GRPC_SERVICE_PORT", xrayAPIPort+1),
-
+		AppName:            getString("REBECCA_NODE_APP_NAME", "rebecca-node"),
+		InstallMode:        getInstallMode(),
+		ServiceHost:        serviceHost,
+		ServicePort:        servicePort,
 		XrayAPIHost:        getString("XRAY_API_HOST", "0.0.0.0"),
 		XrayAPIPort:        xrayAPIPort,
 		RebeccaDataDir:     dataDir,
