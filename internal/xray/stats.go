@@ -34,6 +34,8 @@ type InboundStat struct {
 type UserStat struct {
 	UID        string `json:"uid"`
 	Value      int64  `json:"value"`
+	Up         int64  `json:"up,omitempty"`
+	Down       int64  `json:"down,omitempty"`
 	InboundTag string `json:"inbound_tag,omitempty"`
 }
 
@@ -164,17 +166,28 @@ func userStatsFromCounters(stats []*statscommand.Stat) []UserStat {
 		uid        string
 		inboundTag string
 	}
-	byUser := map[userKey]int64{}
+	byUser := map[userKey]*UserStat{}
 	for _, stat := range stats {
 		if stat == nil || stat.GetValue() == 0 {
 			continue
 		}
-		uid, inboundTag, ok := parseUserStatIdentity(stat.GetName())
+		uid, inboundTag, link, ok := parseUserStatCounter(stat.GetName())
 		if !ok {
 			continue
 		}
 		key := userKey{uid: uid, inboundTag: inboundTag}
-		byUser[key] = addStatCounter(byUser[key], stat.GetValue())
+		item := byUser[key]
+		if item == nil {
+			item = &UserStat{UID: uid, InboundTag: inboundTag}
+			byUser[key] = item
+		}
+		item.Value = addStatCounter(item.Value, stat.GetValue())
+		switch link {
+		case "uplink":
+			item.Up = addStatCounter(item.Up, stat.GetValue())
+		case "downlink":
+			item.Down = addStatCounter(item.Down, stat.GetValue())
+		}
 	}
 
 	keys := make([]userKey, 0, len(byUser))
@@ -190,9 +203,9 @@ func userStatsFromCounters(stats []*statscommand.Stat) []UserStat {
 
 	result := make([]UserStat, 0, len(keys))
 	for _, key := range keys {
-		value := byUser[key]
-		if value != 0 {
-			result = append(result, UserStat{UID: key.uid, Value: value, InboundTag: key.inboundTag})
+		item := byUser[key]
+		if item.Value != 0 {
+			result = append(result, *item)
 		}
 	}
 	return result
@@ -397,6 +410,19 @@ func parseInboundStatName(name string) (string, string, bool) {
 func parseUserStatName(name string) (string, bool) {
 	uid, _, ok := parseUserStatIdentity(name)
 	return uid, ok
+}
+
+func parseUserStatCounter(name string) (string, string, string, bool) {
+	parts := strings.Split(name, ">>>")
+	if len(parts) < 4 {
+		return "", "", "", false
+	}
+	uid, inboundTag, ok := parseUserStatIdentity(name)
+	link := strings.ToLower(strings.TrimSpace(parts[3]))
+	if !ok || (link != "uplink" && link != "downlink") {
+		return "", "", "", false
+	}
+	return uid, inboundTag, link, true
 }
 
 func parseUserStatIdentity(name string) (string, string, bool) {

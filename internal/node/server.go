@@ -56,6 +56,9 @@ type Server struct {
 	// taken only at the public entry points, never in the internal helpers they
 	// call, so the operations do not deadlock on themselves.
 	runtimeMu sync.Mutex
+
+	userStatsMu sync.Mutex
+	userStatsAt time.Time
 }
 
 const sessionTTL = 30 * time.Minute
@@ -144,12 +147,7 @@ func (s *Server) snapshotRunningUsage() {
 	} else {
 		log.Printf("failed to snapshot inbound usage before stopping xray: %v", err)
 	}
-	userStats, err := xray.QueryUserStats(
-		s.settings.XrayAPIHost,
-		s.settings.XrayAPIPort,
-		5*time.Second,
-		true,
-	)
+	userStats, _, err := s.collectXrayUserStats(5*time.Second, true)
 	if err == nil {
 		s.usage.addUsers(userStats)
 	} else {

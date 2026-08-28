@@ -143,6 +143,9 @@ func TestUserStatsKeepInboundDimensionsSeparate(t *testing.T) {
 			t.Fatalf("unexpected stat: %#v", stat)
 		}
 	}
+	if stats[1].Up != 10 || stats[1].Down != 20 {
+		t.Fatalf("directional counters were lost: %#v", stats[1])
+	}
 }
 
 func TestParseOnlineUserName(t *testing.T) {

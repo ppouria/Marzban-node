@@ -466,16 +466,12 @@ func (api *grpcAPI) ConfigurePsiphon(ctx context.Context, req *nodev1.PsiphonPro
 
 func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsageRequest) (*nodev1.UserUsageBatch, error) {
 	var stats []xray.UserStat
+	var speeds []userTrafficSpeed
 	var onlineUIDs []string
 	var onlineIPs []xray.OnlineUserIP
 	if api.server.core.Started() {
 		var err error
-		stats, err = xray.QueryUserStats(
-			api.server.settings.XrayAPIHost,
-			api.server.settings.XrayAPIPort,
-			30*time.Second,
-			req.GetReset_(),
-		)
+		stats, speeds, err = api.server.collectXrayUserStats(30*time.Second, req.GetReset_())
 		if err != nil {
 			return nil, status.Error(codes.Unavailable, err.Error())
 		}
@@ -521,6 +517,13 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 	batchID, pending := api.server.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
 	res := &nodev1.UserUsageBatch{BatchId: batchID, OnlineIps: protoOnlineUserIPs(onlineIPs)}
+	for _, speed := range speeds {
+		res.Speeds = append(res.Speeds, &nodev1.UserTrafficSpeed{
+			Uid:      speed.UID,
+			Upload:   speed.Upload,
+			Download: speed.Download,
+		})
+	}
 	for _, stat := range pending {
 		res.Stats = append(res.Stats, &nodev1.UserUsageSample{
 			Uid:        stat.UID,
