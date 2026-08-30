@@ -226,9 +226,32 @@ func QueryOnlineUserUIDs(apiHost string, apiPort int, timeout time.Duration) ([]
 	if err != nil {
 		return nil, fmt.Errorf("query Xray online users: %w", err)
 	}
+	return onlineUserUIDs(res.GetUsers()), nil
+}
 
+func QueryOnlineUserSnapshot(apiHost string, apiPort int, timeout time.Duration) ([]string, []OnlineUserIP, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	conn, err := dialAPI(ctx, apiHost, apiPort)
+	if err != nil {
+		return nil, nil, fmt.Errorf("connect to Xray stats API: %w", err)
+	}
+	defer conn.Close()
+
+	client := statscommand.NewStatsServiceClient(conn)
+	res, err := client.GetAllOnlineUsers(ctx, &statscommand.GetAllOnlineUsersRequest{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("query Xray online users: %w", err)
+	}
+	uids := onlineUserUIDs(res.GetUsers())
+	users, err := queryOnlineUserIPs(ctx, client, res.GetUsers())
+	return uids, users, err
+}
+
+func onlineUserUIDs(names []string) []string {
 	seen := map[string]struct{}{}
-	for _, name := range res.GetUsers() {
+	for _, name := range names {
 		_, uid, ok := parseOnlineUserName(name)
 		if !ok {
 			continue
@@ -241,7 +264,7 @@ func QueryOnlineUserUIDs(apiHost string, apiPort int, timeout time.Duration) ([]
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
-	return uids, nil
+	return uids
 }
 
 func QueryOnlineUserIPs(apiHost string, apiPort int, timeout time.Duration) ([]OnlineUserIP, error) {

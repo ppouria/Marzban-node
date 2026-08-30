@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -475,25 +474,13 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 		if err != nil {
 			return nil, status.Error(codes.Unavailable, err.Error())
 		}
-		onlineIPs, err = xray.QueryOnlineUserIPs(
+		onlineUIDs, onlineIPs, err = xray.QueryOnlineUserSnapshot(
 			api.server.settings.XrayAPIHost,
 			api.server.settings.XrayAPIPort,
 			5*time.Second,
 		)
 		if err != nil {
 			log.Printf("failed to query online user IPs: %v", err)
-			partialOnlineIPs := onlineIPs
-			onlineUIDs, err = xray.QueryOnlineUserUIDs(
-				api.server.settings.XrayAPIHost,
-				api.server.settings.XrayAPIPort,
-				5*time.Second,
-			)
-			if err != nil {
-				log.Printf("failed to query online users: %v", err)
-			}
-			onlineIPs = partialOnlineIPs
-		} else {
-			onlineUIDs = onlineUserIPUIDs(onlineIPs)
 		}
 	}
 	if OVStats := api.server.ov.CollectUsage(); len(OVStats) > 0 {
@@ -1242,23 +1229,6 @@ func maxInt64(value int64, minimum int64) int64 {
 		return minimum
 	}
 	return value
-}
-
-func onlineUserIPUIDs(users []xray.OnlineUserIP) []string {
-	seen := map[string]struct{}{}
-	for _, user := range users {
-		uid := strings.TrimSpace(user.UID)
-		if uid == "" {
-			continue
-		}
-		seen[uid] = struct{}{}
-	}
-	uids := make([]string, 0, len(seen))
-	for uid := range seen {
-		uids = append(uids, uid)
-	}
-	sort.Strings(uids)
-	return uids
 }
 
 func protoOnlineUserIPs(users []xray.OnlineUserIP) []*nodev1.OnlineUserIP {

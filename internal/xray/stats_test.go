@@ -47,6 +47,18 @@ func TestQueryOnlineUserIPsPreservesPartialResults(t *testing.T) {
 	}
 }
 
+func TestOnlineUserUIDsReturnsUniqueSortedSnapshot(t *testing.T) {
+	got := onlineUserUIDs([]string{
+		"user>>>20.second>>>online",
+		"user>>>10.first>>>online",
+		"user>>>20.second>>>online",
+		"",
+	})
+	if len(got) != 2 || got[0] != "10" || got[1] != "20" {
+		t.Fatalf("online user snapshot=%v", got)
+	}
+}
+
 func TestParseOutboundStatName(t *testing.T) {
 	tag, link, ok := parseOutboundStatName("outbound>>>proxy>>>traffic>>>uplink")
 	if !ok || tag != "proxy" || link != "uplink" {
