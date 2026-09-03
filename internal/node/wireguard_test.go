@@ -1,9 +1,27 @@
 package node
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
+
+func TestWGSessionStatePersistsLatestHandshake(t *testing.T) {
+	raw, err := json.Marshal(wgSessionState{UserID: 7, LastHandshakeUnix: 123})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state wgSessionState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.LastHandshakeUnix != 123 {
+		t.Fatalf("last handshake = %d, want 123", state.LastHandshakeUnix)
+	}
+	if !wgHandshakeAdvanced(122, state.LastHandshakeUnix) || wgHandshakeAdvanced(state.LastHandshakeUnix, state.LastHandshakeUnix) {
+		t.Fatal("WireGuard heartbeat must be emitted only for a newer handshake")
+	}
+}
 
 func TestWGValidateInboundsRejectsPeerOutsidePool(t *testing.T) {
 	err := wgValidateInbounds([]wgRuntimeInbound{{
