@@ -488,6 +488,7 @@ func (s *Server) startCachedConfig() {
 		log.Printf("failed to decode cached config: %v", err)
 		return
 	}
+	prepareTProxyConfig(cfg)
 	if err := s.core.Start(cfg); err != nil {
 		log.Printf("failed to start cached config: %v", err)
 		return

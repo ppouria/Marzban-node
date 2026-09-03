@@ -37,6 +37,24 @@ func TestGRPCVPNRuntimeClearsMissingAuxiliaryState(t *testing.T) {
 	}
 }
 
+func TestXrayConfigUsesTProxy(t *testing.T) {
+	for _, test := range []struct {
+		raw  string
+		want bool
+	}{
+		{`{"inbounds":[{"streamSettings":{"sockopt":{"tproxy":"tproxy"}}}]}`, true},
+		{`{"inbounds":[{"streamSettings":{"sockopt":{"tproxy":"off"}}}]}`, false},
+	} {
+		cfg, err := xray.NewConfig(test.raw, "127.0.0.1", appconfig.Settings{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := xrayConfigUsesTProxy(cfg); got != test.want {
+			t.Fatalf("xrayConfigUsesTProxy() = %v, want %v", got, test.want)
+		}
+	}
+}
+
 func TestGRPCVPNRuntimeCarriesManagedHAProxyCertificate(t *testing.T) {
 	certificateFile, privateKeyFile := writeSelfSignedCert(t, t.TempDir(), "managed.example.test", []string{"managed.example.test"})
 	certificate, _ := os.ReadFile(certificateFile)

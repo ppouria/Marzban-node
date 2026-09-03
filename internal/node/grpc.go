@@ -623,6 +623,7 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if err != nil {
 		return nil, err
 	}
+	prepareTProxyConfig(cfg)
 	if err := s.core.Start(cfg); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -689,6 +690,7 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if err != nil {
 		return nil, err
 	}
+	prepareTProxyConfig(cfg)
 	if err := s.core.Restart(cfg); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -900,6 +902,17 @@ func (s *Server) grpcConfig(ctx context.Context, req *nodev1.RuntimeConfigReques
 		return nil, status.Error(codes.InvalidArgument, "failed to decode config: "+err.Error())
 	}
 	return cfg, nil
+}
+
+func prepareTProxyConfig(cfg *xray.Config) {
+	if xrayConfigUsesTProxy(cfg) {
+		enableVPNTProxyHostNetworking()
+	}
+}
+
+func xrayConfigUsesTProxy(cfg *xray.Config) bool {
+	raw, err := cfg.JSON()
+	return err == nil && strings.Contains(string(raw), `"tproxy":"tproxy"`)
 }
 
 func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, *pptpRuntime, *wgRuntime, *remoteAccessRuntime, *remoteAccessRuntime, *haproxyRuntime, error) {
