@@ -158,13 +158,7 @@ func (api *grpcAPI) RestartRuntime(ctx context.Context, req *nodev1.RuntimeConfi
 	if err := api.server.validateDesiredRevision(req); err != nil {
 		return nil, err
 	}
-	var response *nodev1.RuntimeActionResponse
-	var err error
-	if api.server.core.Started() && api.server.runtimeConfigMatchesCache(req.GetConfigJson()) {
-		response, err = api.server.grpcApplyRuntimeOnly(ctx, req, "runtime config unchanged")
-	} else {
-		response, err = api.server.grpcRestartRuntime(ctx, req, "runtime restarted")
-	}
+	response, err := api.server.grpcRestartRuntime(ctx, req, "runtime restarted")
 	api.server.recordAppliedRevision(req, err)
 	return response, err
 }

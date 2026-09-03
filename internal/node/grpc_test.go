@@ -77,6 +77,62 @@ func TestGRPCVPNRuntimeCarriesManagedHAProxyCertificate(t *testing.T) {
 	}
 }
 
+func TestRestartRuntimeRestartsUnchangedConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	runsPath := filepath.Join(tempDir, "runs")
+	executable := filepath.Join(tempDir, "xray")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nif [ \"$1\" = version ]; then echo 'Xray 1.0.0'; exit 0; fi\necho $$ >> \"$XRAY_TEST_RUNS\"\ncat >/dev/null\nwhile :; do sleep 1; done\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XRAY_TEST_RUNS", runsPath)
+	settings := appconfig.Settings{
+		RebeccaDataDir:     tempDir,
+		XrayExecutablePath: executable,
+		XrayAssetsPath:     tempDir,
+		XrayLogDir:         tempDir,
+		XrayAPIHost:        "127.0.0.1",
+		XrayAPIPort:        10085,
+	}
+	core, err := xray.NewCore(executable, tempDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Stop()
+	configJSON := `{"inbounds":[],"outbounds":[]}`
+	cfg, err := xray.NewConfig(configJSON, "127.0.0.1", settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.Start(cfg); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if runs, _ := os.ReadFile(runsPath); len(strings.Fields(string(runs))) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("initial Xray process did not start")
+		}
+	}
+	server := &Server{settings: settings, core: core, sessions: make(map[string]time.Time)}
+	server.saveConfigCache(configJSON, "127.0.0.1", nil, nil, nil, nil)
+
+	response, err := (&grpcAPI{server: server}).RestartRuntime(context.Background(), &nodev1.RuntimeConfigRequest{ConfigJson: configJSON})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.GetAccepted() || response.GetMessage() != "runtime restarted" {
+		t.Fatalf("unexpected restart response: %#v", response)
+	}
+	runs, err := os.ReadFile(runsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(strings.Fields(string(runs))); got != 2 {
+		t.Fatalf("unchanged config started Xray %d times, want 2", got)
+	}
+}
+
 func TestGRPCServerAcceptsMutualTLSClient(t *testing.T) {
 	tempDir := t.TempDir()
 	serverCertFile, serverKeyFile := writeSelfSignedCert(t, tempDir, "server", []string{"rebecca-node.test"})
