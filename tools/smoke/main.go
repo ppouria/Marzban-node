@@ -2,18 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
-	"encoding/json"
-	"errors"
+	"crypto/x509"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
+
+	nodev1 "github.com/rebeccapanel/rebecca-node/internal/proto/node/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 type launched struct {
@@ -75,38 +76,56 @@ func smokeNode(binaryPath string, tempDir string) error {
 	if err != nil {
 		return err
 	}
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-				Certificates:       []tls.Certificate{cert},
-			},
-		},
-	}
-	connectURL := "https://127.0.0.1:" + port + "/connect"
-	if err := waitUntil(func() bool {
-		res, err := client.Post(connectURL, "application/json", nil)
-		if err != nil {
-			return false
-		}
-		defer res.Body.Close()
-		return res.StatusCode < 400
-	}, 20*time.Second, process, "Node binary did not accept TLS connections"); err != nil {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
 		return err
 	}
-
-	var connectPayload struct {
-		SessionID string `json:"session_id"`
-	}
-	if err := postJSON(client, connectURL, nil, &connectPayload); err != nil {
-		return err
-	}
-	if connectPayload.SessionID == "" {
-		return errors.New("connect response did not include session_id")
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(certPEM) {
+		return fmt.Errorf("failed to load generated node certificate")
 	}
 
-	return postOK(client, "https://127.0.0.1:"+port+"/ping", map[string]string{"session_id": connectPayload.SessionID})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(
+		ctx,
+		"127.0.0.1:"+port,
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
+			ServerName:   "localhost",
+			RootCAs:      roots,
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		})),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		return fmt.Errorf("node binary did not accept gRPC TLS connections: %w. Last output: %s", err, process.output.String())
+	}
+	defer conn.Close()
+
+	control := nodev1.NewNodeControlServiceClient(conn)
+	hello, err := control.Hello(ctx, &nodev1.HelloRequest{MasterId: "binary-smoke-test"})
+	if err != nil {
+		return fmt.Errorf("gRPC hello failed: %w", err)
+	}
+	if hello.GetNodeVersion() != "binary-smoke-test" {
+		return fmt.Errorf("unexpected node version %q", hello.GetNodeVersion())
+	}
+	connected, err := control.Connect(ctx, &nodev1.ConnectRequest{MasterId: "binary-smoke-test"})
+	if err != nil {
+		return fmt.Errorf("gRPC connect failed: %w", err)
+	}
+	if connected.GetConnectionId() == "" || !connected.GetRuntime().GetConnected() {
+		return fmt.Errorf("unexpected gRPC connect response: %#v", connected)
+	}
+	health, err := control.Health(ctx, &nodev1.HealthRequest{})
+	if err != nil {
+		return fmt.Errorf("gRPC health failed: %w", err)
+	}
+	if !health.GetRuntime().GetConnected() {
+		return fmt.Errorf("gRPC health did not retain the connected session")
+	}
+	return nil
 }
 
 func createFakeXray(dir string) (string, error) {
@@ -160,34 +179,6 @@ func waitUntil(predicate func() bool, timeout time.Duration, process *launched, 
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("%s. Last output: %s", message, process.output.String())
-}
-
-func postOK(client *http.Client, url string, payload any) error {
-	return postJSON(client, url, payload, nil)
-}
-
-func postJSON(client *http.Client, url string, payload any, target any) error {
-	var body io.Reader
-	if payload != nil {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-		body = bytes.NewReader(data)
-	}
-	res, err := client.Post(url, "application/json", body)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	responseBody, _ := io.ReadAll(res.Body)
-	if res.StatusCode >= 400 {
-		return fmt.Errorf("POST %s failed with %d: %s", url, res.StatusCode, strings.TrimSpace(string(responseBody)))
-	}
-	if target != nil {
-		return json.Unmarshal(responseBody, target)
-	}
-	return nil
 }
 
 func requireBinary(name string) string {

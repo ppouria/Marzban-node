@@ -28,6 +28,19 @@ sudo bash -c "$(curl -sL https://raw.githubusercontent.com/rebeccapanel/Rebecca/
 
 The Docker and binary installers are intentionally separate. Use the matching script for update, restart, core update, and script update operations.
 
+OpenVPN runtime support is binary-only. Docker nodes reject OpenVPN runtime payloads
+instead of installing host VPN prerequisites inside the container.
+
+WireGuard runtime support is binary-only for the same reason. On first use the node installs
+`wireguard-tools`, `nftables`, loads the kernel module, and reconciles one kernel interface per
+inbound. By default each WireGuard inbound sends TCP/UDP traffic through nftables TPROXY to its
+Xray tunnel port, so Rebecca routing rules still apply. Direct MASQUERADE/NAT is available only
+when the runtime explicitly sets `nat_enabled=true`. The master pushes WireGuard state inside the
+shared runtime envelope (`ov_runtime_json`) under `wg_inbounds`, each with a server `private_key`,
+`address_pool`, `listen_port`, `tunnel_port` and a `peers` list (`public_key`, optional
+`preshared_key`, `address`). Per-peer rx+tx is read from the kernel and reported to the master as
+`wg:<user_id>` usage deltas.
+
 Use `help` to view all commands:
 ```Rebecca-node help```
 
@@ -38,7 +51,7 @@ Read the setup guide here: Soon!
 ## Runtime
 Rebecca-node is implemented in Go and ships one host-level binary:
 
-- `rebecca-node`: the TLS REST API used by the Rebecca master to control Xray and schedule safe on-host restart/update commands
+- `rebecca-node`: the mutually authenticated gRPC service used by the Rebecca master to control Xray and schedule safe on-host restart/update commands
 
 ## Binary builds
 Linux `amd64` and Windows `amd64` binaries are built for:

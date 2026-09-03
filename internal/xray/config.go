@@ -72,7 +72,7 @@ func (c *Config) applyAPI() {
 	c.filterAPIRoutes()
 
 	c.data["api"] = map[string]any{
-		"services": []any{"HandlerService", "StatsService", "LoggerService"},
+		"services": []any{"HandlerService", "StatsService", "LoggerService", "RoutingService"},
 		"tag":      "API",
 	}
 	c.data["stats"] = map[string]any{}
@@ -81,18 +81,10 @@ func (c *Config) applyAPI() {
 	inbound := map[string]any{
 		"listen":   c.settings.XrayAPIHost,
 		"port":     c.settings.XrayAPIPort,
-		"protocol": "dokodemo-door",
-		"settings": map[string]any{"address": "127.0.0.1"},
-		"streamSettings": map[string]any{
-			"security": "tls",
-			"tlsSettings": map[string]any{
-				"certificates": []any{
-					map[string]any{
-						"certificateFile": c.settings.SSLCertFile,
-						"keyFile":         c.settings.SSLKeyFile,
-					},
-				},
-			},
+		"protocol": "tunnel",
+		"settings": map[string]any{
+			"allowedNetwork": "tcp",
+			"rewriteAddress": "127.0.0.1",
 		},
 		"tag": "API_INBOUND",
 	}
@@ -124,10 +116,9 @@ func (c *Config) applyStatsPolicy() {
 	level0 := ensureConfigMap(levels, "0")
 	level0["statsUserUplink"] = true
 	level0["statsUserDownlink"] = true
+	level0["statsUserOnline"] = true
 
 	system := ensureConfigMap(policy, "system")
-	system["statsInboundDownlink"] = false
-	system["statsInboundUplink"] = false
 	system["statsOutboundDownlink"] = true
 	system["statsOutboundUplink"] = true
 
@@ -157,7 +148,7 @@ func (c *Config) filterInbounds() {
 			filtered = append(filtered, item)
 			continue
 		}
-		if inbound["protocol"] == "dokodemo-door" && inbound["tag"] == "API_INBOUND" {
+		if inbound["tag"] == "API_INBOUND" {
 			continue
 		}
 		if len(allowed) > 0 {

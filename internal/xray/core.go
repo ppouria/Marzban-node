@@ -3,6 +3,7 @@ package xray
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"log"
 	"os"
@@ -14,6 +15,9 @@ import (
 )
 
 type Core struct {
+	lifecycleMu    sync.Mutex
+	testSlotsOnce  sync.Once
+	testSlots      chan struct{}
 	mu             sync.Mutex
 	executablePath string
 	assetsPath     string
@@ -22,6 +26,20 @@ type Core struct {
 	logs           *LogBus
 	version        string
 	debug          bool
+}
+
+const maxConcurrentTestRuntimes = 2
+
+func (c *Core) acquireTestRuntime(ctx context.Context) (func(), bool) {
+	c.testSlotsOnce.Do(func() {
+		c.testSlots = make(chan struct{}, maxConcurrentTestRuntimes)
+	})
+	select {
+	case c.testSlots <- struct{}{}:
+		return func() { <-c.testSlots }, true
+	case <-ctx.Done():
+		return nil, false
+	}
 }
 
 func NewCore(executablePath, assetsPath string, debug bool) (*Core, error) {
@@ -92,6 +110,12 @@ func (c *Core) Started() bool {
 }
 
 func (c *Core) Start(config *Config) error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	return c.start(config)
+}
+
+func (c *Core) start(config *Config) error {
 	c.mu.Lock()
 	if c.running {
 		c.mu.Unlock()
@@ -100,6 +124,7 @@ func (c *Core) Start(config *Config) error {
 	executable := c.executablePath
 	assets := c.assetsPath
 	c.mu.Unlock()
+	cleanupStaleManagedProcesses(executable)
 
 	if err := config.NormalizeLogPaths(); err != nil {
 		return err
@@ -113,6 +138,7 @@ func (c *Core) Start(config *Config) error {
 	}
 
 	cmd := exec.Command(executable, "run", "-config", "stdin:")
+	configureManagedProcess(cmd)
 	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+assets)
 
 	stdin, err := cmd.StdinPipe()
@@ -131,7 +157,7 @@ func (c *Core) Start(config *Config) error {
 		return err
 	}
 	if _, err := stdin.Write(configJSON); err != nil {
-		_ = cmd.Process.Kill()
+		terminateManagedProcess(cmd)
 		return err
 	}
 	_ = stdin.Close()
@@ -145,8 +171,10 @@ func (c *Core) Start(config *Config) error {
 	go c.capture(stderr)
 	go func() {
 		err := cmd.Wait()
-		if err != nil && c.debug {
+		if err != nil {
 			log.Printf("xray exited: %v", err)
+		} else if c.debug {
+			log.Print("xray exited")
 		}
 		c.mu.Lock()
 		if c.cmd == cmd {
@@ -160,6 +188,12 @@ func (c *Core) Start(config *Config) error {
 }
 
 func (c *Core) Stop() {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	c.stop()
+}
+
+func (c *Core) stop() {
 	c.mu.Lock()
 	cmd := c.cmd
 	c.cmd = nil
@@ -167,13 +201,15 @@ func (c *Core) Stop() {
 	c.mu.Unlock()
 
 	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+		terminateManagedProcess(cmd)
 	}
 }
 
 func (c *Core) Restart(config *Config) error {
-	c.Stop()
-	return c.Start(config)
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	c.stop()
+	return c.start(config)
 }
 
 func (c *Core) capture(pipe interface{ Read([]byte) (int, error) }) {
