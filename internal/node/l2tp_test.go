@@ -1,10 +1,20 @@
 package node
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestNoninteractivePackageArgsPreserveExistingConfig(t *testing.T) {
+	if got := noninteractivePackageArgs("apt-get", []string{"install", "-y", "strongswan"}); !slices.Equal(got, []string{"-o", "Dpkg::Options::=--force-confold", "install", "-y", "strongswan"}) {
+		t.Fatalf("unexpected apt args: %#v", got)
+	}
+	if got := noninteractivePackageArgs("dpkg", []string{"--configure", "-a"}); !slices.Equal(got, []string{"--force-confold", "--configure", "-a"}) {
+		t.Fatalf("unexpected dpkg args: %#v", got)
+	}
+}
 
 func TestL2TPPoolRangeUsesCIDRCapacity(t *testing.T) {
 	local, pool := l2tpPoolRange("10.67.0.0/16")

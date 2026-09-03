@@ -740,6 +740,7 @@ func runInstallCommand(env []string, name string, args ...string) error {
 	if err != nil {
 		return err
 	}
+	args = noninteractivePackageArgs(filepath.Base(command), args)
 	cmd := exec.Command(command, args...)
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
@@ -749,6 +750,18 @@ func runInstallCommand(env []string, name string, args ...string) error {
 		return fmt.Errorf("%s %s: %v: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func noninteractivePackageArgs(name string, args []string) []string {
+	for _, arg := range args {
+		if name == "apt-get" && arg == "install" {
+			return append([]string{"-o", "Dpkg::Options::=--force-confold"}, args...)
+		}
+		if name == "dpkg" && arg == "--configure" {
+			return append([]string{"--force-confold"}, args...)
+		}
+	}
+	return args
 }
 
 func ovBlockedDestinations() ([]string, []string) {

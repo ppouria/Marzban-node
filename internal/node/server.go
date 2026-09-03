@@ -496,9 +496,16 @@ func (s *Server) startCachedConfig() {
 	s.mu.Lock()
 	s.lastConfig = cfg
 	s.mu.Unlock()
-	if warning := s.applyHAProxyRuntime(payload.HAProxyRuntime); warning != "" {
-		log.Print(warning)
+	if err := s.ov.Apply(payload.OVRuntime); err != nil {
+		log.Printf("OpenVPN cached runtime apply failed: %v", err)
 	}
+	s.prepareIKEv2Runtime(payload.IKEv2Runtime)
+	s.applyL2TPRuntime(payload.L2TPRuntime)
+	s.applyPPTPRuntime(payload.PPTPRuntime)
+	s.applyWGRuntime(payload.WGRuntime)
+	s.applyIKEv2Runtime(payload.IKEv2Runtime)
+	s.applyAnyConnectRuntime(payload.AnyConnectRuntime)
+	s.applyHAProxyRuntime(payload.HAProxyRuntime)
 }
 
 type downloadFile struct {
