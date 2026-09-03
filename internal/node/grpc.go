@@ -1107,11 +1107,14 @@ func (s *Server) grpcRuntimeState(message string) *nodev1.RuntimeState {
 			"operation_deduplication",
 			"config_revision",
 			"host_actions",
+			"protocol_statuses",
+			"xray_process_metrics",
 			"tor_proxy",
 			"windscribe_proxy",
 			"psiphon_proxy",
 		},
-		AppliedRevision: s.appliedRevision(),
+		AppliedRevision:  s.appliedRevision(),
+		ProtocolStatuses: s.protocolStatuses(),
 	}
 }
 
@@ -1119,6 +1122,11 @@ func (s *Server) grpcMetrics(message string) *nodev1.MetricsResponse {
 	var snapshot systemSnapshot
 	if s.system != nil {
 		snapshot = s.system.Snapshot()
+	}
+	pid, xrayUptime := s.core.Process()
+	xraySnapshot := processSnapshot{PID: pid, UptimeSec: xrayUptime}
+	if s.system != nil {
+		xraySnapshot = s.system.ProcessSnapshot(pid, xrayUptime)
 	}
 	return &nodev1.MetricsResponse{
 		Runtime: s.grpcRuntimeState(message),
@@ -1134,6 +1142,10 @@ func (s *Server) grpcMetrics(message string) *nodev1.MetricsResponse {
 		Transfer: &nodev1.TransferMetrics{
 			UploadSpeed:   snapshot.Bandwidth.UploadBytesPerSecond,
 			DownloadSpeed: snapshot.Bandwidth.DownloadBytesPerSecond,
+		},
+		Xray: &nodev1.XrayMetrics{
+			Pid: int32(xraySnapshot.PID), CpuUsagePercent: xraySnapshot.CPUUsagePct,
+			MemoryUsed: xraySnapshot.MemoryUsed, UptimeSeconds: xraySnapshot.UptimeSec,
 		},
 		SampledAtUnix: time.Now().Unix(),
 	}

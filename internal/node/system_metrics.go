@@ -20,6 +20,10 @@ type systemSampler struct {
 	lastNet netTotals
 	hasNet  bool
 	lastAt  time.Time
+
+	processPID   int
+	processTicks uint64
+	processAt    time.Time
 }
 
 type systemSnapshot struct {
@@ -44,6 +48,13 @@ type memorySnapshot struct {
 type bandwidthSnapshot struct {
 	UploadBytesPerSecond   uint64 `json:"upload_bytes_per_second"`
 	DownloadBytesPerSecond uint64 `json:"download_bytes_per_second"`
+}
+
+type processSnapshot struct {
+	PID         int
+	CPUUsagePct float64
+	MemoryUsed  uint64
+	UptimeSec   uint64
 }
 
 type cpuTimes struct {
@@ -107,6 +118,73 @@ func (s *systemSampler) Snapshot() systemSnapshot {
 		Bandwidth: bandwidth,
 		UptimeSec: readUptimeSeconds("/proc/uptime"),
 	}
+}
+
+func (s *systemSampler) ProcessSnapshot(pid int, uptime uint64) processSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := processSnapshot{PID: pid, UptimeSec: uptime}
+	if pid <= 0 {
+		s.processPID, s.processTicks, s.processAt = 0, 0, time.Time{}
+		return result
+	}
+	now := time.Now()
+	ticks, ok := readProcessTicks(pid)
+	if !ok {
+		s.processPID, s.processTicks, s.processAt = 0, 0, time.Time{}
+		result.MemoryUsed = readProcessMemory(pid)
+		return result
+	}
+	if ok && s.processPID == pid && !s.processAt.IsZero() && ticks >= s.processTicks {
+		elapsed := now.Sub(s.processAt).Seconds()
+		if elapsed > 0 {
+			result.CPUUsagePct = roundFloat(float64(ticks-s.processTicks)/elapsed, 1)
+		}
+	}
+	s.processPID, s.processTicks, s.processAt = pid, ticks, now
+	result.MemoryUsed = readProcessMemory(pid)
+	return result
+}
+
+func readProcessTicks(pid int) (uint64, bool) {
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0, false
+	}
+	return parseProcessTicks(string(raw))
+}
+
+func parseProcessTicks(raw string) (uint64, bool) {
+	end := strings.LastIndexByte(raw, ')')
+	if end < 0 {
+		return 0, false
+	}
+	fields := strings.Fields(raw[end+1:])
+	if len(fields) <= 12 {
+		return 0, false
+	}
+	user, errUser := strconv.ParseUint(fields[11], 10, 64)
+	system, errSystem := strconv.ParseUint(fields[12], 10, 64)
+	return user + system, errUser == nil && errSystem == nil
+}
+
+func readProcessMemory(pid int) uint64 {
+	raw, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/status")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		value, _ := strconv.ParseUint(fields[1], 10, 64)
+		return value * 1024
+	}
+	return 0
 }
 
 func readUptimeSeconds(path string) uint64 {
