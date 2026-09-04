@@ -305,6 +305,9 @@ func (m *externalProxyManager) applyWebLocked(inbounds []extraRuntimeInbound) er
 	installer = bytes.ReplaceAll(installer,
 		[]byte(`repo="$work/tproxy-server-master"`),
 		[]byte(`repo="$work/tproxy-server-f7a6acc4d536a787d442fd7df3ba4ebfd728f406"`))
+	installer = bytes.ReplaceAll(installer,
+		[]byte(`sed -i 's/attempt != 20/attempt != 90/' "$repo/deploy/install.sh"`),
+		[]byte("sed -i 's/attempt != 20/attempt != 90/' \"$repo/deploy/install.sh\"\n    sed -i '/install-mtproxy.sh/a\\chmod -R a+rX /opt/MTProxy' \"$repo/deploy/install.sh\""))
 	if err := os.MkdirAll(m.dir, 0o700); err != nil {
 		return err
 	}
