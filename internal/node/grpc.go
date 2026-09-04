@@ -158,13 +158,7 @@ func (api *grpcAPI) RestartRuntime(ctx context.Context, req *nodev1.RuntimeConfi
 	if err := api.server.validateDesiredRevision(req); err != nil {
 		return nil, err
 	}
-	var response *nodev1.RuntimeActionResponse
-	var err error
-	if api.server.core.Started() && api.server.runtimeConfigMatchesCache(req.GetConfigJson()) {
-		response, err = api.server.grpcApplyRuntimeOnly(ctx, req, "runtime config unchanged")
-	} else {
-		response, err = api.server.grpcRestartRuntime(ctx, req, "runtime restarted")
-	}
+	response, err := api.server.grpcRestartRuntime(ctx, req, "runtime restarted")
 	api.server.recordAppliedRevision(req, err)
 	return response, err
 }
@@ -197,6 +191,21 @@ func (api *grpcAPI) StopRuntime(ctx context.Context, req *nodev1.StopRuntimeRequ
 	if api.server.haproxy != nil {
 		if err := api.server.haproxy.Apply(&haproxyRuntime{}); err != nil {
 			log.Printf("HAProxy runtime stop failed: %v", err)
+		}
+	}
+	if api.server.sshProxy != nil {
+		if err := api.server.sshProxy.Apply(&extraRuntime{}); err != nil {
+			log.Printf("SSH runtime stop failed: %v", err)
+		}
+	}
+	if api.server.external != nil {
+		if err := api.server.external.Apply(&extraRuntime{}); err != nil {
+			log.Printf("external proxy runtime stop failed: %v", err)
+		}
+	}
+	if api.server.extraVPN != nil {
+		if err := api.server.extraVPN.Apply(&extraRuntime{}); err != nil {
+			log.Printf("extra VPN runtime stop failed: %v", err)
 		}
 	}
 	if err := api.server.ipBlocks.Clear(ctx); err != nil {
@@ -501,6 +510,18 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 	if anyConnectStats := api.server.remoteAccess.CollectUsage("anyconnect"); len(anyConnectStats) > 0 {
 		stats = append(stats, anyConnectStats...)
 	}
+	if api.server.sshProxy != nil {
+		if sshStats := api.server.sshProxy.CollectUsage(); len(sshStats) > 0 {
+			stats = append(stats, sshStats...)
+		}
+		onlineUIDs = append(onlineUIDs, api.server.sshProxy.OnlineUIDs()...)
+	}
+	if api.server.extraVPN != nil {
+		if extraStats := api.server.extraVPN.CollectUsage(); len(extraStats) > 0 {
+			stats = append(stats, extraStats...)
+		}
+		onlineUIDs = append(onlineUIDs, api.server.extraVPN.OnlineUIDs()...)
+	}
 	batchID, pending := api.server.usage.addUsersAndSnapshot(stats)
 	pending = appendOnlineUserMarkers(pending, onlineUIDs)
 	res := &nodev1.UserUsageBatch{BatchId: batchID, OnlineIps: protoOnlineUserIPs(onlineIPs)}
@@ -522,16 +543,20 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 }
 
 func (api *grpcAPI) CollectOnlineUsers(context.Context, *nodev1.Empty) (*nodev1.OnlineUsersResponse, error) {
-	if !api.server.core.Started() {
-		return &nodev1.OnlineUsersResponse{}, nil
+	uids := []string{}
+	if api.server.sshProxy != nil {
+		uids = api.server.sshProxy.OnlineUIDs()
 	}
-	uids, err := xray.QueryOnlineUserUIDs(
-		api.server.settings.XrayAPIHost,
-		api.server.settings.XrayAPIPort,
-		5*time.Second,
-	)
-	if err != nil {
-		return nil, status.Error(codes.Unavailable, err.Error())
+	if api.server.core.Started() {
+		xrayUIDs, err := xray.QueryOnlineUserUIDs(
+			api.server.settings.XrayAPIHost,
+			api.server.settings.XrayAPIPort,
+			5*time.Second,
+		)
+		if err != nil {
+			return nil, status.Error(codes.Unavailable, err.Error())
+		}
+		uids = append(uids, xrayUIDs...)
 	}
 	return &nodev1.OnlineUsersResponse{Uids: uids}, nil
 }
@@ -619,10 +644,11 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if err != nil {
 		return nil, err
 	}
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, haproxyRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, haproxyRuntimeConfig, extraRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
+	prepareTProxyConfig(cfg)
 	if err := s.core.Start(cfg); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -659,6 +685,10 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	if cacheHAProxyRuntime == nil {
 		cacheHAProxyRuntime = s.cachedHAProxyRuntime()
 	}
+	cacheExtraRuntime := extraRuntimeConfig
+	if cacheExtraRuntime == nil {
+		cacheExtraRuntime = s.cachedExtraRuntime()
+	}
 	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -669,12 +699,13 @@ func (s *Server) grpcStartRuntime(ctx context.Context, req *nodev1.RuntimeConfig
 	ikev2Warning := s.applyIKEv2Runtime(cacheIKEv2Runtime)
 	anyConnectWarning := s.applyAnyConnectRuntime(cacheAnyConnectRuntime)
 	haproxyWarning := s.applyHAProxyRuntime(cacheHAProxyRuntime)
-	s.saveConfigCacheWithHAProxy(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheHAProxyRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
+	extraWarning := s.applyExtraRuntime(cacheExtraRuntime)
+	s.saveConfigCacheWithHAProxy(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheHAProxyRuntime, cacheExtraRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
 	message := "runtime started"
 	if sync {
 		message = "runtime config synced"
 	}
-	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning, haproxyWarning); warning != "" {
+	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning, haproxyWarning, extraWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
@@ -685,10 +716,11 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if err != nil {
 		return nil, err
 	}
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, haproxyRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, haproxyRuntimeConfig, extraRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
+	prepareTProxyConfig(cfg)
 	if err := s.core.Restart(cfg); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -725,6 +757,10 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	if cacheHAProxyRuntime == nil {
 		cacheHAProxyRuntime = s.cachedHAProxyRuntime()
 	}
+	cacheExtraRuntime := extraRuntimeConfig
+	if cacheExtraRuntime == nil {
+		cacheExtraRuntime = s.cachedExtraRuntime()
+	}
 	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -735,15 +771,16 @@ func (s *Server) grpcRestartRuntime(ctx context.Context, req *nodev1.RuntimeConf
 	ikev2Warning := s.applyIKEv2Runtime(cacheIKEv2Runtime)
 	anyConnectWarning := s.applyAnyConnectRuntime(cacheAnyConnectRuntime)
 	haproxyWarning := s.applyHAProxyRuntime(cacheHAProxyRuntime)
-	s.saveConfigCacheWithHAProxy(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheHAProxyRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
-	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning, haproxyWarning); warning != "" {
+	extraWarning := s.applyExtraRuntime(cacheExtraRuntime)
+	s.saveConfigCacheWithHAProxy(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheHAProxyRuntime, cacheExtraRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
+	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning, haproxyWarning, extraWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
 }
 
 func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeConfigRequest, message string) (*nodev1.RuntimeActionResponse, error) {
-	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, haproxyRuntimeConfig, err := grpcVPNRuntime(req)
+	runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, haproxyRuntimeConfig, extraRuntimeConfig, err := grpcVPNRuntime(req)
 	if err != nil {
 		return nil, err
 	}
@@ -778,6 +815,10 @@ func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeCo
 	if cacheHAProxyRuntime == nil {
 		cacheHAProxyRuntime = s.cachedHAProxyRuntime()
 	}
+	cacheExtraRuntime := extraRuntimeConfig
+	if cacheExtraRuntime == nil {
+		cacheExtraRuntime = s.cachedExtraRuntime()
+	}
 	if err := s.ov.Apply(cacheRuntime); err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
@@ -788,8 +829,9 @@ func (s *Server) grpcApplyRuntimeOnly(ctx context.Context, req *nodev1.RuntimeCo
 	ikev2Warning := s.applyIKEv2Runtime(cacheIKEv2Runtime)
 	anyConnectWarning := s.applyAnyConnectRuntime(cacheAnyConnectRuntime)
 	haproxyWarning := s.applyHAProxyRuntime(cacheHAProxyRuntime)
-	s.saveConfigCacheWithHAProxy(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheHAProxyRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
-	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning, haproxyWarning); warning != "" {
+	extraWarning := s.applyExtraRuntime(cacheExtraRuntime)
+	s.saveConfigCacheWithHAProxy(req.GetConfigJson(), grpcPeerIP(ctx), cacheRuntime, cacheL2TPRuntime, cachePPTPRuntime, cacheWGRuntime, cacheHAProxyRuntime, cacheExtraRuntime, cacheIKEv2Runtime, cacheAnyConnectRuntime)
+	if warning := joinedWarnings(ikev2PrepareWarning, l2tpWarning, pptpWarning, wgWarning, ikev2Warning, anyConnectWarning, haproxyWarning, extraWarning); warning != "" {
 		message += "; " + warning
 	}
 	return s.grpcAction(req.GetOperationId(), true, message), nil
@@ -902,7 +944,18 @@ func (s *Server) grpcConfig(ctx context.Context, req *nodev1.RuntimeConfigReques
 	return cfg, nil
 }
 
-func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, *pptpRuntime, *wgRuntime, *remoteAccessRuntime, *remoteAccessRuntime, *haproxyRuntime, error) {
+func prepareTProxyConfig(cfg *xray.Config) {
+	if xrayConfigUsesTProxy(cfg) {
+		enableVPNTProxyHostNetworking()
+	}
+}
+
+func xrayConfigUsesTProxy(cfg *xray.Config) bool {
+	raw, err := cfg.JSON()
+	return err == nil && strings.Contains(string(raw), `"tproxy":"tproxy"`)
+}
+
+func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime, *pptpRuntime, *wgRuntime, *remoteAccessRuntime, *remoteAccessRuntime, *haproxyRuntime, *extraRuntime, error) {
 	raw := strings.TrimSpace(req.GetOvRuntimeJson())
 	if raw == "" {
 		return &ovRuntime{Inbounds: []ovRuntimeInbound{}},
@@ -911,7 +964,7 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 			&wgRuntime{Inbounds: []wgRuntimeInbound{}},
 			&remoteAccessRuntime{Inbounds: []remoteAccessRuntimeInbound{}},
 			&remoteAccessRuntime{Inbounds: []remoteAccessRuntimeInbound{}},
-			&haproxyRuntime{}, nil
+			&haproxyRuntime{}, &extraRuntime{Inbounds: []extraRuntimeInbound{}}, nil
 	}
 	var envelope struct {
 		GeneratedAt         string                       `json:"generated_at"`
@@ -929,9 +982,10 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 		AnyConnectInbounds  []remoteAccessRuntimeInbound `json:"anyconnect_inbounds"`
 		AnyConnectGenerated string                       `json:"anyconnect_generated,omitempty"`
 		HAProxy             *haproxyRuntime              `json:"haproxy,omitempty"`
+		Extra               *extraRuntime                `json:"extra,omitempty"`
 	}
 	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
-		return nil, nil, nil, nil, nil, nil, nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
+		return nil, nil, nil, nil, nil, nil, nil, nil, status.Error(codes.InvalidArgument, "failed to decode ov_runtime_json: "+err.Error())
 	}
 	ovRuntimeConfig := &ovRuntime{GeneratedAt: envelope.GeneratedAt, Target: envelope.Target, SessionCallback: envelope.SessionCallback, Inbounds: envelope.Inbounds}
 	if ovRuntimeConfig.Inbounds == nil {
@@ -957,7 +1011,7 @@ func grpcVPNRuntime(req *nodev1.RuntimeConfigRequest) (*ovRuntime, *l2tpRuntime,
 	if anyConnectRuntimeConfig.Inbounds == nil {
 		anyConnectRuntimeConfig.Inbounds = []remoteAccessRuntimeInbound{}
 	}
-	return ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, envelope.HAProxy, nil
+	return ovRuntimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, ikev2RuntimeConfig, anyConnectRuntimeConfig, envelope.HAProxy, envelope.Extra, nil
 }
 
 func (s *Server) grpcAddUser(req *nodev1.InboundUserRequest, message string) (*nodev1.RuntimeActionResponse, error) {
@@ -1100,11 +1154,14 @@ func (s *Server) grpcRuntimeState(message string) *nodev1.RuntimeState {
 			"operation_deduplication",
 			"config_revision",
 			"host_actions",
+			"protocol_statuses",
+			"xray_process_metrics",
 			"tor_proxy",
 			"windscribe_proxy",
 			"psiphon_proxy",
 		},
-		AppliedRevision: s.appliedRevision(),
+		AppliedRevision:  s.appliedRevision(),
+		ProtocolStatuses: s.protocolStatuses(),
 	}
 }
 
@@ -1112,6 +1169,11 @@ func (s *Server) grpcMetrics(message string) *nodev1.MetricsResponse {
 	var snapshot systemSnapshot
 	if s.system != nil {
 		snapshot = s.system.Snapshot()
+	}
+	pid, xrayUptime := s.core.Process()
+	xraySnapshot := processSnapshot{PID: pid, UptimeSec: xrayUptime}
+	if s.system != nil {
+		xraySnapshot = s.system.ProcessSnapshot(pid, xrayUptime)
 	}
 	return &nodev1.MetricsResponse{
 		Runtime: s.grpcRuntimeState(message),
@@ -1127,6 +1189,10 @@ func (s *Server) grpcMetrics(message string) *nodev1.MetricsResponse {
 		Transfer: &nodev1.TransferMetrics{
 			UploadSpeed:   snapshot.Bandwidth.UploadBytesPerSecond,
 			DownloadSpeed: snapshot.Bandwidth.DownloadBytesPerSecond,
+		},
+		Xray: &nodev1.XrayMetrics{
+			Pid: int32(xraySnapshot.PID), CpuUsagePercent: xraySnapshot.CPUUsagePct,
+			MemoryUsed: xraySnapshot.MemoryUsed, UptimeSeconds: xraySnapshot.UptimeSec,
 		},
 		SampledAtUnix: time.Now().Unix(),
 	}

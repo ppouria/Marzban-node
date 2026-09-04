@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Core struct {
@@ -26,6 +27,7 @@ type Core struct {
 	logs           *LogBus
 	version        string
 	debug          bool
+	startedAt      time.Time
 }
 
 const maxConcurrentTestRuntimes = 2
@@ -109,6 +111,15 @@ func (c *Core) Started() bool {
 	return c.running
 }
 
+func (c *Core) Process() (int, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.running || c.cmd == nil || c.cmd.Process == nil {
+		return 0, 0
+	}
+	return c.cmd.Process.Pid, uint64(time.Since(c.startedAt).Seconds())
+}
+
 func (c *Core) Start(config *Config) error {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
@@ -165,6 +176,7 @@ func (c *Core) start(config *Config) error {
 	c.mu.Lock()
 	c.cmd = cmd
 	c.running = true
+	c.startedAt = time.Now()
 	c.mu.Unlock()
 
 	go c.capture(stdout)
@@ -180,6 +192,7 @@ func (c *Core) start(config *Config) error {
 		if c.cmd == cmd {
 			c.running = false
 			c.cmd = nil
+			c.startedAt = time.Time{}
 		}
 		c.mu.Unlock()
 	}()
@@ -198,6 +211,7 @@ func (c *Core) stop() {
 	cmd := c.cmd
 	c.cmd = nil
 	c.running = false
+	c.startedAt = time.Time{}
 	c.mu.Unlock()
 
 	if cmd != nil && cmd.Process != nil {

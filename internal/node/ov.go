@@ -355,6 +355,15 @@ func (m *ovManager) stopInboundName(name string) {
 	if raw, err := os.ReadFile(pidPath); err == nil {
 		if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 1 {
 			_ = exec.Command("kill", strconv.Itoa(pid)).Run()
+			for range 40 {
+				if !processAlive(pid) {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if processAlive(pid) {
+				_ = exec.Command("kill", "-KILL", strconv.Itoa(pid)).Run()
+			}
 		}
 		_ = os.Remove(pidPath)
 	}
@@ -731,6 +740,7 @@ func runInstallCommand(env []string, name string, args ...string) error {
 	if err != nil {
 		return err
 	}
+	args = noninteractivePackageArgs(filepath.Base(command), args)
 	cmd := exec.Command(command, args...)
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
@@ -740,6 +750,18 @@ func runInstallCommand(env []string, name string, args ...string) error {
 		return fmt.Errorf("%s %s: %v: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
 	return nil
+}
+
+func noninteractivePackageArgs(name string, args []string) []string {
+	for _, arg := range args {
+		if name == "apt-get" && arg == "install" {
+			return append([]string{"-o", "Dpkg::Options::=--force-confold"}, args...)
+		}
+		if name == "dpkg" && arg == "--configure" {
+			return append([]string{"--force-confold"}, args...)
+		}
+	}
+	return args
 }
 
 func ovBlockedDestinations() ([]string, []string) {
@@ -881,24 +903,21 @@ func ensureOVDCOSupport() error {
 	if runtime.GOOS != "linux" {
 		return fmt.Errorf("DCO is only supported on Linux nodes")
 	}
-	if !openvpnSupportsDCO() {
-		return fmt.Errorf("installed OpenVPN binary was built without DCO support")
-	}
-	if ovDCOModuleAvailable() {
-		return nil
-	}
 	loadOVDCOModules()
-	if ovDCOModuleAvailable() {
+	if openvpnSupportsDCO() && ovDCOModuleAvailable() {
 		return nil
 	}
 	if err := installOVDCOPackages(); err != nil {
 		return err
 	}
 	loadOVDCOModules()
-	if ovDCOModuleAvailable() {
-		return nil
+	if !openvpnSupportsDCO() {
+		return fmt.Errorf("installed OpenVPN binary was built without DCO support")
 	}
-	return fmt.Errorf("kernel DCO module is unavailable after automatic install")
+	if !ovDCOModuleAvailable() {
+		return fmt.Errorf("kernel DCO module is unavailable after automatic install")
+	}
+	return nil
 }
 
 func openvpnSupportsDCO() bool {
@@ -939,8 +958,18 @@ func installOVDCOPackages() error {
 	kernelRelease := strings.TrimSpace(commandOutput("uname", "-r"))
 	switch {
 	case commandExists("apt-get"):
-		_ = runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update")
-		packages := []string{"dkms", "openvpn-dco-dkms"}
+		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
+			return err
+		}
+		if !aptPackageAvailable("openvpn-dco-dkms") {
+			if err := configureOpenVPN26APTRepository(); err != nil {
+				return err
+			}
+			if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
+				return err
+			}
+		}
+		packages := []string{"openvpn", "dkms", "openvpn-dco-dkms"}
 		if kernelRelease != "" {
 			packages = append([]string{"linux-headers-" + kernelRelease}, packages...)
 		}
@@ -961,6 +990,44 @@ func installOVDCOPackages() error {
 	default:
 		return fmt.Errorf("no supported package manager was found for DCO module install")
 	}
+}
+
+func aptPackageAvailable(name string) bool {
+	output, err := exec.Command("apt-cache", "policy", name).CombinedOutput()
+	return err == nil && bytes.Contains(output, []byte("Candidate:")) && !bytes.Contains(output, []byte("Candidate: (none)"))
+}
+
+func configureOpenVPN26APTRepository() error {
+	arch := map[string]string{"amd64": "amd64", "arm64": "arm64"}[runtime.GOARCH]
+	if arch == "" {
+		return fmt.Errorf("OpenVPN DCO packages are unavailable for %s", runtime.GOARCH)
+	}
+	raw, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return err
+	}
+	codename := ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "VERSION_CODENAME=") {
+			codename = strings.Trim(strings.TrimPrefix(line, "VERSION_CODENAME="), `"'`)
+			break
+		}
+	}
+	if !map[string]bool{"bullseye": true, "bookworm": true, "trixie": true, "focal": true, "jammy": true, "noble": true}[codename] {
+		return fmt.Errorf("OpenVPN DCO packages are unavailable for %s", codename)
+	}
+	key, err := download("https://swupdate.openvpn.net/repos/repo-public.gpg", 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("download OpenVPN repository key: %w", err)
+	}
+	if err := os.MkdirAll("/etc/apt/keyrings", 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile("/etc/apt/keyrings/openvpn-repo-public.asc", key, 0o644); err != nil {
+		return err
+	}
+	source := fmt.Sprintf("deb [arch=%s signed-by=/etc/apt/keyrings/openvpn-repo-public.asc] https://build.openvpn.net/debian/openvpn/release/2.6 %s main\n", arch, codename)
+	return os.WriteFile("/etc/apt/sources.list.d/openvpn-aptrepo.list", []byte(source), 0o644)
 }
 
 func ovDCOInactiveReason(logText string) string {

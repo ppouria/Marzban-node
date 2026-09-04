@@ -19,6 +19,116 @@ permissions:
   contents: write
 
 jobs:
+  build-extra-vpn-assets:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            loader_arch: x86_64
+          - arch: arm64
+            platform: linux/arm64
+            loader_arch: aarch64
+    steps:
+      - uses: docker/setup-qemu-action@v3
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: amnezia-vpn/amneziawg-go
+          ref: b5928efb6ca19f0153958460c3d141f04abc5c2e
+          path: amneziawg-go
+      - uses: actions/checkout@v4
+        with:
+          repository: amnezia-vpn/amneziawg-tools
+          ref: ee0f0a9aa34ff0a0da4b3433b9512781cfe02843
+          path: amneziawg-tools
+      - name: Build official AmneziaWG and SSTP runtime assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm --platform "${{ matrix.platform }}" \
+            -e CGO_ENABLED=0 -e ASSET_ARCH="${{ matrix.arch }}" \
+            -v "$PWD/amneziawg-go:/src:ro" -v "$PWD/dist:/out" golang:1.25-alpine sh -euxc '
+              cp -a /src /build && cd /build
+              go build -trimpath -ldflags="-s -w" -o "/out/rebecca-amneziawg-go-linux-${ASSET_ARCH}" .
+            '
+          docker run --rm --platform "${{ matrix.platform }}" \
+            -e ASSET_ARCH="${{ matrix.arch }}" \
+            -v "$PWD/amneziawg-tools:/src:ro" -v "$PWD/dist:/out" alpine:3.22 sh -euxc '
+              apk add --no-cache build-base linux-headers >/dev/null
+              cp -a /src /build && cd /build/src
+              make WITH_WGQUICK=no WITH_BASHCOMPLETION=no WITH_SYSTEMDUNITS=no LDFLAGS=-static
+              strip wg
+              cp wg "/out/rebecca-amneziawg-tools-linux-${ASSET_ARCH}"
+            '
+          docker run --rm --platform "${{ matrix.platform }}" \
+            -e ASSET_ARCH="${{ matrix.arch }}" -e ARCH="${{ matrix.loader_arch }}" \
+            -v "$PWD/tools/build-accel-bundle.sh:/build.sh:ro" -v "$PWD/dist:/out" alpine:3.22 sh /build.sh
+          sudo chown -R "$USER:$USER" dist
+          for file in dist/rebecca-*-linux-${{ matrix.arch }}*; do
+            [[ "$file" == *.sha256 ]] || sha256sum "$file" > "${file}.sha256"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rebecca-extra-vpn-linux-${{ matrix.arch }}
+          path: dist/rebecca-*
+
+  build-patched-telemt:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            rust_arch: x86_64
+          - arch: arm64
+            platform: linux/arm64
+            rust_arch: aarch64
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Checkout patched telemt
+        uses: actions/checkout@v4
+        with:
+          repository: Sir-MmD/telemt
+          ref: 1e6549df23136a676ef8ec36ef0f1d9af2a1083d
+          path: telemt
+
+      - name: Build patched telemt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm --platform "${{ matrix.platform }}" \
+            -e RUST_ARCH="${{ matrix.rust_arch }}" \
+            -v "$PWD/telemt:/src:ro" -v "$PWD/dist:/out" rust:alpine sh -euxc '
+              apk add --no-cache build-base musl-dev pkgconf cmake perl >/dev/null
+              cp -a /src /build && cd /build
+              grep -q user_modes src/config/types.rs
+              grep -q socks_user_from_account src/config/types.rs
+              grep -q "cfg.general.modes = new.general.modes" src/config/hot_reload.rs
+              export RUSTFLAGS="-C target-feature=+crt-static"
+              target="${RUST_ARCH}-unknown-linux-musl"
+              cargo build --release --locked --target "$target"
+              cp "target/$target/release/telemt" "/out/rebecca-telemt-linux-${{ matrix.arch }}"
+            '
+          sudo chown "$USER:$USER" "dist/rebecca-telemt-linux-${{ matrix.arch }}"
+          sha256sum "dist/rebecca-telemt-linux-${{ matrix.arch }}" > \
+            "dist/rebecca-telemt-linux-${{ matrix.arch }}.sha256"
+
+      - name: Upload patched telemt artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebecca-telemt-linux-${{ matrix.arch }}
+          path: |
+            dist/rebecca-telemt-linux-${{ matrix.arch }}
+            dist/rebecca-telemt-linux-${{ matrix.arch }}.sha256
+
   build-linux:
     runs-on: ubuntu-latest
     env:
@@ -203,6 +313,8 @@ jobs:
   publish-release:
     runs-on: ubuntu-latest
     needs:
+      - build-extra-vpn-assets
+      - build-patched-telemt
       - build-linux
       - build-windows-amd64
     if: github.event_name == 'release' || github.ref_type == 'tag'
@@ -223,7 +335,7 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: rebecca-node-binaries-*
+          pattern: rebecca-*
           path: release-assets
           merge-multiple: true
 
@@ -238,11 +350,13 @@ jobs:
           gh release view "${RELEASE_TAG}" >/dev/null 2>&1 || \
             gh release create "${RELEASE_TAG}" --title "${RELEASE_TAG}" --notes "Rebecca Node ${RELEASE_TAG}"
           gh release delete-asset "${RELEASE_TAG}" rebecca-node -y >/dev/null 2>&1 || true
-          gh release upload "${RELEASE_TAG}" release-assets/rebecca-node-* --clobber
+          gh release upload "${RELEASE_TAG}" release-assets/rebecca-* --clobber
 
   publish-dev-binaries:
     runs-on: ubuntu-latest
     needs:
+      - build-extra-vpn-assets
+      - build-patched-telemt
       - build-linux
       - build-windows-amd64
     if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
@@ -251,7 +365,7 @@ jobs:
       - name: Download dev artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: rebecca-node-binaries-*
+          pattern: rebecca-*
           path: release-assets
           merge-multiple: true
 
@@ -274,6 +388,34 @@ jobs:
           for file in release-assets/rebecca-node-*-windows-amd64.exe; do
             [[ "$file" == *.sha256 ]] && continue
             dest="dev-assets/rebecca-node-dev-windows-amd64.exe"
+            cp "$file" "$dest"
+            sha256sum "$dest" > "${dest}.sha256"
+          done
+
+          for file in release-assets/rebecca-telemt-linux-*; do
+            [[ "$file" == *.sha256 ]] && continue
+            arch="${file##*-linux-}"
+            dest="dev-assets/rebecca-telemt-dev-linux-${arch}"
+            cp "$file" "$dest"
+            sha256sum "$dest" > "${dest}.sha256"
+          done
+
+          for file in release-assets/rebecca-amneziawg-*-linux-*; do
+            [[ "$file" == *.sha256 ]] && continue
+            base="$(basename "$file")"
+            name="${base#rebecca-}"
+            component="${name%%-linux-*}"
+            arch="${base##*-linux-}"
+            dest="dev-assets/rebecca-${component}-dev-linux-${arch}"
+            cp "$file" "$dest"
+            sha256sum "$dest" > "${dest}.sha256"
+          done
+
+          for file in release-assets/rebecca-accel-ppp-linux-*.tar.gz; do
+            base="$(basename "$file")"
+            arch="${base#rebecca-accel-ppp-linux-}"
+            arch="${arch%.tar.gz}"
+            dest="dev-assets/rebecca-accel-ppp-dev-linux-${arch}.tar.gz"
             cp "$file" "$dest"
             sha256sum "$dest" > "${dest}.sha256"
           done

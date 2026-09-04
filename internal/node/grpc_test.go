@@ -25,15 +25,33 @@ import (
 )
 
 func TestGRPCVPNRuntimeClearsMissingAuxiliaryState(t *testing.T) {
-	ov, l2tp, pptp, wg, ikev2, anyConnect, haproxy, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{})
+	ov, l2tp, pptp, wg, ikev2, anyConnect, haproxy, extra, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ov == nil || l2tp == nil || pptp == nil || wg == nil || ikev2 == nil || anyConnect == nil || haproxy == nil {
+	if ov == nil || l2tp == nil || pptp == nil || wg == nil || ikev2 == nil || anyConnect == nil || haproxy == nil || extra == nil {
 		t.Fatal("missing runtime payload must clear every auxiliary runtime")
 	}
 	if len(ov.Inbounds)+len(l2tp.Inbounds)+len(pptp.Inbounds)+len(wg.Inbounds)+len(ikev2.Inbounds)+len(anyConnect.Inbounds) != 0 {
 		t.Fatal("missing runtime payload must not restore cached auxiliary inbounds")
+	}
+}
+
+func TestXrayConfigUsesTProxy(t *testing.T) {
+	for _, test := range []struct {
+		raw  string
+		want bool
+	}{
+		{`{"inbounds":[{"streamSettings":{"sockopt":{"tproxy":"tproxy"}}}]}`, true},
+		{`{"inbounds":[{"streamSettings":{"sockopt":{"tproxy":"off"}}}]}`, false},
+	} {
+		cfg, err := xray.NewConfig(test.raw, "127.0.0.1", appconfig.Settings{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := xrayConfigUsesTProxy(cfg); got != test.want {
+			t.Fatalf("xrayConfigUsesTProxy() = %v, want %v", got, test.want)
+		}
 	}
 }
 
@@ -47,7 +65,7 @@ func TestGRPCVPNRuntimeCarriesManagedHAProxyCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, _, _, _, runtime, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{OvRuntimeJson: string(payload)})
+	_, _, _, _, _, _, runtime, _, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{OvRuntimeJson: string(payload)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +74,76 @@ func TestGRPCVPNRuntimeCarriesManagedHAProxyCertificate(t *testing.T) {
 	}
 	if _, err := tls.X509KeyPair([]byte(runtime.Sites[0].CertificatePEM), []byte(runtime.Sites[0].PrivateKeyPEM)); err != nil {
 		t.Fatalf("transferred managed certificate cannot be loaded: %v", err)
+	}
+}
+
+func TestGRPCVPNRuntimeCarriesAdditionalProxyState(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{"extra": extraRuntime{Inbounds: []extraRuntimeInbound{{
+		Tag: "ssh", Protocol: "ssh", Listen: "127.0.0.1", Port: 2222,
+		Users: []extraRuntimeUser{{UserID: 7, Username: "alice", Password: "secret"}},
+	}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, _, _, _, runtime, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{OvRuntimeJson: string(payload)})
+	if err != nil || runtime == nil || len(runtime.Inbounds) != 1 || runtime.Inbounds[0].Users[0].Username != "alice" {
+		t.Fatalf("additional proxy runtime was lost: runtime=%#v err=%v", runtime, err)
+	}
+}
+
+func TestRestartRuntimeRestartsUnchangedConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	runsPath := filepath.Join(tempDir, "runs")
+	executable := filepath.Join(tempDir, "xray")
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\nif [ \"$1\" = version ]; then echo 'Xray 1.0.0'; exit 0; fi\necho $$ >> \"$XRAY_TEST_RUNS\"\ncat >/dev/null\nwhile :; do sleep 1; done\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XRAY_TEST_RUNS", runsPath)
+	settings := appconfig.Settings{
+		RebeccaDataDir:     tempDir,
+		XrayExecutablePath: executable,
+		XrayAssetsPath:     tempDir,
+		XrayLogDir:         tempDir,
+		XrayAPIHost:        "127.0.0.1",
+		XrayAPIPort:        10085,
+	}
+	core, err := xray.NewCore(executable, tempDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer core.Stop()
+	configJSON := `{"inbounds":[],"outbounds":[]}`
+	cfg, err := xray.NewConfig(configJSON, "127.0.0.1", settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := core.Start(cfg); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if runs, _ := os.ReadFile(runsPath); len(strings.Fields(string(runs))) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("initial Xray process did not start")
+		}
+	}
+	server := &Server{settings: settings, core: core, sessions: make(map[string]time.Time)}
+	server.saveConfigCache(configJSON, "127.0.0.1", nil, nil, nil, nil)
+
+	response, err := (&grpcAPI{server: server}).RestartRuntime(context.Background(), &nodev1.RuntimeConfigRequest{ConfigJson: configJSON})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.GetAccepted() || response.GetMessage() != "runtime restarted" {
+		t.Fatalf("unexpected restart response: %#v", response)
+	}
+	runs, err := os.ReadFile(runsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(strings.Fields(string(runs))); got != 2 {
+		t.Fatalf("unchanged config started Xray %d times, want 2", got)
 	}
 }
 

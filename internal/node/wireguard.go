@@ -252,10 +252,11 @@ func (m *wgManager) markPeerLimited(inboundTag string, publicKey string, limit i
 }
 
 type wgSessionState struct {
-	UserID    int64  `json:"user_id"`
-	SessionID string `json:"session_id"`
-	Address   string `json:"address,omitempty"`
-	ClientIP  string `json:"client_ip,omitempty"`
+	UserID            int64  `json:"user_id"`
+	SessionID         string `json:"session_id"`
+	Address           string `json:"address,omitempty"`
+	ClientIP          string `json:"client_ip,omitempty"`
+	LastHandshakeUnix int64  `json:"last_handshake_unix,omitempty"`
 }
 
 func (m *wgManager) syncPeerSessions(client *wgctrl.Client, iface string, inbound wgRuntimeInbound, device *wgtypes.Device, peerByKey map[string]wgRuntimePeer, callback *vpnSessionCallback) {
@@ -278,8 +279,9 @@ func (m *wgManager) syncPeerSessions(client *wgctrl.Client, iface string, inboun
 		}
 		sessionID := "wg:" + iface + ":" + key
 		clientIP := wgPeerEndpointIP(devicePeer.Endpoint)
-		state := wgSessionState{UserID: runtimePeer.UserID, SessionID: sessionID, Address: runtimePeer.Address, ClientIP: clientIP}
-		if _, ok := previous[key]; !ok {
+		state := wgSessionState{UserID: runtimePeer.UserID, SessionID: sessionID, Address: runtimePeer.Address, ClientIP: clientIP, LastHandshakeUnix: devicePeer.LastHandshakeTime.Unix()}
+		previousState, existed := previous[key]
+		if !existed {
 			event := vpnSessionEvent{
 				UserID:     runtimePeer.UserID,
 				Protocol:   "wg",
@@ -295,6 +297,16 @@ func (m *wgManager) syncPeerSessions(client *wgctrl.Client, iface string, inboun
 				delete(present, key)
 				continue
 			}
+		} else if wgHandshakeAdvanced(previousState.LastHandshakeUnix, state.LastHandshakeUnix) {
+			go vpnNotifySession(callback, vpnSessionEvent{
+				UserID:     runtimePeer.UserID,
+				Protocol:   "wg",
+				InboundTag: inbound.Tag,
+				SessionID:  sessionID,
+				AssignedIP: wgPeerAddressHost(runtimePeer.Address),
+				ClientIP:   clientIP,
+				Event:      "seen",
+			})
 		}
 		current[key] = state
 	}
@@ -315,6 +327,8 @@ func (m *wgManager) syncPeerSessions(client *wgctrl.Client, iface string, inboun
 	m.restoreAvailablePeers(client, iface, inbound, present)
 	m.saveActiveSessions(iface, current)
 }
+
+func wgHandshakeAdvanced(previous, current int64) bool { return current > previous }
 
 func (m *wgManager) removePeer(client *wgctrl.Client, iface string, key wgtypes.Key) {
 	if client == nil || strings.TrimSpace(iface) == "" {
@@ -884,9 +898,7 @@ func wgEnsureLink(ctx context.Context, iface, serverAddress string, mtu int) err
 		}
 	}
 	threadedPath := filepath.Join("/sys/class/net", iface, "threaded")
-	if err := os.WriteFile(threadedPath, []byte("0"), 0o644); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("disable threaded NAPI on %s: %w", iface, err)
-	}
+	_ = os.WriteFile(threadedPath, []byte("0"), 0o644)
 	if mtu > 0 {
 		if out, err := wgRunIP(ctx, "link", "set", "dev", iface, "mtu", strconv.Itoa(mtu)); err != nil {
 			return fmt.Errorf("set mtu on %s: %v: %s", iface, err, strings.TrimSpace(out))

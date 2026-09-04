@@ -243,7 +243,7 @@ func (m *l2tpManager) stop() {
 	_ = updateManagedBlock("/etc/ipsec.secrets", "# BEGIN REBECCA L2TP IPSEC", "# END REBECCA L2TP IPSEC", "")
 	_ = runOptional("ipsec", "rereadsecrets")
 	_ = runOptional("ipsec", "reload")
-	_ = runOptional("systemctl", "stop", "xl2tpd")
+	stopL2TPService()
 	if nft, err := exec.LookPath("nft"); err == nil {
 		_ = exec.Command(nft, "delete", "table", "inet", "rebecca_l2tp").Run()
 	}
@@ -887,6 +887,11 @@ func ensureL2TPPrerequisites() error {
 	if runtime.GOOS != "linux" {
 		return nil
 	}
+	if commandExists("dpkg-query") && commandExists("ipsec") && !l2tpDebianPackagesReady() {
+		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "dpkg", "--configure", "strongswan-starter", "strongswan"); err != nil {
+			return err
+		}
+	}
 	missing := missingExecutables("ipsec", "xl2tpd", "pppd", "nft", "ip", "iptables")
 	if len(missing) > 0 {
 		if err := installL2TPPackages(); err != nil {
@@ -909,6 +914,16 @@ func ensureL2TPPrerequisites() error {
 	return nil
 }
 
+func l2tpDebianPackagesReady() bool {
+	for _, name := range []string{"strongswan-starter", "strongswan"} {
+		output, err := exec.Command("dpkg-query", "-W", "-f=${db:Status-Abbrev}", name).CombinedOutput()
+		if err != nil || !strings.HasPrefix(string(output), "ii ") {
+			return false
+		}
+	}
+	return true
+}
+
 func installL2TPPackages() error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("L2TP prerequisites are missing and automatic install requires root")
@@ -916,7 +931,9 @@ func installL2TPPackages() error {
 	switch {
 	case commandExists("apt-get"):
 		if commandExists("dpkg") {
-			_ = runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "dpkg", "--configure", "-a")
+			if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "dpkg", "--configure", "-a"); err != nil {
+				return err
+			}
 		}
 		if err := runInstallCommand([]string{"DEBIAN_FRONTEND=noninteractive"}, "apt-get", "update"); err != nil {
 			return err
@@ -1000,12 +1017,29 @@ func restartL2TPServices() error {
 			return err
 		}
 	}
+	stopL2TPService()
 	if commandExists("systemctl") {
-		if err := runOptional("systemctl", "restart", "xl2tpd"); err == nil {
+		if err := runOptional("systemctl", "start", "xl2tpd"); err == nil {
 			return nil
 		}
 	}
-	return runOptional("service", "xl2tpd", "restart")
+	return runOptional("service", "xl2tpd", "start")
+}
+
+func stopL2TPService() {
+	if commandExists("systemctl") {
+		_ = runOptional("systemctl", "stop", "xl2tpd")
+	} else {
+		_ = runOptional("service", "xl2tpd", "stop")
+	}
+	_ = exec.Command("pkill", "-TERM", "-x", "xl2tpd").Run()
+	for range 40 {
+		if exec.Command("pgrep", "-x", "xl2tpd").Run() != nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = exec.Command("pkill", "-KILL", "-x", "xl2tpd").Run()
 }
 
 func l2tpSystemConfigSnapshot() string {

@@ -174,6 +174,10 @@ func enableVPNTProxyHostNetworking(pools ...string) {
 		return
 	}
 	enableVPNForwarding()
+	if _, err := os.Stat("/proc/sys/net/mptcp/enabled"); err == nil {
+		_ = os.WriteFile("/proc/sys/net/mptcp/enabled", []byte("0\n"), 0o644)
+		_ = os.WriteFile("/etc/sysctl.d/99-rebecca-vpn-tproxy.conf", []byte("net.mptcp.enabled=0\n"), 0o644)
+	}
 	if modprobe, err := exec.LookPath("modprobe"); err == nil {
 		for _, module := range []string{"nf_tproxy_ipv4", "nf_conntrack"} {
 			_ = exec.Command(modprobe, module).Run()

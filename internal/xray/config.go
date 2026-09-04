@@ -29,6 +29,19 @@ func (c *Config) JSON() ([]byte, error) {
 	return json.Marshal(c.data)
 }
 
+func (c *Config) InboundCount() int {
+	inbounds, _ := c.data["inbounds"].([]any)
+	count := 0
+	for _, value := range inbounds {
+		inbound, _ := value.(map[string]any)
+		if tag, _ := inbound["tag"].(string); strings.EqualFold(tag, "API") {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
 func (c *Config) AccessLogPath() string {
 	logConfig, ok := c.data["log"].(map[string]any)
 	if !ok {
