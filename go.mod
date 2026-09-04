@@ -8,6 +8,7 @@ require (
 
 require (
 	github.com/xtls/xray-core v1.260327.0
+	golang.org/x/crypto v0.49.0
 	golang.org/x/net v0.52.0
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20241231184526-a9ab2273dd10
 	google.golang.org/protobuf v1.36.11
@@ -30,7 +31,6 @@ require (
 	github.com/refraction-networking/utls v1.8.3-0.20260301010127-aa6edf4b11af // indirect
 	github.com/sagernet/sing v0.5.1 // indirect
 	github.com/xtls/reality v0.0.0-20260322125925-9234c772ba8f // indirect
-	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect

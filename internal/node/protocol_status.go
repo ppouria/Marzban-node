@@ -123,6 +123,25 @@ func (s *Server) protocolStatuses() []*nodev1.ProtocolStatus {
 		}
 	}
 	statuses = append(statuses, protocolState("haproxy", haproxyConfigured, haproxyRunning, ""))
+	sshConfigured, sshRunning := 0, 0
+	if s.sshProxy != nil {
+		sshConfigured, sshRunning = s.sshProxy.State()
+	}
+	statuses = append(statuses, protocolState("ssh", sshConfigured, sshRunning, ""))
+	for _, protocol := range []string{"mtproto", "web"} {
+		configured, running := 0, 0
+		if s.external != nil {
+			configured, running = s.external.State(protocol)
+		}
+		statuses = append(statuses, protocolState(protocol, configured, running, ""))
+	}
+	for _, protocol := range []string{"sstp", "amneziawg", "gre"} {
+		configured, running := 0, 0
+		if s.extraVPN != nil {
+			configured, running = s.extraVPN.State(protocol)
+		}
+		statuses = append(statuses, protocolState(protocol, configured, running, ""))
+	}
 	return statuses
 }
 

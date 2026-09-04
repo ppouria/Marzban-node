@@ -25,11 +25,11 @@ import (
 )
 
 func TestGRPCVPNRuntimeClearsMissingAuxiliaryState(t *testing.T) {
-	ov, l2tp, pptp, wg, ikev2, anyConnect, haproxy, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{})
+	ov, l2tp, pptp, wg, ikev2, anyConnect, haproxy, extra, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ov == nil || l2tp == nil || pptp == nil || wg == nil || ikev2 == nil || anyConnect == nil || haproxy == nil {
+	if ov == nil || l2tp == nil || pptp == nil || wg == nil || ikev2 == nil || anyConnect == nil || haproxy == nil || extra == nil {
 		t.Fatal("missing runtime payload must clear every auxiliary runtime")
 	}
 	if len(ov.Inbounds)+len(l2tp.Inbounds)+len(pptp.Inbounds)+len(wg.Inbounds)+len(ikev2.Inbounds)+len(anyConnect.Inbounds) != 0 {
@@ -65,7 +65,7 @@ func TestGRPCVPNRuntimeCarriesManagedHAProxyCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, _, _, _, runtime, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{OvRuntimeJson: string(payload)})
+	_, _, _, _, _, _, runtime, _, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{OvRuntimeJson: string(payload)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,6 +74,20 @@ func TestGRPCVPNRuntimeCarriesManagedHAProxyCertificate(t *testing.T) {
 	}
 	if _, err := tls.X509KeyPair([]byte(runtime.Sites[0].CertificatePEM), []byte(runtime.Sites[0].PrivateKeyPEM)); err != nil {
 		t.Fatalf("transferred managed certificate cannot be loaded: %v", err)
+	}
+}
+
+func TestGRPCVPNRuntimeCarriesAdditionalProxyState(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{"extra": extraRuntime{Inbounds: []extraRuntimeInbound{{
+		Tag: "ssh", Protocol: "ssh", Listen: "127.0.0.1", Port: 2222,
+		Users: []extraRuntimeUser{{UserID: 7, Username: "alice", Password: "secret"}},
+	}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, _, _, _, runtime, err := grpcVPNRuntime(&nodev1.RuntimeConfigRequest{OvRuntimeJson: string(payload)})
+	if err != nil || runtime == nil || len(runtime.Inbounds) != 1 || runtime.Inbounds[0].Users[0].Username != "alice" {
+		t.Fatalf("additional proxy runtime was lost: runtime=%#v err=%v", runtime, err)
 	}
 }
 

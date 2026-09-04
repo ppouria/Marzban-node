@@ -38,6 +38,9 @@ type Server struct {
 	wg           *wgManager
 	remoteAccess *remoteAccessManager
 	haproxy      *haproxyManager
+	sshProxy     *sshProxyManager
+	external     *externalProxyManager
+	extraVPN     *extraVPNManager
 	ipBlocks     *sourceIPBlocker
 	usage        *usageBuffer
 	system       *systemSampler
@@ -88,12 +91,15 @@ func New(settings appconfig.Settings) (*Server, error) {
 		wg:           newWGManager(settings.RebeccaDataDir, settings.InstallMode),
 		remoteAccess: newRemoteAccessManager(settings.RebeccaDataDir, settings.InstallMode),
 		haproxy:      newHAProxyManager(settings.RebeccaDataDir),
+		sshProxy:     newSSHProxyManager(settings.RebeccaDataDir),
 		ipBlocks:     newSourceIPBlocker(settings.RebeccaDataDir, settings.InstallMode),
 		usage:        usage,
 		system:       newSystemSampler(),
 		operations:   newOperationDeduper(filepath.Join(settings.RebeccaDataDir, "operation-receipts.json")),
 		sessions:     make(map[string]time.Time),
 	}
+	server.external = newExternalProxyManager(settings.RebeccaDataDir, server.updateChannel)
+	server.extraVPN = newExtraVPNManager(settings.RebeccaDataDir, settings.InstallMode, server.updateChannel)
 	// Auxiliary VPN state is authoritative on the master. Never resurrect stale
 	// WireGuard peers from disk while waiting for the first full sync.
 	if err := server.wg.Apply(&wgRuntime{Inbounds: []wgRuntimeInbound{}}); err != nil {
@@ -121,6 +127,16 @@ func (s *Server) snapshotRunningUsage() {
 	}
 	if stats := s.remoteAccess.CollectUsage("anyconnect"); len(stats) > 0 {
 		s.usage.addUsers(stats)
+	}
+	if s.sshProxy != nil {
+		if stats := s.sshProxy.CollectUsage(); len(stats) > 0 {
+			s.usage.addUsers(stats)
+		}
+	}
+	if s.extraVPN != nil {
+		if stats := s.extraVPN.CollectUsage(); len(stats) > 0 {
+			s.usage.addUsers(stats)
+		}
 	}
 	if !s.core.Started() {
 		return
@@ -212,6 +228,7 @@ type cachedConfigPayload struct {
 	IKEv2Runtime      *remoteAccessRuntime `json:"ikev2_runtime,omitempty"`
 	AnyConnectRuntime *remoteAccessRuntime `json:"anyconnect_runtime,omitempty"`
 	HAProxyRuntime    *haproxyRuntime      `json:"haproxy_runtime,omitempty"`
+	ExtraRuntime      *extraRuntime        `json:"extra_runtime,omitempty"`
 }
 
 func (s *Server) configCachePath() string {
@@ -219,10 +236,10 @@ func (s *Server) configCachePath() string {
 }
 
 func (s *Server) saveConfigCache(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime, pptpRuntimeConfig *pptpRuntime, wgRuntimeConfig *wgRuntime, remoteRuntimes ...*remoteAccessRuntime) {
-	s.saveConfigCacheWithHAProxy(rawConfig, peerIP, runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, s.cachedHAProxyRuntime(), remoteRuntimes...)
+	s.saveConfigCacheWithHAProxy(rawConfig, peerIP, runtimeConfig, l2tpRuntimeConfig, pptpRuntimeConfig, wgRuntimeConfig, s.cachedHAProxyRuntime(), s.cachedExtraRuntime(), remoteRuntimes...)
 }
 
-func (s *Server) saveConfigCacheWithHAProxy(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime, pptpRuntimeConfig *pptpRuntime, wgRuntimeConfig *wgRuntime, haproxyRuntimeConfig *haproxyRuntime, remoteRuntimes ...*remoteAccessRuntime) {
+func (s *Server) saveConfigCacheWithHAProxy(rawConfig string, peerIP string, runtimeConfig *ovRuntime, l2tpRuntimeConfig *l2tpRuntime, pptpRuntimeConfig *pptpRuntime, wgRuntimeConfig *wgRuntime, haproxyRuntimeConfig *haproxyRuntime, extraRuntimeConfig *extraRuntime, remoteRuntimes ...*remoteAccessRuntime) {
 	if strings.TrimSpace(rawConfig) == "" {
 		return
 	}
@@ -237,7 +254,7 @@ func (s *Server) saveConfigCacheWithHAProxy(rawConfig string, peerIP string, run
 	if cached, ok := s.loadConfigCache(); ok {
 		appliedRevision = cached.AppliedRevision
 	}
-	payload, err := json.Marshal(cachedConfigPayload{AppliedRevision: appliedRevision, Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig, WGRuntime: wgRuntimeConfig, IKEv2Runtime: ikev2Runtime, AnyConnectRuntime: anyConnectRuntime, HAProxyRuntime: haproxyRuntimeConfig})
+	payload, err := json.Marshal(cachedConfigPayload{AppliedRevision: appliedRevision, Config: rawConfig, PeerIP: peerIP, OVRuntime: runtimeConfig, L2TPRuntime: l2tpRuntimeConfig, PPTPRuntime: pptpRuntimeConfig, WGRuntime: wgRuntimeConfig, IKEv2Runtime: ikev2Runtime, AnyConnectRuntime: anyConnectRuntime, HAProxyRuntime: haproxyRuntimeConfig, ExtraRuntime: extraRuntimeConfig})
 	if err != nil {
 		return
 	}
@@ -389,6 +406,14 @@ func (s *Server) cachedHAProxyRuntime() *haproxyRuntime {
 	return payload.HAProxyRuntime
 }
 
+func (s *Server) cachedExtraRuntime() *extraRuntime {
+	payload, ok := s.loadConfigCache()
+	if !ok {
+		return nil
+	}
+	return payload.ExtraRuntime
+}
+
 func (s *Server) applyL2TPRuntime(runtimeConfig *l2tpRuntime) string {
 	if err := s.l2tp.Apply(runtimeConfig); err != nil {
 		warning := "L2TP runtime apply failed: " + err.Error()
@@ -461,6 +486,51 @@ func (s *Server) applyHAProxyRuntime(runtimeConfig *haproxyRuntime) string {
 	return ""
 }
 
+func (s *Server) applyExtraRuntime(runtimeConfig *extraRuntime) string {
+	warnings := []string{}
+	hasSSH, hasExternal, hasExtraVPN := false, false, false
+	if runtimeConfig != nil {
+		for _, inbound := range runtimeConfig.Inbounds {
+			switch strings.ToLower(strings.TrimSpace(inbound.Protocol)) {
+			case "ssh":
+				hasSSH = true
+			case "mtproto", "web":
+				hasExternal = true
+			case "sstp", "amneziawg", "gre":
+				hasExtraVPN = true
+			}
+		}
+	}
+	if s.sshProxy == nil {
+		if hasSSH {
+			warnings = append(warnings, "SSH runtime apply failed: SSH manager is unavailable")
+		}
+	} else if err := s.sshProxy.Apply(runtimeConfig); err != nil {
+		warning := "SSH runtime apply failed: " + err.Error()
+		log.Print(warning)
+		warnings = append(warnings, warning)
+	}
+	if s.external == nil {
+		if hasExternal {
+			warnings = append(warnings, "external proxy runtime apply failed: manager is unavailable")
+		}
+	} else if err := s.external.Apply(runtimeConfig); err != nil {
+		warning := "external proxy runtime apply failed: " + err.Error()
+		log.Print(warning)
+		warnings = append(warnings, warning)
+	}
+	if s.extraVPN == nil {
+		if hasExtraVPN {
+			warnings = append(warnings, "extra VPN runtime apply failed: manager is unavailable")
+		}
+	} else if err := s.extraVPN.Apply(runtimeConfig); err != nil {
+		warning := "extra VPN runtime apply failed: " + err.Error()
+		log.Print(warning)
+		warnings = append(warnings, warning)
+	}
+	return joinedWarnings(warnings...)
+}
+
 func joinedWarnings(values ...string) string {
 	parts := make([]string, 0, len(values))
 	for _, value := range values {
@@ -506,6 +576,7 @@ func (s *Server) startCachedConfig() {
 	s.applyIKEv2Runtime(payload.IKEv2Runtime)
 	s.applyAnyConnectRuntime(payload.AnyConnectRuntime)
 	s.applyHAProxyRuntime(payload.HAProxyRuntime)
+	s.applyExtraRuntime(payload.ExtraRuntime)
 }
 
 type downloadFile struct {
