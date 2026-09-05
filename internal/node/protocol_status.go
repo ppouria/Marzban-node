@@ -37,10 +37,6 @@ func (s *Server) protocolStatuses() []*nodev1.ProtocolStatus {
 	xrayRunning := 0
 	if s.core.Started() {
 		xrayRunning = xrayInbounds
-		if xrayInbounds == 0 {
-			xrayRunning = 1
-			xrayInbounds = 1
-		}
 	}
 	statuses := []*nodev1.ProtocolStatus{protocolState("xray", xrayInbounds, xrayRunning, s.core.Version())}
 

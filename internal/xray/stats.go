@@ -295,6 +295,8 @@ type onlineIPTask struct {
 	uid       string
 }
 
+const maxOnlineIPLookups = 512
+
 func queryOnlineUserIPs(ctx context.Context, client onlineIPStatsClient, names []string) ([]OnlineUserIP, error) {
 	tasks := make([]onlineIPTask, 0, len(names))
 	for _, name := range names {
@@ -310,6 +312,11 @@ func queryOnlineUserIPs(ctx context.Context, client onlineIPStatsClient, names [
 	}
 	if len(tasks) == 0 {
 		return nil, nil
+	}
+	if len(tasks) > maxOnlineIPLookups {
+		// The UID list is the authoritative online signal. IP lookups are
+		// supplementary and one RPC per user overwhelms Xray on large nodes.
+		tasks = tasks[:maxOnlineIPLookups]
 	}
 	jobs := make(chan onlineIPTask, len(tasks))
 	results := make(chan OnlineUserIP, len(tasks))
