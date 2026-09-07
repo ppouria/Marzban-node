@@ -311,6 +311,8 @@ func (api *grpcAPI) Metrics(ctx context.Context, _ *nodev1.MetricsRequest) (*nod
 }
 
 func (api *grpcAPI) UpdateRuntime(ctx context.Context, req *nodev1.RuntimeUpdateRequest) (*nodev1.RuntimeActionResponse, error) {
+	api.server.runtimeMu.Lock()
+	defer api.server.runtimeMu.Unlock()
 	if err := api.server.grpcUpdateRuntime(req.GetVersion()); err != nil {
 		return nil, err
 	}
@@ -318,6 +320,8 @@ func (api *grpcAPI) UpdateRuntime(ctx context.Context, req *nodev1.RuntimeUpdate
 }
 
 func (api *grpcAPI) UpdateGeo(ctx context.Context, req *nodev1.GeoUpdateRequest) (*nodev1.RuntimeActionResponse, error) {
+	api.server.runtimeMu.Lock()
+	defer api.server.runtimeMu.Unlock()
 	files := make([]downloadFile, 0, len(req.GetFiles()))
 	for _, file := range req.GetFiles() {
 		files = append(files, downloadFile{Name: file.GetName(), URL: file.GetUrl()})
@@ -478,18 +482,22 @@ func (api *grpcAPI) CollectUserUsage(ctx context.Context, req *nodev1.CollectUsa
 	var onlineUIDs []string
 	var onlineIPs []xray.OnlineUserIP
 	if api.server.core.Started() {
-		var err error
-		stats, speeds, err = api.server.collectXrayUserStats(30*time.Second, req.GetReset_())
-		if err != nil {
-			return nil, status.Error(codes.Unavailable, err.Error())
+		var statsErr error
+		stats, speeds, statsErr = api.server.collectXrayUserStats(30*time.Second, req.GetReset_())
+		if statsErr != nil {
+			// Keep the online signal independent from the expensive traffic
+			// counters. A busy Xray stats service must not make every user look
+			// offline until the next successful collection.
+			log.Printf("failed to query user traffic stats: %v", statsErr)
 		}
-		onlineUIDs, onlineIPs, err = xray.QueryOnlineUserSnapshot(
+		var onlineErr error
+		onlineUIDs, onlineIPs, onlineErr = xray.QueryOnlineUserSnapshot(
 			api.server.settings.XrayAPIHost,
 			api.server.settings.XrayAPIPort,
 			5*time.Second,
 		)
-		if err != nil {
-			log.Printf("failed to query online user IPs: %v", err)
+		if onlineErr != nil {
+			log.Printf("failed to query online user IPs: %v", onlineErr)
 		}
 	}
 	if OVStats := api.server.ov.CollectUsage(); len(OVStats) > 0 {
@@ -1063,7 +1071,8 @@ func (s *Server) grpcUpdateRuntime(version string) error {
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
-	if s.core.Started() {
+	wasRunning := s.core.Started()
+	if wasRunning {
 		s.snapshotRunningUsage()
 		s.core.Stop()
 	}
@@ -1083,6 +1092,17 @@ func (s *Server) grpcUpdateRuntime(version string) error {
 	_ = os.Chmod(finalExe, 0o755)
 	if err := s.core.SetExecutablePath(finalExe); err != nil {
 		return status.Error(codes.Internal, err.Error())
+	}
+	if wasRunning {
+		s.mu.Lock()
+		cachedConfig := s.lastConfig
+		s.mu.Unlock()
+		if cachedConfig == nil {
+			return status.Error(codes.FailedPrecondition, "Xray was running without a cached configuration")
+		}
+		if err := s.core.Start(cachedConfig); err != nil {
+			return status.Error(codes.Unavailable, "failed to restart Xray after core update: "+err.Error())
+		}
 	}
 	return nil
 }
@@ -1113,6 +1133,17 @@ func (s *Server) grpcUpdateGeo(files []downloadFile) error {
 		}
 	}
 	s.core.SetAssetsPath(assetsDir)
+	if s.core.Started() {
+		s.mu.Lock()
+		cachedConfig := s.lastConfig
+		s.mu.Unlock()
+		if cachedConfig == nil {
+			return status.Error(codes.FailedPrecondition, "Xray is running without a cached configuration")
+		}
+		if err := s.core.Restart(cachedConfig); err != nil {
+			return status.Error(codes.Unavailable, "failed to restart Xray after geo update: "+err.Error())
+		}
+	}
 	return nil
 }
 

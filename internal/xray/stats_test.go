@@ -214,3 +214,18 @@ func TestQueryOnlineUserIPsUsesBoundedWorkers(t *testing.T) {
 		t.Fatalf("worker peak=%d want 2..8", peak)
 	}
 }
+
+func TestQueryOnlineUserIPsCapsLargeSnapshots(t *testing.T) {
+	names := make([]string, maxOnlineIPLookups+40)
+	for index := range names {
+		names[index] = fmt.Sprintf("user>>>%d.user>>>online", index+1)
+	}
+	client := &concurrentOnlineIPClient{}
+	users, err := queryOnlineUserIPs(context.Background(), client, names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(users) != maxOnlineIPLookups {
+		t.Fatalf("users=%d want=%d", len(users), maxOnlineIPLookups)
+	}
+}

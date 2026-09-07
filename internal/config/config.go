@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-const NodeVersionFallback = "1.2.0"
+const NodeVersionFallback = "1.3.0"
 
 type Settings struct {
 	AppName     string
@@ -109,8 +109,8 @@ func resolveXrayExecutablePath(dataDir string) string {
 
 func resolveXrayAssetsPath(dataDir string) string {
 	for _, candidate := range []string{
-		filepath.Join(dataDir, "xray-core"),
 		filepath.Join(dataDir, "assets"),
+		filepath.Join(dataDir, "xray-core"),
 	} {
 		if fileExists(filepath.Join(candidate, "geoip.dat")) || fileExists(filepath.Join(candidate, "geosite.dat")) {
 			return candidate
